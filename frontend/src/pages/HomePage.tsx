@@ -2,6 +2,7 @@ import { motion } from 'framer-motion';
 import { Button } from '../components/Button';
 import { GlassCard } from '../components/GlassCard';
 import { InputField } from '../components/InputField';
+import { BackendStatus } from '../components/BackendStatus';
 import { useAppStore } from '../store/useAppStore';
 
 const exampleIdeas = [
@@ -20,6 +21,9 @@ export function HomePage() {
 
   return (
     <div className="relative z-10 min-h-screen flex flex-col items-center justify-center px-4 py-16">
+
+      <BackendStatus />
+
       <motion.div
         initial={{ opacity: 0, y: -30 }}
         animate={{ opacity: 1, y: 0 }}
