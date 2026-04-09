@@ -2,7 +2,7 @@ import axios from 'axios';
 import type { AnalysisResponse } from '../types';
 
 const api = axios.create({
-  baseURL: '/api',
+  baseURL: import.meta.env.VITE_API_URL,
   timeout: 300_000,
   headers: { 'Content-Type': 'application/json' },
 });
