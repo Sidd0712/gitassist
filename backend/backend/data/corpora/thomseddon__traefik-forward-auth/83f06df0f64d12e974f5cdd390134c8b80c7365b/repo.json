@@ -1,0 +1,30 @@
+{
+  "full_name": "thomseddon/traefik-forward-auth",
+  "description": "Minimal forward authentication service that provides Google/OpenID oauth based login and authentication for the traefik reverse proxy",
+  "html_url": "https://github.com/thomseddon/traefik-forward-auth",
+  "stars": 2380,
+  "language": "Go",
+  "topics": [
+    "beyondcorp",
+    "docker-swarm",
+    "google-oauth",
+    "kubernetes",
+    "oauth2",
+    "oauth2-proxy",
+    "openid-connect",
+    "traefik"
+  ],
+  "default_branch": "master",
+  "updated_at": "2026-04-08T05:29:28Z",
+  "archived": false,
+  "commit_sha": "83f06df0f64d12e974f5cdd390134c8b80c7365b",
+  "relevance_score": 0.274,
+  "rank_reasons": [
+    "capabilities: authentication",
+    "useful README/manifests for implementation details"
+  ],
+  "reference_type": "pattern",
+  "fit_score": 0.274,
+  "fit_summary": "It behaves like a pattern reference covering authentication.",
+  "files": []
+}

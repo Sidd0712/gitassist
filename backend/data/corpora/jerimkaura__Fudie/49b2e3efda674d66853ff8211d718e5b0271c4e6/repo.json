@@ -1,0 +1,25 @@
+{
+  "full_name": "jerimkaura/Fudie",
+  "description": "A meal recipe application to provide meals, their ingredients and cooking instructions. Some meals have video links from where you can stream the cooking procedure in youtube.",
+  "html_url": "https://github.com/jerimkaura/Fudie",
+  "stars": 12,
+  "language": "Kotlin",
+  "topics": [
+    "android-application",
+    "dagger-hilt",
+    "jetpack-compose",
+    "mvvm-architecture",
+    "retrofit",
+    "room-database"
+  ],
+  "default_branch": "main",
+  "updated_at": "2026-04-06T13:42:50Z",
+  "archived": false,
+  "commit_sha": "49b2e3efda674d66853ff8211d718e5b0271c4e6",
+  "relevance_score": 0.0,
+  "rank_reasons": [],
+  "reference_type": "candidate",
+  "fit_score": 0.0,
+  "fit_summary": "",
+  "files": []
+}

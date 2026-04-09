@@ -1,0 +1,21 @@
+{
+  "full_name": "m-sanjid/ai_meal_planner",
+  "description": "An AI-powered meal planner app that creates personalized meal plans based on your dietary preferences, health goals, and available ingredients. Enjoy nutritious recipes, smart grocery lists, and hassle-free meal prep \u2014 all tailored just for you.",
+  "html_url": "https://github.com/m-sanjid/ai_meal_planner",
+  "stars": 1,
+  "language": "TypeScript",
+  "topics": [],
+  "default_branch": "main",
+  "updated_at": "2025-11-10T09:32:35Z",
+  "archived": false,
+  "commit_sha": "1a43d9163f1d1b78f3a2a225b8ad34e4dd73b0cc",
+  "relevance_score": 0.4308,
+  "rank_reasons": [
+    "capabilities: meal planning, recipe recommendation",
+    "useful README/manifests for implementation details"
+  ],
+  "reference_type": "subsystem",
+  "fit_score": 0.4308,
+  "fit_summary": "It behaves like a subsystem reference covering meal planning, recipe recommendation.",
+  "files": []
+}

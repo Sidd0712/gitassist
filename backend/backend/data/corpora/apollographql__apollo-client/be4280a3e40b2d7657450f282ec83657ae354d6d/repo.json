@@ -1,0 +1,21 @@
+{
+  "full_name": "apollographql/apollo-client",
+  "description": "The industry-leading GraphQL client for TypeScript, JavaScript, React, Vue, Angular, and more. Apollo Client delivers powerful caching, intuitive APIs, and comprehensive developer tools to accelerate your app development.",
+  "html_url": "https://github.com/apollographql/apollo-client",
+  "stars": 19721,
+  "language": "TypeScript",
+  "topics": [
+    "apollo-client",
+    "apollographql",
+    "graphql",
+    "graphql-client",
+    "typescript"
+  ],
+  "default_branch": "main",
+  "updated_at": "2026-04-09T07:33:11Z",
+  "archived": false,
+  "commit_sha": "be4280a3e40b2d7657450f282ec83657ae354d6d",
+  "relevance_score": 0.0,
+  "rank_reasons": [],
+  "files": []
+}

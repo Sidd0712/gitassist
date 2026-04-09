@@ -1,0 +1,29 @@
+{
+  "full_name": "mohit1106/excalidraw-realtime-editor",
+  "description": "a realtime- simple and collaborative whiteboard application for drawing and notes taking.",
+  "html_url": "https://github.com/mohit1106/excalidraw-realtime-editor",
+  "stars": 2,
+  "language": "TypeScript",
+  "topics": [
+    "aws-ec2",
+    "ci-cd",
+    "monorepo",
+    "nextjs",
+    "nodejs",
+    "prisma-orm",
+    "turborepo",
+    "typescript",
+    "websocket",
+    "zod-validation"
+  ],
+  "default_branch": "master",
+  "updated_at": "2026-03-22T15:38:27Z",
+  "archived": false,
+  "commit_sha": "77682a8e5daf47026ad3133ac16ae6750683abfb",
+  "relevance_score": 0.0,
+  "rank_reasons": [],
+  "reference_type": "candidate",
+  "fit_score": 0.0,
+  "fit_summary": "",
+  "files": []
+}

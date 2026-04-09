@@ -1,0 +1,43 @@
+{
+  "full_name": "authorizerdev/authorizer",
+  "description": "Your data, your control. Fully open source, authentication and authorization. No lock-ins.  Deployment in Railway in 120 seconds || Spin a docker image as a micro-service in your infra. Built in login page and Admin panel out of the box.",
+  "html_url": "https://github.com/authorizerdev/authorizer",
+  "stars": 1948,
+  "language": "Go",
+  "topics": [
+    "2fa",
+    "auth",
+    "authentication",
+    "authorization",
+    "docker",
+    "golang",
+    "graphdb",
+    "graphql",
+    "hacktoberfest",
+    "magic-link",
+    "microservice",
+    "nosql",
+    "oauth2",
+    "role-based-access-control",
+    "security",
+    "social-logins",
+    "sql",
+    "typescript",
+    "user-privileges"
+  ],
+  "default_branch": "main",
+  "updated_at": "2026-04-09T08:33:09Z",
+  "archived": false,
+  "commit_sha": "0ccc1c5f824cf3c9218188d47c3522656f287080",
+  "relevance_score": 0.2782,
+  "rank_reasons": [
+    "capabilities: authentication",
+    "frameworks: jwt",
+    "stack patterns: session management",
+    "useful README/manifests for implementation details"
+  ],
+  "reference_type": "pattern",
+  "fit_score": 0.2782,
+  "fit_summary": "It behaves like a pattern reference covering authentication and showing jwt.",
+  "files": []
+}

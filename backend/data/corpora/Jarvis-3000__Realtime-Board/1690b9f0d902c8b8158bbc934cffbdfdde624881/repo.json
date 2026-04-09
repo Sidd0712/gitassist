@@ -1,0 +1,31 @@
+{
+  "full_name": "Jarvis-3000/Realtime-Board",
+  "description": "A feature-packed, real-time collaborative whiteboard built with cutting-edge technologies. This project offers a dynamic and interactive platform where users can sketch, add shapes, notes, and collaborate seamlessly in real-time.",
+  "html_url": "https://github.com/Jarvis-3000/Realtime-Board",
+  "stars": 3,
+  "language": "TypeScript",
+  "topics": [
+    "clerk-auth",
+    "collaborating",
+    "convex",
+    "liveblocks",
+    "nextjs14",
+    "radix-ui",
+    "shadcn-ui",
+    "tailwindcss",
+    "theme",
+    "typescript",
+    "websocket",
+    "zustand"
+  ],
+  "default_branch": "main",
+  "updated_at": "2025-12-04T07:16:45Z",
+  "archived": false,
+  "commit_sha": "1690b9f0d902c8b8158bbc934cffbdfdde624881",
+  "relevance_score": 0.0,
+  "rank_reasons": [],
+  "reference_type": "candidate",
+  "fit_score": 0.0,
+  "fit_summary": "",
+  "files": []
+}

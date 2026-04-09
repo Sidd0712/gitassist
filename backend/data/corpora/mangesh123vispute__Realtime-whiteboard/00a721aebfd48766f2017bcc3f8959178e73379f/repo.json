@@ -1,0 +1,18 @@
+{
+  "full_name": "mangesh123vispute/Realtime-whiteboard",
+  "description": "Realtime Whiteboard: React web app for collaborative whiteboarding with real-time drawing, undo/redo, and Keycloak authentication. Use WebSocket  for seamless collaboration. Bonus: live chat, invitation system, and export to video.",
+  "html_url": "https://github.com/mangesh123vispute/Realtime-whiteboard",
+  "stars": 2,
+  "language": "JavaScript",
+  "topics": [],
+  "default_branch": "main",
+  "updated_at": "2026-01-15T12:50:08Z",
+  "archived": false,
+  "commit_sha": "00a721aebfd48766f2017bcc3f8959178e73379f",
+  "relevance_score": 0.0,
+  "rank_reasons": [],
+  "reference_type": "candidate",
+  "fit_score": 0.0,
+  "fit_summary": "",
+  "files": []
+}

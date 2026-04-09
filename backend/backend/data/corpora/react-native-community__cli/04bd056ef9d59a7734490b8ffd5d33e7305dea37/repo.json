@@ -1,0 +1,25 @@
+{
+  "full_name": "react-native-community/cli",
+  "description": "The React Native Community CLI - command line tools to help you build RN apps",
+  "html_url": "https://github.com/react-native-community/cli",
+  "stars": 2865,
+  "language": "TypeScript",
+  "topics": [
+    "android",
+    "cli",
+    "hacktoberfest",
+    "ios",
+    "javascript",
+    "npm",
+    "react-native",
+    "typescript",
+    "yarn"
+  ],
+  "default_branch": "main",
+  "updated_at": "2026-04-08T16:36:06Z",
+  "archived": false,
+  "commit_sha": "04bd056ef9d59a7734490b8ffd5d33e7305dea37",
+  "relevance_score": 0.0,
+  "rank_reasons": [],
+  "files": []
+}

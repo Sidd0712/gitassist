@@ -1,0 +1,21 @@
+{
+  "full_name": "richardblythman/meal-planner-agent",
+  "description": "An intelligent agent that helps users plan meals, manage grocery lists, and discover recipes based on dietary preferences and available ingredients.",
+  "html_url": "https://github.com/richardblythman/meal-planner-agent",
+  "stars": 19,
+  "language": null,
+  "topics": [],
+  "default_branch": "main",
+  "updated_at": "2026-04-09T10:59:18Z",
+  "archived": false,
+  "commit_sha": "41b0aad8fb5e91d46f72d999f6a0d7fd25c1732e",
+  "relevance_score": 0.3316,
+  "rank_reasons": [
+    "capabilities: meal planning",
+    "useful README/manifests for implementation details"
+  ],
+  "reference_type": "pattern",
+  "fit_score": 0.3316,
+  "fit_summary": "It behaves like a pattern reference covering meal planning.",
+  "files": []
+}
