@@ -11,3 +11,4 @@ sentence-transformers
 transformers
 torch
 accelerate
+tf-keras
