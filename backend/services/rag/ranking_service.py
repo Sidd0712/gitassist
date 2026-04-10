@@ -9,7 +9,6 @@ from collections import Counter
 
 from core.config import get_settings
 from models.schemas import ExtractedKeywords, ShallowRepoEvidence
-from services.llm_service import CAPABILITY_CATALOG, GENERIC_CAPABILITIES
 from services.rag.embedding_service import EmbeddingService
 
 logger = logging.getLogger(__name__)
@@ -54,7 +53,7 @@ async def rank_repo_evidence(
         lowered = repo_text.lower()
         primary_capabilities = keywords.primary_capabilities or keywords.capabilities[:3]
         secondary_capabilities = keywords.secondary_capabilities or keywords.capabilities[3:6]
-        trivial_capabilities = keywords.trivial_capabilities or [cap for cap in keywords.capabilities if cap in GENERIC_CAPABILITIES]
+        trivial_capabilities = keywords.trivial_capabilities or []
 
         covered_primary = _matched_capabilities(primary_capabilities, lowered)
         covered_secondary = _matched_capabilities(secondary_capabilities, lowered)
@@ -169,19 +168,19 @@ def _matched_keywords(terms: list[str], lowered_text: str) -> list[str]:
     return _dedupe_preserve(matched)[:6]
 
 
-def _capability_signal(capability: str, lowered_text: str) -> float:
-    metadata = CAPABILITY_CATALOG.get(capability, {})
+def _capability_signal(capability: str, lowered_text: str, keywords: ExtractedKeywords) -> float:
+    """Score how well a capability matches the repository text."""
     score = 0.0
+    
+    # Direct capability name match
     if capability.lower() in lowered_text:
         score += 0.7
-    for alias in metadata.get("aliases", []):
-        alias_lower = alias.lower()
-        if alias_lower in lowered_text:
-            score += 0.35 if " " in alias_lower or "-" in alias_lower else 0.2
-    for keyword in metadata.get("keywords", []):
-        keyword_lower = keyword.lower()
-        if keyword_lower in lowered_text:
+    
+    # Check related keywords from model extraction
+    for keyword in keywords.keywords + keywords.domain_terms + keywords.tech_terms:
+        if keyword.lower() in lowered_text:
             score += 0.3
+    
     return min(score, 1.0)
 
 
@@ -193,7 +192,7 @@ def _weighted_coverage(keywords: ExtractedKeywords, lowered_text: str) -> float:
         return 0.0
 
     total_weight = sum(weights.values()) or 1.0
-    covered_weight = sum(weight * _capability_signal(capability, lowered_text) for capability, weight in weights.items())
+    covered_weight = sum(weight * _capability_signal(capability, lowered_text, keywords) for capability, weight in weights.items())
     return min(covered_weight / total_weight, 1.0)
 
 
