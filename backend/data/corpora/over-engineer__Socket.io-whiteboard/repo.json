@@ -1,0 +1,40 @@
+{
+  "full_name": "over-engineer/Socket.io-whiteboard",
+  "description": "\ud83c\udfa8 HTML5 canvas real-time drawing using socket.io",
+  "html_url": "https://github.com/over-engineer/Socket.io-whiteboard",
+  "stars": 23,
+  "language": "JavaScript",
+  "topics": [
+    "drawing",
+    "es6",
+    "javascript",
+    "real-time",
+    "realtime",
+    "socket-io",
+    "socketio",
+    "whiteboard"
+  ],
+  "default_branch": "HEAD",
+  "updated_at": "2025-11-04T12:42:44Z",
+  "archived": false,
+  "commit_sha": "",
+  "relevance_score": 0.3725,
+  "semantic_meta_score": 0.3253,
+  "semantic_readme_score": 0.15584,
+  "query_hit_count": 1,
+  "rank_reasons": [
+    "covers primary capabilities: realtime collaboration",
+    "README semantic score 0.16",
+    "matched 1 search families",
+    "good implementation docs or manifests",
+    "appeared across multiple idea-focused query families"
+  ],
+  "reference_type": "subsystem",
+  "fit_score": 0.3725,
+  "fit_summary": "It behaves like a subsystem reference covering realtime collaboration.",
+  "covered_primary": [
+    "realtime collaboration"
+  ],
+  "missing_primary": [],
+  "files": []
+}

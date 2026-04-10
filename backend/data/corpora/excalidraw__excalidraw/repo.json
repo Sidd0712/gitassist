@@ -1,0 +1,39 @@
+{
+  "full_name": "excalidraw/excalidraw",
+  "description": "Virtual whiteboard for sketching hand-drawn like diagrams",
+  "html_url": "https://github.com/excalidraw/excalidraw",
+  "stars": 120739,
+  "language": "TypeScript",
+  "topics": [
+    "canvas",
+    "collaboration",
+    "diagrams",
+    "drawing",
+    "hacktoberfest",
+    "productivity",
+    "whiteboard"
+  ],
+  "default_branch": "HEAD",
+  "updated_at": "2026-04-10T18:52:10Z",
+  "archived": false,
+  "commit_sha": "",
+  "relevance_score": 0.3825,
+  "semantic_meta_score": 0.34199,
+  "semantic_readme_score": 0.03321,
+  "query_hit_count": 1,
+  "rank_reasons": [
+    "covers primary capabilities: realtime collaboration",
+    "README semantic score 0.03",
+    "matched 1 search families",
+    "good implementation docs or manifests",
+    "appeared across multiple idea-focused query families"
+  ],
+  "reference_type": "subsystem",
+  "fit_score": 0.3825,
+  "fit_summary": "It behaves like a subsystem reference covering realtime collaboration.",
+  "covered_primary": [
+    "realtime collaboration"
+  ],
+  "missing_primary": [],
+  "files": []
+}

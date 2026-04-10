@@ -21,18 +21,12 @@ class Settings(BaseSettings):
     GITHUB_API_BASE: str = "https://api.github.com"
     GITHUB_SEARCH_LIMIT: int = 5  # top N repos to fetch
 
-    # LLM / OpenAI-compatible
-    LLM_API_KEY: str = ""
-    LLM_MODEL: str = "gpt-4o-mini"
-    LLM_BASE_URL: str = ""  # leave empty for default OpenAI
-    LLM_TIMEOUT_SECONDS: int = 20
-    LLM_MAX_RETRIES: int = 0
-    EMBEDDING_API_KEY: str = ""
-    EMBEDDING_MODEL: str = "text-embedding-3-small"
-    EMBEDDING_BASE_URL: str = ""
-    EMBEDDING_DIMENSIONS: int = 0
-    EMBEDDING_TIMEOUT_SECONDS: int = 15
-    EMBEDDING_MAX_RETRIES: int = 0
+    # LLM / HuggingFace
+    LLM_TOKEN: str = ""  # HuggingFace API token (optional, for private models)
+    LLM_MODEL: str = "HuggingFaceH4/zephyr-7b-beta"  # Free open-source model
+    EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"  # Lightweight free embeddings
+    LLM_TIMEOUT_SECONDS: int = 120
+    LLM_MAX_RETRIES: int = 1
 
     # Cache
     GITHUB_CACHE_TTL: int = 3600  # seconds
