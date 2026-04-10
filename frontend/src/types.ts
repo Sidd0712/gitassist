@@ -5,9 +5,16 @@ export interface ExtractedKeywords {
   frameworks: string[];
   languages: string[];
   summary: string;
+  core_intent: string;
   product_type: string;
   target_users: string[];
   capabilities: string[];
+  primary_capabilities: string[];
+  secondary_capabilities: string[];
+  trivial_capabilities: string[];
+  capability_weights: Record<string, number>;
+  domain_terms: string[];
+  tech_terms: string[];
   constraints: string[];
   likely_components: string[];
   likely_integrations: string[];
@@ -27,10 +34,15 @@ export interface RepoSearchResult {
   archived?: boolean;
   commit_sha?: string;
   relevance_score?: number;
+  semantic_meta_score?: number;
+  semantic_readme_score?: number;
+  query_hit_count?: number;
   rank_reasons?: string[];
   reference_type?: 'candidate' | 'end_to_end' | 'subsystem' | 'pattern';
   fit_score?: number;
   fit_summary?: string;
+  covered_primary?: string[];
+  missing_primary?: string[];
 }
 
 export interface LearningStep {

@@ -1,0 +1,31 @@
+{
+  "full_name": "Piyush2864/social-trip-planner",
+  "description": "Social Trip Planner is a collaborative travel planning app that helps solo travelers connect, form groups, plan trips together, and chat in real-time. Built with Node.js, TypeScript, and MongoDB, the backend handles user management, trip creation, group coordination, and messaging features.",
+  "html_url": "https://github.com/Piyush2864/social-trip-planner",
+  "stars": 0,
+  "language": null,
+  "topics": [],
+  "default_branch": "HEAD",
+  "updated_at": "2025-05-14T18:06:28Z",
+  "archived": false,
+  "commit_sha": "",
+  "relevance_score": 0.4116,
+  "semantic_meta_score": 0.37819,
+  "semantic_readme_score": 0.343,
+  "query_hit_count": 1,
+  "rank_reasons": [
+    "covers primary capabilities: chat messaging, travel planning",
+    "README semantic score 0.34",
+    "matched 1 search families",
+    "appeared across multiple idea-focused query families"
+  ],
+  "reference_type": "end_to_end",
+  "fit_score": 0.4116,
+  "fit_summary": "It behaves like a end to end reference covering chat messaging, travel planning.",
+  "covered_primary": [
+    "chat messaging",
+    "travel planning"
+  ],
+  "missing_primary": [],
+  "files": []
+}

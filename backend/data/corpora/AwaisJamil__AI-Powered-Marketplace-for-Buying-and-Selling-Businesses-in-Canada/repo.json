@@ -1,0 +1,34 @@
+{
+  "full_name": "AwaisJamil/AI-Powered-Marketplace-for-Buying-and-Selling-Businesses-in-Canada",
+  "description": "The AI-Powered Marketplace for Buying and Selling Businesses in Canada connects buyers and sellers with AI-driven features. It offers personalized business listings, predictive analytics, automated realtor matching, and customizable ads. Built with PHP, JavaScript, and MySQL, the platform ensures seamless user experience and optimized transactions.",
+  "html_url": "https://github.com/AwaisJamil/AI-Powered-Marketplace-for-Buying-and-Selling-Businesses-in-Canada",
+  "stars": 0,
+  "language": null,
+  "topics": [],
+  "default_branch": "HEAD",
+  "updated_at": "2024-11-18T10:42:57Z",
+  "archived": false,
+  "commit_sha": "",
+  "relevance_score": 0.3833,
+  "semantic_meta_score": 0.3191,
+  "semantic_readme_score": 0.35194,
+  "query_hit_count": 1,
+  "rank_reasons": [
+    "covers primary capabilities: marketplace matching",
+    "README semantic score 0.35",
+    "matched 1 search families",
+    "good implementation docs or manifests",
+    "appeared across multiple idea-focused query families"
+  ],
+  "reference_type": "subsystem",
+  "fit_score": 0.3833,
+  "fit_summary": "It behaves like a subsystem reference covering marketplace matching while missing video or voice, payments and billing.",
+  "covered_primary": [
+    "marketplace matching"
+  ],
+  "missing_primary": [
+    "video or voice",
+    "payments and billing"
+  ],
+  "files": []
+}

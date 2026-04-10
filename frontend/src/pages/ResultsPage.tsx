@@ -86,9 +86,17 @@ function RepoCards({ repos, descriptions }: { repos: AnalysisResponse['repositor
               {repo.language && (
                 <span className="px-2.5 py-1 rounded-full text-xs bg-white/5 text-text-muted">{repo.language}</span>
               )}
+              {repo.covered_primary?.map((capability) => (
+                <span key={capability} className="px-2.5 py-1 rounded-full text-xs bg-accent-cyan/10 text-accent-cyan">
+                  covers {capability}
+                </span>
+              ))}
             </div>
 
             {descriptions[index] && <p className="text-sm text-text-primary leading-relaxed">{descriptions[index]}</p>}
+            {repo.missing_primary && repo.missing_primary.length > 0 && (
+              <p className="text-xs text-text-muted mt-3">Missing: {repo.missing_primary.join(', ')}</p>
+            )}
           </GlassCard>
         ))}
       </div>

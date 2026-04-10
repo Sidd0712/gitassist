@@ -38,8 +38,10 @@ class Settings(BaseSettings):
     GITHUB_CACHE_TTL: int = 3600  # seconds
 
     # RAG
-    RAG_CANDIDATE_REPO_LIMIT: int = 20
-    RAG_SEARCH_PER_QUERY: int = 8
+    RAG_CANDIDATE_REPO_LIMIT: int = 30
+    RAG_README_RERANK_LIMIT: int = 30
+    RAG_OUTPUT_REPO_LIMIT: int = 10
+    RAG_SEARCH_PER_QUERY: int = 10
     RAG_DEEP_INDEX_REPO_LIMIT: int = 4
     RAG_MAX_FILES_PER_REPO: int = 60
     RAG_MAX_CHARS_PER_REPO: int = 250_000
@@ -49,10 +51,13 @@ class Settings(BaseSettings):
     RAG_SECTION_TOP_K: int = 8
     RAG_SECTION_CONTEXT_CHARS: int = 14_000
     RAG_MAX_SEARCH_CONCURRENCY: int = 4
+    RAG_QUERY_LIMIT: int = 10
+    RAG_DEDUP_THRESHOLD: float = 0.92
+    RAG_MAX_PER_LANGUAGE: int = 4
     RAG_CHUNKING_VERSION: str = "v1"
-    RAG_VECTOR_STORE_PATH: str = "backend/data/chroma"
-    RAG_SQLITE_PATH: str = "backend/data/retrieval.db"
-    RAG_CORPUS_PATH: str = "backend/data/corpora"
+    RAG_VECTOR_STORE_PATH: str = "data/chroma"
+    RAG_SQLITE_PATH: str = "data/retrieval.db"
+    RAG_CORPUS_PATH: str = "data/corpora"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 

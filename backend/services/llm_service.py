@@ -53,7 +53,30 @@ STOPWORDS = {
     "with",
 }
 
+GENERIC_CAPABILITIES = {
+    "authentication",
+    "roles and permissions",
+    "persistence",
+    "file uploads",
+    "notifications",
+}
+
+TECHNICAL_STOPWORDS = {
+    "api",
+    "backend",
+    "frontend",
+    "framework",
+    "frameworks",
+    "platform",
+    "service",
+    "services",
+    "stack",
+    "system",
+    "tool",
+}
+
 PRODUCT_TYPE_HINTS = [
+    ("travel planner", ("travel planner", "trip planner", "travel itinerary", "trip itinerary")),
     ("meal prep app", ("meal prep", "meal plan", "meal planning", "weekly meals", "everyday meals")),
     ("recipe recommendation app", ("recipe", "recipes", "fridge", "pantry", "ingredients")),
     ("collaborative whiteboard", ("whiteboard", "draw", "drawing", "sketch", "canvas")),
@@ -69,6 +92,22 @@ PRODUCT_TYPE_HINTS = [
 ]
 
 CAPABILITY_CATALOG: dict[str, dict[str, list[str] | str]] = {
+    "travel planning": {
+        "aliases": ["travel", "trip", "itinerary", "itineraries", "travel planner", "trip planner", "destinations", "vacation plan"],
+        "components": ["trip planner workflow", "itinerary builder"],
+        "integrations": ["maps API"],
+        "stack_families": ["travel planning workflow"],
+        "frameworks": [],
+        "keywords": ["trip itinerary", "travel plan", "destination planning"],
+    },
+    "recommendation and ranking": {
+        "aliases": ["recommendation", "recommendations", "recommended", "suggestion", "suggestions", "personalized", "ranking"],
+        "components": ["recommendation engine"],
+        "integrations": [],
+        "stack_families": ["ranking engine"],
+        "frameworks": [],
+        "keywords": ["personalized recommendations", "ranking"],
+    },
     "ingredient inventory": {
         "aliases": ["fridge", "pantry", "ingredients", "ingredient", "available ingredients", "what's in your fridge", "what is in your fridge", "leftovers"],
         "components": ["ingredient inventory", "ingredient normalization service"],
@@ -334,9 +373,14 @@ async def extract_keywords(idea: str, clarification_answers: dict[str, str] | No
     normalized = _normalize_text(idea, clarification_answers)
     tokens = _tokenize(normalized)
 
+    capability_scores = _score_capabilities(idea, clarification_answers)
     capabilities = _detect_capabilities(idea, clarification_answers)
     frameworks = _detect_explicit_frameworks(normalized)
     languages = _detect_explicit_languages(normalized)
+    primary_capabilities, secondary_capabilities, trivial_capabilities, capability_weights = _split_capability_priority(
+        capability_scores,
+        clarification_answers,
+    )
     product_type = _detect_product_type(normalized, capabilities)
     platform = _detect_platform(normalized, clarification_answers)
     target_users = _detect_target_users(normalized)
@@ -344,6 +388,8 @@ async def extract_keywords(idea: str, clarification_answers: dict[str, str] | No
     likely_components = _derive_components(capabilities, platform, clarification_answers)
     likely_integrations = _derive_integrations(capabilities, clarification_answers)
     likely_stack_families = _derive_stack_families(platform, capabilities, constraints, clarification_answers)
+    domain_terms = _derive_domain_terms(tokens, product_type, primary_capabilities, secondary_capabilities)
+    tech_terms = _derive_tech_terms(frameworks, languages, likely_stack_families)
     assumptions = _derive_assumptions(platform, capabilities, clarification_answers)
     ambiguities = _detect_ambiguities(
         idea=idea,
@@ -351,9 +397,19 @@ async def extract_keywords(idea: str, clarification_answers: dict[str, str] | No
         clarification_answers=clarification_answers,
         platform=platform,
         capabilities=capabilities,
+        primary_capabilities=primary_capabilities,
+        capability_scores=capability_scores,
     )
-    summary = _build_summary(product_type, platform, capabilities, target_users)
-    keywords = _build_keywords(tokens, product_type, capabilities, likely_stack_families)
+    core_intent = _build_core_intent(product_type, primary_capabilities, secondary_capabilities, target_users)
+    summary = _build_summary(product_type, platform, primary_capabilities or capabilities, target_users)
+    keywords = _build_keywords(
+        tokens,
+        product_type,
+        primary_capabilities,
+        secondary_capabilities,
+        domain_terms,
+        tech_terms,
+    )
 
     for capability in capabilities:
         frameworks.extend(_catalog_list(capability, "frameworks"))
@@ -364,9 +420,16 @@ async def extract_keywords(idea: str, clarification_answers: dict[str, str] | No
         frameworks=frameworks,
         languages=languages[:4],
         summary=summary,
+        core_intent=core_intent,
         product_type=product_type,
         target_users=target_users[:4],
         capabilities=capabilities[:12],
+        primary_capabilities=primary_capabilities[:3],
+        secondary_capabilities=secondary_capabilities[:6],
+        trivial_capabilities=trivial_capabilities[:6],
+        capability_weights=capability_weights,
+        domain_terms=domain_terms[:12],
+        tech_terms=tech_terms[:10],
         constraints=constraints[:8],
         likely_components=likely_components[:10],
         likely_integrations=likely_integrations[:8],
@@ -391,6 +454,20 @@ def build_clarification_questions(keywords: ExtractedKeywords) -> list[Clarifica
     for ambiguity in keywords.ambiguities:
         if ambiguity.resolved or ambiguity.severity != "high":
             continue
+        if ambiguity.axis == "feature_priority":
+            options = keywords.primary_capabilities or keywords.secondary_capabilities or keywords.capabilities[:4]
+            if options:
+                questions.append(
+                    ClarificationQuestion(
+                        key="feature_priority",
+                        question="Which capability matters most in the first version?",
+                        options=options[:4],
+                        reason="This helps the ranking system favor repositories that match the real product focus instead of nearby but less central features.",
+                    )
+                )
+            if len(questions) >= 4:
+                break
+            continue
         question = QUESTION_BANK.get(ambiguity.axis)
         if question is None:
             continue
@@ -408,51 +485,62 @@ async def plan_retrieval_queries(
     """Create an idea-first retrieval plan for each output section."""
 
     repo_hint = ", ".join(repo.reference_type for repo in repositories[:4] if repo.reference_type != "candidate")
-    summary = keywords.summary or idea
-    capability_scope = ", ".join(keywords.capabilities[:5] or keywords.keywords[:5])
-    stack_scope = ", ".join(keywords.likely_stack_families[:4] or keywords.frameworks[:4])
-    architecture_scope = ", ".join(keywords.likely_components[:5] or keywords.capabilities[:4])
+    summary = keywords.core_intent or keywords.summary or idea
+    primary_scope = ", ".join(keywords.primary_capabilities[:3] or keywords.capabilities[:3] or keywords.keywords[:4])
+    secondary_scope = ", ".join(keywords.secondary_capabilities[:3] or keywords.capabilities[3:6] or keywords.keywords[:3])
+    stack_scope = ", ".join(keywords.tech_terms[:4] or keywords.likely_stack_families[:4] or keywords.frameworks[:4])
+    architecture_scope = ", ".join(keywords.likely_components[:5] or keywords.primary_capabilities[:4] or keywords.capabilities[:4])
 
-    return RetrievalPlan(
-        queries=[
+    queries = [
+        RetrievalQuery(
+            section="repo_descriptions",
+            query=(
+                f"{summary}. Explain why a repository is useful as an implementation reference for "
+                f"{primary_scope}. Prioritize end-to-end matches before subsystem patterns. {repo_hint}"
+            ),
+            preferred_roles=["documentation", "entrypoint", "source", "config"],
+            top_k=8,
+        ),
+        RetrievalQuery(
+            section="learning_path",
+            query=(
+                f"{summary}. Focus on setup docs, examples, onboarding notes, and implementation milestones "
+                f"for {primary_scope} and {secondary_scope}."
+            ),
+            preferred_roles=["documentation", "example", "config", "source"],
+            top_k=8,
+        ),
+        RetrievalQuery(
+            section="architecture_diagram",
+            query=(
+                f"{summary}. Focus on components, API boundaries, data flow, integrations, and capability coverage "
+                f"for {architecture_scope}."
+            ),
+            preferred_roles=["entrypoint", "source", "config", "documentation"],
+            top_k=8,
+        ),
+        RetrievalQuery(
+            section="tech_stack",
+            query=(
+                f"{summary}. Focus on dependencies, manifests, deployment choices, and technology decisions "
+                f"for {stack_scope}."
+            ),
+            preferred_roles=["config", "documentation", "entrypoint"],
+            top_k=8,
+        ),
+    ]
+
+    for capability in keywords.primary_capabilities[:3]:
+        queries.append(
             RetrievalQuery(
                 section="repo_descriptions",
-                query=(
-                    f"{summary}. Explain why a repository is useful as an implementation reference for "
-                    f"{capability_scope}. Prioritize end-to-end matches before subsystem patterns. {repo_hint}"
-                ),
-                preferred_roles=["documentation", "entrypoint", "source", "config"],
-                top_k=8,
-            ),
-            RetrievalQuery(
-                section="learning_path",
-                query=(
-                    f"{summary}. Focus on setup docs, examples, onboarding notes, and implementation milestones "
-                    f"for {capability_scope}."
-                ),
-                preferred_roles=["documentation", "example", "config", "source"],
-                top_k=8,
-            ),
-            RetrievalQuery(
-                section="architecture_diagram",
-                query=(
-                    f"{summary}. Focus on components, API boundaries, realtime flows, data persistence, auth, "
-                    f"and integrations for {architecture_scope}."
-                ),
-                preferred_roles=["entrypoint", "source", "config", "documentation"],
-                top_k=8,
-            ),
-            RetrievalQuery(
-                section="tech_stack",
-                query=(
-                    f"{summary}. Focus on dependencies, manifests, deployment choices, and technology decisions "
-                    f"for {stack_scope}."
-                ),
-                preferred_roles=["config", "documentation", "entrypoint"],
-                top_k=8,
-            ),
-        ]
-    )
+                query=f"{summary}. Find implementation evidence for {capability}.",
+                preferred_roles=["documentation", "source", "entrypoint"],
+                top_k=6,
+            )
+        )
+
+    return RetrievalPlan(queries=queries)
 
 
 async def generate_analysis(
@@ -506,7 +594,7 @@ def _dedupe_preserve(values: list[str]) -> list[str]:
     return result
 
 
-def _detect_capabilities(text: str, clarification_answers: dict[str, str]) -> list[str]:
+def _score_capabilities(text: str, clarification_answers: dict[str, str]) -> Counter[str]:
     lowered = text.lower()
     scores: Counter[str] = Counter()
 
@@ -565,12 +653,72 @@ def _detect_capabilities(text: str, clarification_answers: dict[str, str]) -> li
         scores["meal planning"] += 1
 
     if not scores:
-        generic = []
+        generic = Counter()
         if any(token in lowered for token in ("dashboard", "portal", "admin")):
-            generic.append("analytics")
+            generic["analytics"] += 1
         if any(token in lowered for token in ("api", "service")):
-            generic.append("persistence")
+            generic["persistence"] += 1
         return generic
+
+    return scores
+
+
+def _detect_capabilities(text: str, clarification_answers: dict[str, str]) -> list[str]:
+    scores = _score_capabilities(text, clarification_answers)
+    return [name for name, _score in scores.most_common(12)]
+
+
+def _split_capability_priority(
+    scores: Counter[str],
+    clarification_answers: dict[str, str],
+) -> tuple[list[str], list[str], list[str], dict[str, float]]:
+    ordered = [name for name, _score in scores.most_common(12)]
+    if not ordered:
+        return [], [], [], {}
+
+    generic = [capability for capability in ordered if capability in GENERIC_CAPABILITIES]
+    non_generic = [capability for capability in ordered if capability not in GENERIC_CAPABILITIES]
+    prioritized_answer = clarification_answers.get("feature_priority", "").strip().lower()
+
+    prioritized_capability = ""
+    if prioritized_answer:
+        for capability in list(non_generic):
+            if prioritized_answer == capability.lower():
+                non_generic.remove(capability)
+                non_generic.insert(0, capability)
+                prioritized_capability = capability
+                break
+
+    primary: list[str] = []
+    working_non_generic = non_generic[:]
+    if prioritized_capability:
+        primary.append(prioritized_capability)
+        working_non_generic = [capability for capability in working_non_generic if capability != prioritized_capability]
+
+    if working_non_generic:
+        top_score = scores[working_non_generic[0]]
+        primary.extend(
+            capability
+            for capability in working_non_generic
+            if scores[capability] >= max(2, top_score - 1)
+        )
+        primary = _dedupe_preserve(primary)[:3]
+        if not primary:
+            primary = working_non_generic[:1]
+        secondary = [capability for capability in working_non_generic if capability not in primary][:6]
+    else:
+        primary = ordered[:1]
+        secondary = []
+
+    trivial = [capability for capability in generic if capability not in primary and capability not in secondary][:6]
+    capability_weights: dict[str, float] = {}
+    for capability in primary:
+        capability_weights[capability] = 1.0 if capability.lower() == prioritized_answer else 0.9
+    for capability in secondary:
+        capability_weights[capability] = 0.45
+    for capability in trivial:
+        capability_weights[capability] = 0.08
+    return primary, secondary, trivial, capability_weights
 
     return [name for name, _score in scores.most_common(10)]
 
@@ -587,11 +735,39 @@ def _detect_explicit_languages(text: str) -> list[str]:
     return _dedupe_preserve(languages)
 
 
+def _derive_domain_terms(
+    tokens: list[str],
+    product_type: str,
+    primary_capabilities: list[str],
+    secondary_capabilities: list[str],
+) -> list[str]:
+    technical_terms = set(EXPLICIT_FRAMEWORKS) | set(EXPLICIT_LANGUAGES) | TECHNICAL_STOPWORDS
+    domain_terms: list[str] = []
+    if product_type and product_type != "software product":
+        domain_terms.append(product_type)
+    domain_terms.extend(primary_capabilities)
+    domain_terms.extend(secondary_capabilities[:3])
+    for capability in [*primary_capabilities, *secondary_capabilities[:3]]:
+        domain_terms.extend(_catalog_list(capability, "keywords")[:2])
+    domain_terms.extend(
+        token
+        for token in tokens
+        if token not in STOPWORDS and token not in technical_terms
+    )
+    return _dedupe_preserve(domain_terms)
+
+
+def _derive_tech_terms(frameworks: list[str], languages: list[str], stack_families: list[str]) -> list[str]:
+    return _dedupe_preserve([*frameworks, *languages, *stack_families[:4]])
+
+
 def _detect_product_type(text: str, capabilities: list[str]) -> str:
     lowered = text.lower()
     for product_type, aliases in PRODUCT_TYPE_HINTS:
         if any(alias in lowered for alias in aliases):
             return product_type
+    if "travel planning" in capabilities and "maps and geolocation" in capabilities:
+        return "travel planner"
     if "meal planning" in capabilities and "recipe recommendation" in capabilities:
         return "meal prep app"
     if "recipe recommendation" in capabilities and "ingredient inventory" in capabilities:
@@ -768,6 +944,8 @@ def _detect_ambiguities(
     clarification_answers: dict[str, str],
     platform: str,
     capabilities: list[str],
+    primary_capabilities: list[str],
+    capability_scores: Counter[str],
 ) -> list[AmbiguityFlag]:
     lowered = normalized.lower()
     technical_signal = len(_detect_explicit_frameworks(normalized)) + len(_detect_explicit_languages(normalized))
@@ -825,7 +1003,34 @@ def _detect_ambiguities(
     if "meal planning" in capabilities and not clarification_answers.get("planning_scope") and not explicit_planning_scope:
         add("planning_scope", "Meal prep products can optimize for the next meal, a day plan, or a weekly planner, which changes scope a lot.", "high")
 
+    non_generic = [capability for capability in capabilities if capability not in GENERIC_CAPABILITIES]
+    explicit_priority = any(
+        phrase in lowered
+        for phrase in ("mainly", "primarily", "focus on", "most important", "first focus", "v1 is")
+    )
+    if (
+        len(non_generic) >= 3
+        and not clarification_answers.get("feature_priority")
+        and not explicit_priority
+    ):
+        add(
+            "feature_priority",
+            "The idea includes several strong product capabilities, but it is unclear which one should dominate repository selection in the first version.",
+            "high",
+        )
+
     return ambiguities
+
+
+def _build_core_intent(
+    product_type: str,
+    primary_capabilities: list[str],
+    secondary_capabilities: list[str],
+    target_users: list[str],
+) -> str:
+    audience = f" for {', '.join(target_users[:2])}" if target_users else ""
+    focus = ", ".join(primary_capabilities[:2] or secondary_capabilities[:2] or ["the core workflow"])
+    return f"{product_type or 'software product'}{audience} focused on {focus}"
 
 
 def _build_summary(product_type: str, platform: str, capabilities: list[str], target_users: list[str]) -> str:
@@ -835,13 +1040,22 @@ def _build_summary(product_type: str, platform: str, capabilities: list[str], ta
     return f"A {platform_text}{product_type}{audience} centered on {capability_text}."
 
 
-def _build_keywords(tokens: list[str], product_type: str, capabilities: list[str], stack_families: list[str]) -> list[str]:
+def _build_keywords(
+    tokens: list[str],
+    product_type: str,
+    primary_capabilities: list[str],
+    secondary_capabilities: list[str],
+    domain_terms: list[str],
+    tech_terms: list[str],
+) -> list[str]:
     keywords: list[str] = []
     if product_type and product_type != "software product":
         keywords.append(product_type)
-    keywords.extend(capabilities)
-    keywords.extend(token for token in tokens if token not in STOPWORDS)
-    keywords.extend(stack_families[:4])
+    keywords.extend(primary_capabilities)
+    keywords.extend(secondary_capabilities[:3])
+    keywords.extend(domain_terms[:8])
+    keywords.extend(token for token in tokens if token not in STOPWORDS and token not in TECHNICAL_STOPWORDS)
+    keywords.extend(tech_terms[:3])
     return _dedupe_preserve(keywords)
 
 
@@ -866,11 +1080,13 @@ def _build_repo_descriptions(
         top_hit = hit_map.get(repo.full_name, [])
         evidence_path = f" Key evidence appears in `{top_hit[0].path}`." if top_hit else ""
         reference_type = repo.reference_type.replace("_", " ")
+        covered = f" It covers {', '.join(repo.covered_primary[:3])}." if repo.covered_primary else ""
+        missing = f" It does not directly cover {', '.join(repo.missing_primary[:2])}." if repo.missing_primary else ""
         descriptions.append(
             (
                 f"{repo.full_name} is a {reference_type} reference for this idea. "
                 f"{repo.fit_summary or 'It matches the product through capability overlap and implementation coverage.'} "
-                f"{capability_text}.{evidence_path}"
+                f"{capability_text}.{covered}{missing}{evidence_path}"
             ).strip()
         )
     return descriptions
@@ -937,9 +1153,14 @@ def _build_learning_path(keywords: ExtractedKeywords, repositories: list[RepoSea
             ),
         ]
 
-    primary_cap = keywords.capabilities[0] if keywords.capabilities else "the core product workflow"
-    secondary_cap = keywords.capabilities[1] if len(keywords.capabilities) > 1 else "supporting user flows"
-    tertiary_cap = keywords.capabilities[2] if len(keywords.capabilities) > 2 else "production hardening"
+    priority_caps = keywords.primary_capabilities or keywords.capabilities
+    primary_cap = priority_caps[0] if priority_caps else "the core product workflow"
+    secondary_cap = (priority_caps[1] if len(priority_caps) > 1 else (keywords.secondary_capabilities[0] if keywords.secondary_capabilities else "supporting user flows"))
+    tertiary_cap = (
+        keywords.secondary_capabilities[0]
+        if keywords.secondary_capabilities
+        else (priority_caps[2] if len(priority_caps) > 2 else "production hardening")
+    )
 
     return [
         LearningStep(

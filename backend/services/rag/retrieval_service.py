@@ -37,7 +37,7 @@ class RetrievalService:
             query_embedding = await self.embedding_service.embed_query(query.query)
             dense_hits = self.store.dense_search(query_embedding, allowed_repos, query.top_k)
             lexical_hits = self.store.lexical_search(query.query, allowed_repos, query.top_k)
-            section_hits[query.section] = self._merge_hits(
+            merged_hits = self._merge_hits(
                 section=query.section,
                 dense_hits=dense_hits,
                 lexical_hits=lexical_hits,
@@ -45,6 +45,8 @@ class RetrievalService:
                 preferred_roles=query.preferred_roles,
                 top_k=query.top_k,
             )
+            existing_hits = section_hits.get(query.section, [])
+            section_hits[query.section] = self._merge_section_hits(existing_hits, merged_hits, query.top_k)
 
         return section_hits
 
@@ -133,6 +135,20 @@ class RetrievalService:
             if len(selected) >= top_k:
                 break
         return selected
+
+    def _merge_section_hits(
+        self,
+        existing_hits: list[RetrievalHit],
+        new_hits: list[RetrievalHit],
+        top_k: int,
+    ) -> list[RetrievalHit]:
+        merged: dict[str, RetrievalHit] = {hit.chunk_id: hit for hit in existing_hits}
+        for hit in new_hits:
+            current = merged.get(hit.chunk_id)
+            if current is None or hit.score > current.score:
+                merged[hit.chunk_id] = hit
+        combined = sorted(merged.values(), key=lambda item: item.score, reverse=True)
+        return self._diversify(combined, max(top_k, len(existing_hits), len(new_hits)))
 
     def _role_prior(self, chunk_role: str, preferred_roles: list[str], section: str, path: str) -> float:
         role_prior = 1.0 if chunk_role in preferred_roles else 0.25

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
+import math
 from collections import defaultdict
 
 import httpx
@@ -11,6 +13,7 @@ from cachetools import TTLCache
 
 from core.config import get_settings
 from models.schemas import ExtractedKeywords, RepoFetchPlan, RepoFile, RepoSearchResult, RepoSnapshot, RepoTreeEntry, ShallowRepoEvidence
+from services.rag.embedding_service import EmbeddingService
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +95,8 @@ SKIP_PATH_PARTS = {
 }
 
 CAPABILITY_SEARCH_TERMS = {
+    "travel planning": ["travel-planner", "trip-planner", "itinerary", "travel"],
+    "recommendation and ranking": ["recommendation", "personalized", "ranking", "matching"],
     "ingredient inventory": ["pantry", "fridge", "ingredients", "inventory"],
     "recipe recommendation": ["recipe", "recipes", "meal", "ingredients", "recommendation"],
     "meal planning": ["meal-prep", "meal-planner", "meal", "planning"],
@@ -112,6 +117,24 @@ CAPABILITY_SEARCH_TERMS = {
     "notifications": ["notifications", "email"],
     "video or voice": ["video", "webrtc", "call"],
 }
+
+LOW_VALUE_PATTERNS = (
+    "awesome-",
+    "boilerplate",
+    "challenge",
+    "cheatsheet",
+    "course",
+    "example",
+    "exercise",
+    "leetcode",
+    "list",
+    "roadmap",
+    "scaffold",
+    "starter",
+    "template",
+    "test",
+    "tutorial",
+)
 
 
 def _headers() -> dict[str, str]:
@@ -164,34 +187,40 @@ def build_search_queries(keywords: ExtractedKeywords) -> list[str]:
     """Build multiple GitHub search queries from normalized intent."""
 
     settings = get_settings()
-    query_limit = min(7, settings.RAG_MAX_SEARCH_CONCURRENCY + 3)
+    query_limit = settings.RAG_QUERY_LIMIT
     queries: list[str] = []
-    product_terms = _clean_query_terms(keywords.product_type.split())
-    capability_terms = _capability_terms(keywords.capabilities[:4])
-    framework_terms = _clean_query_terms(keywords.frameworks[:3])
-    keyword_terms = _clean_query_terms(keywords.keywords[:8])
-    capability_query_groups = [
-        _query_join(_clean_query_terms(CAPABILITY_SEARCH_TERMS.get(capability, capability.split()))[:4])
-        for capability in keywords.capabilities[:4]
-    ]
+    product_terms = _clean_query_terms((keywords.product_type or "").split())
+    core_terms = _clean_query_terms((keywords.core_intent or keywords.summary).replace(".", "").split())
+    domain_terms = _clean_query_terms(keywords.domain_terms[:10])
+    primary_capabilities = keywords.primary_capabilities or keywords.capabilities[:3]
+    secondary_capabilities = keywords.secondary_capabilities or keywords.capabilities[3:6]
+    keyword_terms = _clean_query_terms(keywords.keywords[:10])
 
-    if product_terms or capability_terms:
-        queries.append(_query_join([*product_terms[:2], *capability_terms[:3]]))
-    for query in capability_query_groups:
-        if query:
-            queries.append(query)
-    if len(capability_terms) >= 3:
+    if product_terms or domain_terms:
+        queries.append(_query_join([*product_terms[:2], *domain_terms[:3]]))
+
+    for capability in primary_capabilities[:3]:
+        capability_terms = _clean_query_terms(CAPABILITY_SEARCH_TERMS.get(capability, capability.split()))
         queries.append(_query_join(capability_terms[:4]))
-    if len(capability_terms) >= 2 and framework_terms:
-        queries.append(_query_join([*capability_terms[:2], *framework_terms[:2]]))
+
+    if len(primary_capabilities) >= 2:
+        grouped_terms: list[str] = []
+        for capability in primary_capabilities[:2]:
+            grouped_terms.extend(CAPABILITY_SEARCH_TERMS.get(capability, capability.split())[:2])
+        queries.append(_query_join(_clean_query_terms([*product_terms[:2], *grouped_terms])[:6]))
+
+    for capability in secondary_capabilities[:3]:
+        subsystem_terms = _clean_query_terms(CAPABILITY_SEARCH_TERMS.get(capability, capability.split()))
+        queries.append(_query_join(subsystem_terms[:4]))
+
     if keyword_terms:
         queries.append(_query_join(keyword_terms[:5]))
-    if keywords.summary:
-        summary_terms = _clean_query_terms(keywords.summary.replace(".", "").split())
-        queries.append(_query_join(summary_terms[:5]))
+    if core_terms:
+        queries.append(_query_join(core_terms[:5]))
     if keywords.languages:
         language_name = keywords.languages[0]
-        queries.append(f"{_query_join([*(product_terms[:2] or capability_terms[:3] or keyword_terms[:3])])} language:{language_name}")
+        qualifier_terms = product_terms[:2] or domain_terms[:3] or keyword_terms[:3]
+        queries.append(f"{_query_join(qualifier_terms)} language:{language_name}")
 
     deduped: list[str] = []
     seen: set[str] = set()
@@ -231,6 +260,57 @@ def _query_join(terms: list[str]) -> str:
     return " ".join(term for term in terms if term).strip()
 
 
+def _language_bucket(language: str | None) -> str:
+    return (language or "Unknown").strip() or "Unknown"
+
+
+def _candidate_quality_penalty(repo: RepoSearchResult) -> float:
+    lowered = f"{repo.full_name} {repo.description or ''} {' '.join(repo.topics)}".lower()
+    penalty = 0.0
+    if any(pattern in lowered for pattern in LOW_VALUE_PATTERNS):
+        penalty += 0.2
+    if repo.archived:
+        penalty += 0.25
+    return min(penalty, 0.4)
+
+
+def _candidate_quality_score(repo: RepoSearchResult) -> float:
+    penalty = _candidate_quality_penalty(repo)
+    star_score = min(math.log10(repo.stars + 10) / 4.0, 1.0)
+    return max(0.0, (0.3 * star_score) - penalty)
+
+
+def _intent_search_text(keywords: ExtractedKeywords) -> str:
+    terms = [
+        keywords.core_intent or keywords.summary,
+        " ".join(keywords.primary_capabilities[:3]),
+        " ".join(keywords.secondary_capabilities[:3]),
+        " ".join(keywords.domain_terms[:6]),
+    ]
+    return " ".join(term for term in terms if term).strip()
+
+
+def _repo_metadata_text(repo: RepoSearchResult) -> str:
+    return "\n".join(
+        [
+            repo.full_name,
+            repo.description or "",
+            " ".join(repo.topics),
+        ]
+    )
+
+
+def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    numerator = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(a * a for a in left))
+    right_norm = math.sqrt(sum(b * b for b in right))
+    if not left_norm or not right_norm:
+        return 0.0
+    return numerator / (left_norm * right_norm)
+
+
 async def search_repo_candidates(keywords: ExtractedKeywords) -> list[RepoSearchResult]:
     """Search GitHub using multiple query variants and merge candidates."""
 
@@ -241,27 +321,36 @@ async def search_repo_candidates(keywords: ExtractedKeywords) -> list[RepoSearch
 
     merged: dict[str, RepoSearchResult] = {}
     query_map: defaultdict[str, set[str]] = defaultdict(set)
+    embedding_service = EmbeddingService()
+    intent_text = _intent_search_text(keywords)
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        for query in queries:
+        semaphore = asyncio.Semaphore(settings.RAG_MAX_SEARCH_CONCURRENCY)
+
+        async def fetch_query(query: str) -> tuple[str, list[dict]]:
             cache_key = f"search:{query}:{settings.RAG_SEARCH_PER_QUERY}"
             if cache_key in _cache:
-                items = _cache[cache_key]
-            else:
+                return query, _cache[cache_key]
+            async with semaphore:
                 response = await client.get(
                     f"{settings.GITHUB_API_BASE}/search/repositories",
                     headers=_headers(),
                     params={
                         "q": query,
-                        "sort": "stars",
-                        "order": "desc",
                         "per_page": settings.RAG_SEARCH_PER_QUERY,
                     },
                 )
                 response.raise_for_status()
                 items = response.json().get("items", [])
                 _cache[cache_key] = items
+                return query, items
 
+        query_results = await asyncio.gather(*(fetch_query(query) for query in queries), return_exceptions=True)
+        for result in query_results:
+            if isinstance(result, Exception):
+                logger.warning("GitHub query failed during candidate discovery: %s", result)
+                continue
+            query, items = result
             for item in items:
                 existing = merged.get(item["full_name"])
                 repo = RepoSearchResult(
@@ -271,41 +360,63 @@ async def search_repo_candidates(keywords: ExtractedKeywords) -> list[RepoSearch
                     stars=item.get("stargazers_count", 0),
                     language=item.get("language"),
                     topics=item.get("topics", []),
+                    archived=item.get("archived", False),
+                    updated_at=item.get("updated_at"),
                 )
                 if existing is None or repo.stars > existing.stars:
                     merged[repo.full_name] = repo
                 query_map[repo.full_name].add(query)
 
-        if not merged:
-            fallback_terms = _clean_query_terms(keywords.keywords[:6] + keywords.capabilities[:3])
-            fallback_queries = [_query_join(fallback_terms[:4]), _query_join(fallback_terms[:3])]
-            for query in fallback_queries:
-                if not query:
-                    continue
-                response = await client.get(
-                    f"{settings.GITHUB_API_BASE}/search/repositories",
-                    headers=_headers(),
-                    params={
-                        "q": query,
-                        "sort": "stars",
-                        "order": "desc",
-                        "per_page": settings.RAG_SEARCH_PER_QUERY,
-                    },
-                )
-                if response.status_code != 200:
-                    continue
-                for item in response.json().get("items", []):
-                    repo = RepoSearchResult(
-                        full_name=item["full_name"],
-                        description=item.get("description"),
-                        html_url=item["html_url"],
-                        stars=item.get("stargazers_count", 0),
-                        language=item.get("language"),
-                        topics=item.get("topics", []),
-                    )
-                    merged.setdefault(repo.full_name, repo)
+    if not merged:
+        return []
 
-    candidates = sorted(merged.values(), key=lambda repo: repo.stars, reverse=True)[: settings.RAG_CANDIDATE_REPO_LIMIT]
+    candidates = list(merged.values())
+    query_hit_max = max((len(query_map[repo.full_name]) for repo in candidates), default=1)
+    intent_embedding = await embedding_service.embed_query(intent_text)
+    metadata_embeddings = await embedding_service.embed_documents([_repo_metadata_text(repo) for repo in candidates])
+
+    preliminary: list[RepoSearchResult] = []
+    for repo, embedding in zip(candidates, metadata_embeddings):
+        repo.query_hit_count = len(query_map[repo.full_name])
+        repo.semantic_meta_score = round(_cosine_similarity(intent_embedding, embedding), 5)
+        query_score = repo.query_hit_count / max(query_hit_max, 1)
+        quality_score = _candidate_quality_score(repo)
+        coverage_overlap = len(
+            {
+                term.lower()
+                for term in [*keywords.primary_capabilities[:3], *keywords.domain_terms[:6]]
+                if term and term.lower() in _repo_metadata_text(repo).lower()
+            }
+        ) / max(len(keywords.primary_capabilities[:3]) + len(keywords.domain_terms[:6]), 1)
+        repo.relevance_score = round(
+            max(
+                0.0,
+                (0.60 * repo.semantic_meta_score)
+                + (0.20 * query_score)
+                + (0.10 * coverage_overlap)
+                + (0.10 * quality_score),
+            ),
+            5,
+        )
+        repo.rank_reasons = [
+            f"metadata semantic score {repo.semantic_meta_score:.2f}",
+            f"matched {repo.query_hit_count} query families",
+        ]
+        preliminary.append(repo)
+
+    preliminary.sort(key=lambda repo: repo.relevance_score, reverse=True)
+    language_counts: defaultdict[str, int] = defaultdict(int)
+    shortlisted: list[RepoSearchResult] = []
+    for repo in preliminary:
+        bucket = _language_bucket(repo.language)
+        if language_counts[bucket] >= 12:
+            continue
+        shortlisted.append(repo)
+        language_counts[bucket] += 1
+        if len(shortlisted) >= settings.RAG_CANDIDATE_REPO_LIMIT:
+            break
+
+    candidates = shortlisted
     logger.info("GitHub candidate search produced %d repositories across %d queries", len(candidates), len(queries))
     return candidates
 
@@ -382,46 +493,85 @@ async def fetch_repo_snapshot(repo: RepoSearchResult) -> RepoSnapshot:
     return snapshot
 
 
-async def fetch_shallow_repo_evidence(snapshot: RepoSnapshot) -> ShallowRepoEvidence:
-    """Fetch README and manifests for reranking."""
+def _root_manifest_candidates(language: str | None) -> list[str]:
+    base = ["package.json", "pyproject.toml", "requirements.txt", "go.mod", "Cargo.toml", "Dockerfile", "docker-compose.yml"]
+    lowered = (language or "").lower()
+    if lowered in {"typescript", "javascript"}:
+        return ["package.json", "pnpm-lock.yaml", "package-lock.json", "Dockerfile", "docker-compose.yml"]
+    if lowered == "python":
+        return ["pyproject.toml", "requirements.txt", "poetry.lock", "Dockerfile", "docker-compose.yml"]
+    if lowered == "go":
+        return ["go.mod", "Dockerfile", "docker-compose.yml"]
+    if lowered in {"rust", "java", "kotlin"}:
+        return ["Cargo.toml", "pom.xml", "build.gradle", "Dockerfile", "docker-compose.yml"]
+    return base
 
-    manifest_candidates: list[str] = []
-    readme_candidates: list[str] = []
-    highlighted_paths: list[str] = []
 
-    for entry in snapshot.tree:
-        filename = entry.path.lower().rsplit("/", 1)[-1]
-        if filename.startswith("readme"):
-            readme_candidates.append(entry.path)
-        if filename in IMPORTANT_FILENAMES:
-            manifest_candidates.append(entry.path)
-        if _path_priority(entry.path, set()) >= 50:
-            highlighted_paths.append(entry.path)
+async def fetch_shallow_repo_evidence(repository: RepoSearchResult) -> ShallowRepoEvidence:
+    """Fetch README and root manifests for semantic reranking."""
 
-    readme_candidates = readme_candidates[:2] or ["README.md"]
-    manifest_candidates = manifest_candidates[:8]
+    readme_candidates = ["README.md", "readme.md", "README", "docs/README.md"]
+    manifest_candidates = _root_manifest_candidates(repository.language)[:5]
     manifest_files: list[RepoFile] = []
     readme_text = ""
     readme_path: str | None = None
+    highlighted_paths: list[str] = []
 
     async with httpx.AsyncClient(timeout=30.0) as client:
+        readme_cache_key = f"readme:{repository.full_name}"
+        if readme_cache_key in _cache:
+            readme_text = _cache[readme_cache_key]
+            readme_path = "README.md" if readme_text else None
+        else:
+            response = await client.get(
+                f"{get_settings().GITHUB_API_BASE}/repos/{repository.full_name}/readme",
+                headers={**_headers(), "Accept": "application/vnd.github.raw+json"},
+            )
+            if response.status_code == 200:
+                readme_text = response.text
+                readme_path = "README.md"
+                _cache[readme_cache_key] = readme_text
         for path in readme_candidates:
-            readme_text = await _fetch_file_content(client, snapshot.full_name, path) or ""
+            if readme_text:
+                break
+            readme_text = await _fetch_file_content(client, repository.full_name, path) or ""
             if readme_text:
                 readme_path = path
                 break
         for path in manifest_candidates:
-            content = await _fetch_file_content(client, snapshot.full_name, path)
+            content = await _fetch_file_content(client, repository.full_name, path)
             if content:
                 manifest_files.append(RepoFile(path=path, content=content, size=len(content)))
+                highlighted_paths.append(path)
+
+    if readme_path:
+        highlighted_paths.insert(0, readme_path)
 
     return ShallowRepoEvidence(
-        repository=RepoSearchResult(**snapshot.model_dump(exclude={"tree", "search_queries"})),
+        repository=repository.model_copy(deep=True),
         readme_path=readme_path,
         readme=readme_text,
         manifest_files=manifest_files,
-        highlighted_paths=highlighted_paths[:20],
+        highlighted_paths=highlighted_paths[:10],
     )
+
+
+async def fetch_shallow_repo_evidence_batch(repositories: list[RepoSearchResult]) -> list[ShallowRepoEvidence]:
+    """Fetch shallow evidence for a shortlist with bounded concurrency."""
+
+    settings = get_settings()
+    semaphore = asyncio.Semaphore(settings.RAG_MAX_SEARCH_CONCURRENCY)
+
+    async def fetch(repository: RepoSearchResult) -> ShallowRepoEvidence | None:
+        async with semaphore:
+            try:
+                return await fetch_shallow_repo_evidence(repository)
+            except Exception as exc:
+                logger.warning("Skipping candidate %s during shallow ingest: %s", repository.full_name, exc)
+                return None
+
+    results = await asyncio.gather(*(fetch(repository) for repository in repositories))
+    return [item for item in results if item is not None]
 
 
 def build_repo_fetch_plan(snapshot: RepoSnapshot, shallow: ShallowRepoEvidence, intent: ExtractedKeywords) -> RepoFetchPlan:
@@ -431,13 +581,17 @@ def build_repo_fetch_plan(snapshot: RepoSnapshot, shallow: ShallowRepoEvidence, 
     idea_terms = {
         term.lower()
         for term in [
-            *intent.keywords[:8],
-            *intent.capabilities[:6],
+            *intent.domain_terms[:8],
+            *intent.primary_capabilities[:4],
+            *intent.secondary_capabilities[:4],
+            *intent.keywords[:6],
             *intent.likely_components[:4],
             *shallow.matched_capabilities[:4],
         ]
         if len(term) > 2
     }
+    max_files = min(settings.RAG_MAX_FILES_PER_REPO, 30)
+    max_chars = min(settings.RAG_MAX_CHARS_PER_REPO, 150_000)
     prioritized = sorted(
         (
             entry
@@ -467,10 +621,10 @@ def build_repo_fetch_plan(snapshot: RepoSnapshot, shallow: ShallowRepoEvidence, 
     for entry in prioritized:
         if entry.path in selected_set:
             continue
-        if len(selected_paths) >= settings.RAG_MAX_FILES_PER_REPO:
+        if len(selected_paths) >= max_files:
             skipped_paths.append(entry.path)
             continue
-        if estimated_chars + entry.size > settings.RAG_MAX_CHARS_PER_REPO:
+        if estimated_chars + entry.size > max_chars:
             skipped_paths.append(entry.path)
             continue
         selected_paths.append(entry.path)

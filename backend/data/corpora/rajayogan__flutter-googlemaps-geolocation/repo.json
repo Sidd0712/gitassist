@@ -1,0 +1,32 @@
+{
+  "full_name": "rajayogan/flutter-googlemaps-geolocation",
+  "description": "Code for geolocation, google maps and some cool effects with camera position",
+  "html_url": "https://github.com/rajayogan/flutter-googlemaps-geolocation",
+  "stars": 45,
+  "language": "Dart",
+  "topics": [],
+  "default_branch": "HEAD",
+  "updated_at": "2023-03-24T09:50:01Z",
+  "archived": false,
+  "commit_sha": "",
+  "relevance_score": 0.3619,
+  "semantic_meta_score": 0.39123,
+  "semantic_readme_score": 0.36901,
+  "query_hit_count": 1,
+  "rank_reasons": [
+    "covers supporting capabilities: maps and geolocation",
+    "README semantic score 0.37",
+    "matched 1 search families",
+    "good implementation docs or manifests",
+    "appeared across multiple idea-focused query families"
+  ],
+  "reference_type": "pattern",
+  "fit_score": 0.3619,
+  "fit_summary": "It behaves like a pattern reference showing useful patterns for maps and geolocation while missing chat messaging, travel planning.",
+  "covered_primary": [],
+  "missing_primary": [
+    "chat messaging",
+    "travel planning"
+  ],
+  "files": []
+}

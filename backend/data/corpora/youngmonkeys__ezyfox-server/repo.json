@@ -1,0 +1,50 @@
+{
+  "full_name": "youngmonkeys/ezyfox-server",
+  "description": "A socket server (include SSL) supports realtime application, realtime game, MMORPG, messaging, chat and streaming data with TCP, UDP and Websocket",
+  "html_url": "https://github.com/youngmonkeys/ezyfox-server",
+  "stars": 671,
+  "language": "Java",
+  "topics": [
+    "chat-server",
+    "game-server",
+    "live-streaming",
+    "mmorpg-server",
+    "multiplayer-game-server",
+    "networking",
+    "realtime",
+    "socket-io",
+    "socket-server",
+    "tcp",
+    "tcp-server",
+    "udp",
+    "udp-server",
+    "unity-server",
+    "websocket",
+    "websocket-server"
+  ],
+  "default_branch": "HEAD",
+  "updated_at": "2026-04-09T09:01:14Z",
+  "archived": false,
+  "commit_sha": "",
+  "relevance_score": 0.3801,
+  "semantic_meta_score": 0.31617,
+  "semantic_readme_score": 0.26019,
+  "query_hit_count": 1,
+  "rank_reasons": [
+    "covers primary capabilities: chat messaging",
+    "README semantic score 0.26",
+    "matched 1 search families",
+    "good implementation docs or manifests",
+    "appeared across multiple idea-focused query families"
+  ],
+  "reference_type": "subsystem",
+  "fit_score": 0.3801,
+  "fit_summary": "It behaves like a subsystem reference covering chat messaging while missing travel planning.",
+  "covered_primary": [
+    "chat messaging"
+  ],
+  "missing_primary": [
+    "travel planning"
+  ],
+  "files": []
+}

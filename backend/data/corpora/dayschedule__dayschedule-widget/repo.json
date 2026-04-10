@@ -1,0 +1,45 @@
+{
+  "full_name": "dayschedule/dayschedule-widget",
+  "description": "Appointment scheduling widget to embed the booking calendar on your website for 1:1, round-robin and group bookings with Google meet, Zoom and MS Teams integrations",
+  "html_url": "https://github.com/dayschedule/dayschedule-widget",
+  "stars": 93,
+  "language": "TypeScript",
+  "topics": [
+    "appointment-api",
+    "appointment-booking",
+    "appointment-management-system",
+    "appointment-scheduler",
+    "appointment-scheduling",
+    "appointments",
+    "calendar",
+    "calendly",
+    "reservation",
+    "reservation-system",
+    "scheduling"
+  ],
+  "default_branch": "HEAD",
+  "updated_at": "2026-03-23T23:29:47Z",
+  "archived": false,
+  "commit_sha": "",
+  "relevance_score": 0.3266,
+  "semantic_meta_score": 0.33333,
+  "semantic_readme_score": 0.21155,
+  "query_hit_count": 1,
+  "rank_reasons": [
+    "covers supporting capabilities: booking and scheduling",
+    "README semantic score 0.21",
+    "matched 1 search families",
+    "good implementation docs or manifests",
+    "appeared across multiple idea-focused query families"
+  ],
+  "reference_type": "pattern",
+  "fit_score": 0.3266,
+  "fit_summary": "It behaves like a pattern reference showing useful patterns for booking and scheduling while missing marketplace matching, video or voice.",
+  "covered_primary": [],
+  "missing_primary": [
+    "marketplace matching",
+    "video or voice",
+    "payments and billing"
+  ],
+  "files": []
+}

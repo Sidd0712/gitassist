@@ -1,0 +1,51 @@
+{
+  "full_name": "Sanjeev-Kumar78/Travel-Itinerary-Generator",
+  "description": "A web-based tool that simplifies travel planning.",
+  "html_url": "https://github.com/Sanjeev-Kumar78/Travel-Itinerary-Generator",
+  "stars": 33,
+  "language": "HTML",
+  "topics": [
+    "api",
+    "bootstrap5",
+    "css",
+    "flask",
+    "frontend",
+    "html",
+    "itinerary-generator",
+    "javascript",
+    "makemytrip",
+    "python",
+    "travel",
+    "travel-planner",
+    "trip-advisor",
+    "trip-planner",
+    "weather-report",
+    "web-frontend"
+  ],
+  "default_branch": "HEAD",
+  "updated_at": "2026-03-22T23:49:44Z",
+  "archived": false,
+  "commit_sha": "",
+  "relevance_score": 0.3427,
+  "semantic_meta_score": 0.1909,
+  "semantic_readme_score": 0.36495,
+  "query_hit_count": 1,
+  "rank_reasons": [
+    "covers primary capabilities: travel planning",
+    "README semantic score 0.36",
+    "matched 1 search families",
+    "good implementation docs or manifests",
+    "discounted for emphasizing implementation scope outside the resolved idea",
+    "appeared across multiple idea-focused query families"
+  ],
+  "reference_type": "subsystem",
+  "fit_score": 0.3427,
+  "fit_summary": "It behaves like a subsystem reference covering travel planning while missing chat messaging.",
+  "covered_primary": [
+    "travel planning"
+  ],
+  "missing_primary": [
+    "chat messaging"
+  ],
+  "files": []
+}

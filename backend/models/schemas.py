@@ -38,9 +38,16 @@ class ExtractedKeywords(BaseModel):
     frameworks: list[str] = Field(default_factory=list, description="Relevant frameworks/libraries")
     languages: list[str] = Field(default_factory=list, description="Programming languages")
     summary: str = Field("", description="One-line technical summary of the idea")
+    core_intent: str = ""
     product_type: str = ""
     target_users: list[str] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)
+    primary_capabilities: list[str] = Field(default_factory=list)
+    secondary_capabilities: list[str] = Field(default_factory=list)
+    trivial_capabilities: list[str] = Field(default_factory=list)
+    capability_weights: dict[str, float] = Field(default_factory=dict)
+    domain_terms: list[str] = Field(default_factory=list)
+    tech_terms: list[str] = Field(default_factory=list)
     constraints: list[str] = Field(default_factory=list)
     likely_components: list[str] = Field(default_factory=list)
     likely_integrations: list[str] = Field(default_factory=list)
@@ -79,10 +86,15 @@ class RepoSearchResult(BaseModel):
     archived: bool = False
     commit_sha: str = ""
     relevance_score: float = 0.0
+    semantic_meta_score: float = 0.0
+    semantic_readme_score: float = 0.0
+    query_hit_count: int = 0
     rank_reasons: list[str] = Field(default_factory=list)
     reference_type: Literal["candidate", "end_to_end", "subsystem", "pattern"] = "candidate"
     fit_score: float = 0.0
     fit_summary: str = ""
+    covered_primary: list[str] = Field(default_factory=list)
+    missing_primary: list[str] = Field(default_factory=list)
     files: list[RepoFile] = Field(default_factory=list, description="Fetched source files")
 
 

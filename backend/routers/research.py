@@ -12,7 +12,7 @@ from models.schemas import AnalysisResponse, IdeaRequest, RepoSnapshot, ShallowR
 from services.github_service import (
     build_repo_fetch_plan,
     fetch_repo_snapshot,
-    fetch_shallow_repo_evidence,
+    fetch_shallow_repo_evidence_batch,
     search_repo_candidates,
 )
 from services.llm_service import build_clarification_questions, extract_keywords, generate_analysis, plan_retrieval_queries
@@ -61,16 +61,8 @@ async def research_idea(request: IdeaRequest) -> AnalysisResponse:
             )
 
         ingest_started = perf_counter()
-        snapshots: dict[str, RepoSnapshot] = {}
-        evidence_items: list[ShallowRepoEvidence] = []
-        for candidate in candidates:
-            try:
-                snapshot = await fetch_repo_snapshot(candidate)
-                evidence = await fetch_shallow_repo_evidence(snapshot)
-                snapshots[snapshot.full_name] = snapshot
-                evidence_items.append(evidence)
-            except Exception as exc:
-                logger.warning("Skipping candidate %s during shallow ingest: %s", candidate.full_name, exc)
+        settings = get_settings()
+        evidence_items = await fetch_shallow_repo_evidence_batch(candidates[: settings.RAG_README_RERANK_LIMIT])
         logger.info("Shallow ingest completed in %.2fs", perf_counter() - ingest_started)
 
         if not evidence_items:
@@ -83,33 +75,38 @@ async def research_idea(request: IdeaRequest) -> AnalysisResponse:
             )
 
         ranking_started = perf_counter()
-        ranked = rank_repo_evidence(request.idea, keywords, evidence_items)
-        settings = get_settings()
+        ranked = await rank_repo_evidence(request.idea, keywords, evidence_items)
         selected = ranked[: settings.RAG_DEEP_INDEX_REPO_LIMIT]
         logger.info(
-            "Reranking completed in %.2fs; selected %d repos for deep indexing",
+            "Reranking completed in %.2fs; selected %d repos for deep indexing and %d for output",
             perf_counter() - ranking_started,
             len(selected),
+            len(ranked),
         )
 
         index_started = perf_counter()
         corpus_service = CorpusService()
-        selected_repositories = []
+        indexed_repositories = []
         for evidence in selected:
-            snapshot = snapshots[evidence.repository.full_name]
+            snapshot = await fetch_repo_snapshot(evidence.repository)
             plan = build_repo_fetch_plan(snapshot, evidence, keywords)
             repository = await corpus_service.ensure_indexed(plan)
-            selected_repositories.append(repository)
+            indexed_repositories.append(repository)
         logger.info("Corpus indexing completed in %.2fs", perf_counter() - index_started)
 
         retrieval_started = perf_counter()
-        retrieval_plan = await plan_retrieval_queries(request.idea, keywords, selected_repositories)
+        retrieval_plan = await plan_retrieval_queries(request.idea, keywords, indexed_repositories)
         retrieval_service = RetrievalService()
-        section_hits = await retrieval_service.retrieve(retrieval_plan, selected_repositories)
+        section_hits = await retrieval_service.retrieve(retrieval_plan, indexed_repositories)
         logger.info("Retrieval completed in %.2fs", perf_counter() - retrieval_started)
 
         generation_started = perf_counter()
-        analysis = await generate_analysis(request.idea, keywords, selected_repositories, section_hits)
+        analysis = await generate_analysis(
+            request.idea,
+            keywords,
+            [evidence.repository for evidence in ranked],
+            section_hits,
+        )
         logger.info("Grounded generation completed in %.2fs", perf_counter() - generation_started)
 
         for repository in analysis.repositories:
