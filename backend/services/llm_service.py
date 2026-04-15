@@ -143,7 +143,7 @@ async def generate_analysis(
     learning_path_data = await llm.generate_learning_path(idea, keywords.model_dump(), repo_dicts)
     learning_path = [
         LearningStep(
-            step=item.get("step", i + 1),
+            step_number=item.get("step", i + 1),
             title=item.get("title", ""),
             description=item.get("description", ""),
             milestone=item.get("milestone", ""),
@@ -156,9 +156,9 @@ async def generate_analysis(
     tech_stack_data = await llm.generate_tech_stack(idea, keywords.model_dump(), repo_dicts)
     tech_stack = [
         TechRecommendation(
-            layer=item.get("layer", ""),
-            technology=item.get("technology", ""),
-            reasoning=item.get("reasoning", ""),
+            name=item.get("technology", ""),
+            category=item.get("layer", ""),
+            why_recommended=item.get("reasoning", ""),
             pros=item.get("pros", []),
             cons=item.get("cons", []),
         )

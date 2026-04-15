@@ -21,12 +21,13 @@ class Settings(BaseSettings):
     GITHUB_API_BASE: str = "https://api.github.com"
     GITHUB_SEARCH_LIMIT: int = 5  # top N repos to fetch
 
-    # LLM / HuggingFace
-    LLM_TOKEN: str = ""  # HuggingFace API token (optional, for private models)
-    LLM_MODEL: str = "HuggingFaceH4/zephyr-7b-beta"  # Free open-source model
+    # LLM / Groq API
+    GROQ_API_KEY: str = ""  # Groq API key (get from console.groq.com)
+    LLM_PROVIDER: str = "groq"
+    LLM_MODEL: str = "llama-3.3-70b-versatile"  # Groq's latest 70B model (3.1 was decommissioned)
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"  # Lightweight free embeddings
-    LLM_TIMEOUT_SECONDS: int = 120
-    LLM_MAX_RETRIES: int = 1
+    LLM_TIMEOUT_SECONDS: int = 60
+    LLM_MAX_RETRIES: int = 3
 
     # Cache
     GITHUB_CACHE_TTL: int = 3600  # seconds

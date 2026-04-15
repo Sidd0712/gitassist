@@ -19,122 +19,14 @@ logger = logging.getLogger(__name__)
 
 _cache: TTLCache = TTLCache(maxsize=512, ttl=get_settings().GITHUB_CACHE_TTL)
 
-SOURCE_EXTENSIONS = {
-    ".py",
-    ".js",
-    ".ts",
-    ".tsx",
-    ".jsx",
-    ".java",
-    ".go",
-    ".rs",
-    ".rb",
-    ".php",
-    ".c",
-    ".cpp",
-    ".h",
-    ".hpp",
-    ".cs",
-    ".swift",
-    ".kt",
-    ".scala",
-    ".lua",
-    ".sh",
-    ".bash",
-    ".zsh",
-    ".ps1",
-    ".html",
-    ".css",
-    ".scss",
-    ".less",
-    ".vue",
-    ".svelte",
-    ".json",
-    ".yaml",
-    ".yml",
-    ".toml",
-    ".ini",
-    ".cfg",
-    ".md",
-    ".txt",
-    ".rst",
-    ".dockerfile",
-}
+# SOURCE_EXTENSIONS removed - AI will determine file relevance based on project intent
 
-IMPORTANT_FILENAMES = {
-    "dockerfile",
-    "docker-compose.yml",
-    "docker-compose.yaml",
-    "makefile",
-    "cmakelists.txt",
-    "cargo.toml",
-    "go.mod",
-    "package.json",
-    "package-lock.json",
-    "pnpm-lock.yaml",
-    "requirements.txt",
-    "poetry.lock",
-    "pyproject.toml",
-    "pipfile",
-    "readme.md",
-    "readme",
-    "license",
-}
+# IMPORTANT_FILENAMES removed - AI will prioritize files based on project intent
+# SKIP_PATH_PARTS removed - AI will determine which paths to skip
 
-SKIP_PATH_PARTS = {
-    ".git/",
-    "node_modules/",
-    "dist/",
-    "build/",
-    ".next/",
-    "coverage/",
-    "__pycache__/",
-    "vendor/",
-    "target/",
-    ".venv/",
-}
+# CAPABILITY_SEARCH_TERMS removed - now using AI to generate search terms dynamically
 
-CAPABILITY_SEARCH_TERMS = {
-    "travel planning": ["travel-planner", "trip-planner", "itinerary", "travel"],
-    "recommendation and ranking": ["recommendation", "personalized", "ranking", "matching"],
-    "ingredient inventory": ["pantry", "fridge", "ingredients", "inventory"],
-    "recipe recommendation": ["recipe", "recipes", "meal", "ingredients", "recommendation"],
-    "meal planning": ["meal-prep", "meal-planner", "meal", "planning"],
-    "grocery planning": ["grocery", "shopping-list", "meal-prep"],
-    "nutrition tracking": ["nutrition", "calories", "macros", "meal"],
-    "realtime collaboration": ["realtime", "collaborative", "websocket", "sync"],
-    "canvas rendering": ["whiteboard", "canvas", "drawing"],
-    "chat messaging": ["chat", "messaging", "socket"],
-    "booking and scheduling": ["booking", "appointment", "scheduler"],
-    "marketplace matching": ["marketplace", "platform", "listing", "matching"],
-    "payments and billing": ["payments", "stripe", "checkout"],
-    "authentication": ["auth", "login"],
-    "roles and permissions": ["roles", "permissions"],
-    "ai features": ["ai", "llm", "openai", "assistant"],
-    "file uploads": ["upload", "storage"],
-    "search and filtering": ["search", "filter"],
-    "maps and geolocation": ["maps", "geolocation"],
-    "notifications": ["notifications", "email"],
-    "video or voice": ["video", "webrtc", "call"],
-}
-
-LOW_VALUE_PATTERNS = (
-    "awesome-",
-    "boilerplate",
-    "challenge",
-    "cheatsheet",
-    "course",
-    "example",
-    "exercise",
-    "leetcode",
-    "list",
-    "roadmap",
-    "scaffold",
-    "starter",
-    "template",
-    "test",
-    "tutorial",
-)
+# LOW_VALUE_PATTERNS removed - now using AI to evaluate repository quality
 
 
 def _headers() -> dict[str, str]:
@@ -183,63 +75,51 @@ def _path_priority(path: str, idea_terms: set[str]) -> int:
     return score
 
 
-def build_search_queries(keywords: ExtractedKeywords) -> list[str]:
-    """Build multiple GitHub search queries from normalized intent."""
-
+async def build_search_queries(keywords: ExtractedKeywords) -> list[str]:
+    """Build multiple GitHub search queries using AI."""
+    
+    from services.llm_client import get_llm_client
+    
     settings = get_settings()
-    query_limit = settings.RAG_QUERY_LIMIT
+    llm = get_llm_client()
+    
+    idea_context = f"{keywords.core_intent or keywords.summary}. Capabilities: {', '.join(keywords.primary_capabilities or keywords.capabilities[:3])}"
+    
+    # Generate queries for primary capabilities using AI
     queries: list[str] = []
-    product_terms = _clean_query_terms((keywords.product_type or "").split())
-    core_terms = _clean_query_terms((keywords.core_intent or keywords.summary).replace(".", "").split())
-    domain_terms = _clean_query_terms(keywords.domain_terms[:10])
-    primary_capabilities = keywords.primary_capabilities or keywords.capabilities[:3]
-    secondary_capabilities = keywords.secondary_capabilities or keywords.capabilities[3:6]
-    keyword_terms = _clean_query_terms(keywords.keywords[:10])
-
-    if product_terms or domain_terms:
-        queries.append(_query_join([*product_terms[:2], *domain_terms[:3]]))
-
-    for capability in primary_capabilities[:3]:
-        capability_terms = _clean_query_terms(CAPABILITY_SEARCH_TERMS.get(capability, capability.split()))
-        queries.append(_query_join(capability_terms[:4]))
-
-    if len(primary_capabilities) >= 2:
-        grouped_terms: list[str] = []
-        for capability in primary_capabilities[:2]:
-            grouped_terms.extend(CAPABILITY_SEARCH_TERMS.get(capability, capability.split())[:2])
-        queries.append(_query_join(_clean_query_terms([*product_terms[:2], *grouped_terms])[:6]))
-
-    for capability in secondary_capabilities[:3]:
-        subsystem_terms = _clean_query_terms(CAPABILITY_SEARCH_TERMS.get(capability, capability.split()))
-        queries.append(_query_join(subsystem_terms[:4]))
-
-    if keyword_terms:
-        queries.append(_query_join(keyword_terms[:5]))
-    if core_terms:
-        queries.append(_query_join(core_terms[:5]))
+    
+    for capability in (keywords.primary_capabilities or keywords.capabilities[:3]):
+        try:
+            capability_queries = await llm.generate_search_queries(capability, idea_context, num_queries=2)
+            queries.extend(capability_queries)
+        except Exception as exc:
+            logger.warning("Failed to generate AI queries for %s: %s", capability, exc)
+            # Simple fallback query without hardcoded terms
+            queries.append(f"{capability} {keywords.product_type or ''}")
+    
+    # Add broad domain query
+    if keywords.domain_terms:
+        queries.append(" ".join(keywords.domain_terms[:3]))
+    
+    # Add language-qualified query if specified
     if keywords.languages:
-        language_name = keywords.languages[0]
-        qualifier_terms = product_terms[:2] or domain_terms[:3] or keyword_terms[:3]
-        queries.append(f"{_query_join(qualifier_terms)} language:{language_name}")
-
+        qualifier = " ".join([keywords.product_type or "", keywords.core_intent or ""][:2]).strip()
+        if qualifier:
+            queries.append(f"{qualifier} language:{keywords.languages[0]}")
+    
+    # Deduplicate
     deduped: list[str] = []
     seen: set[str] = set()
     for query in queries:
-        normalized = " ".join(part for part in query.split() if part)
+        normalized = " ".join(part for part in query.split() if part).strip()
         if not normalized or normalized.lower() in seen:
             continue
         deduped.append(normalized)
         seen.add(normalized.lower())
-        if len(deduped) >= query_limit:
+        if len(deduped) >= settings.RAG_QUERY_LIMIT:
             break
-    return deduped
-
-
-def _capability_terms(capabilities: list[str]) -> list[str]:
-    terms: list[str] = []
-    for capability in capabilities:
-        terms.extend(CAPABILITY_SEARCH_TERMS.get(capability, capability.split()))
-    return _clean_query_terms(terms)
+    
+    return deduped or [keywords.summary]  # Ultimate fallback to avoid empty list
 
 
 def _clean_query_terms(terms: list[str]) -> list[str]:
@@ -264,20 +144,7 @@ def _language_bucket(language: str | None) -> str:
     return (language or "Unknown").strip() or "Unknown"
 
 
-def _candidate_quality_penalty(repo: RepoSearchResult) -> float:
-    lowered = f"{repo.full_name} {repo.description or ''} {' '.join(repo.topics)}".lower()
-    penalty = 0.0
-    if any(pattern in lowered for pattern in LOW_VALUE_PATTERNS):
-        penalty += 0.2
-    if repo.archived:
-        penalty += 0.25
-    return min(penalty, 0.4)
-
-
-def _candidate_quality_score(repo: RepoSearchResult) -> float:
-    penalty = _candidate_quality_penalty(repo)
-    star_score = min(math.log10(repo.stars + 10) / 4.0, 1.0)
-    return max(0.0, (0.3 * star_score) - penalty)
+# _candidate_quality_penalty and _candidate_quality_score removed - using AI evaluation
 
 
 def _intent_search_text(keywords: ExtractedKeywords) -> str:
@@ -315,7 +182,7 @@ async def search_repo_candidates(keywords: ExtractedKeywords) -> list[RepoSearch
     """Search GitHub using multiple query variants and merge candidates."""
 
     settings = get_settings()
-    queries = build_search_queries(keywords)
+    queries = await build_search_queries(keywords)
     if not queries:
         return []
 
@@ -375,12 +242,35 @@ async def search_repo_candidates(keywords: ExtractedKeywords) -> list[RepoSearch
     intent_embedding = await embedding_service.embed_query(intent_text)
     metadata_embeddings = await embedding_service.embed_documents([_repo_metadata_text(repo) for repo in candidates])
 
+    # Use AI to determine optimal scoring weights
+    from services.llm_client import get_llm_client
+    llm = get_llm_client()
+    
+    try:
+        weights = await llm.calculate_ranking_weights(keywords.summary or keywords.core_intent, len(candidates))
+    except Exception as exc:
+        logger.warning("Failed to get AI ranking weights: %s. Using semantic-first defaults.", exc)
+        weights = {
+            "readme_semantic": 0.7,
+            "metadata_semantic": 0.15,
+            "capability_coverage": 0.1,
+            "doc_quality": 0.0,
+            "query_diversity": 0.05,
+            "star_quality": 0.0,
+        }
+    
     preliminary: list[RepoSearchResult] = []
     for repo, embedding in zip(candidates, metadata_embeddings):
         repo.query_hit_count = len(query_map[repo.full_name])
         repo.semantic_meta_score = round(_cosine_similarity(intent_embedding, embedding), 5)
         query_score = repo.query_hit_count / max(query_hit_max, 1)
-        quality_score = _candidate_quality_score(repo)
+        
+        # Simple quality indicators without hardcoded patterns
+        is_archived = repo.archived
+        has_recent_activity = repo.updated_at is not None
+        star_score = min(math.log10(repo.stars + 10) / 4.0, 1.0)
+        quality_score = star_score * (0.5 if is_archived else 1.0) * (1.1 if has_recent_activity else 0.9)
+        
         coverage_overlap = len(
             {
                 term.lower()
@@ -388,13 +278,15 @@ async def search_repo_candidates(keywords: ExtractedKeywords) -> list[RepoSearch
                 if term and term.lower() in _repo_metadata_text(repo).lower()
             }
         ) / max(len(keywords.primary_capabilities[:3]) + len(keywords.domain_terms[:6]), 1)
+        
+        # Use AI-determined weights
         repo.relevance_score = round(
             max(
                 0.0,
-                (0.60 * repo.semantic_meta_score)
-                + (0.20 * query_score)
-                + (0.10 * coverage_overlap)
-                + (0.10 * quality_score),
+                (weights.get("metadata_semantic", 0.6) * repo.semantic_meta_score)
+                + (weights.get("query_diversity", 0.2) * query_score)
+                + (weights.get("capability_coverage", 0.1) * coverage_overlap)
+                + (weights.get("star_quality", 0.1) * quality_score),
             ),
             5,
         )
@@ -405,11 +297,15 @@ async def search_repo_candidates(keywords: ExtractedKeywords) -> list[RepoSearch
         preliminary.append(repo)
 
     preliminary.sort(key=lambda repo: repo.relevance_score, reverse=True)
+    
+    # Apply diversity constraints from config (not hardcoded)
     language_counts: defaultdict[str, int] = defaultdict(int)
     shortlisted: list[RepoSearchResult] = []
+    max_per_language = settings.RAG_MAX_PER_LANGUAGE if hasattr(settings, 'RAG_MAX_PER_LANGUAGE') else 999
+    
     for repo in preliminary:
         bucket = _language_bucket(repo.language)
-        if language_counts[bucket] >= 12:
+        if language_counts[bucket] >= max_per_language:
             continue
         shortlisted.append(repo)
         language_counts[bucket] += 1

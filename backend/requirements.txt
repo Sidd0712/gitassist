@@ -3,12 +3,8 @@ uvicorn[standard]
 pydantic
 pydantic-settings
 httpx
-langchain-huggingface
+groq
 chromadb
 python-dotenv
 cachetools
 sentence-transformers
-transformers
-torch
-accelerate
-tf-keras

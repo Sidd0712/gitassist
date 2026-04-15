@@ -1,57 +1,65 @@
-"""HuggingFace LLM client for all model-based analysis."""
+"""Groq API LLM client for all model-based analysis."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-from concurrent.futures import ThreadPoolExecutor
 
-from langchain_community.llms import HuggingFacePipeline
-from transformers import pipeline
+from groq import AsyncGroq, RateLimitError, APIError
 
 from core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Thread pool for running sync model operations without blocking
-_executor = ThreadPoolExecutor(max_workers=1)
-
 
 class LLMClient:
-    """Unified interface for HuggingFace model interactions."""
+    """Unified interface for Groq API interactions."""
 
     def __init__(self) -> None:
         self.settings = get_settings()
-        self._client = None
+        if not self.settings.GROQ_API_KEY:
+            logger.warning("GROQ_API_KEY not set. Please add it to your .env file.")
+            logger.warning("Get your free API key at: https://console.groq.com")
+        self.client = AsyncGroq(api_key=self.settings.GROQ_API_KEY)
+        self.model = self.settings.LLM_MODEL
+        logger.info("✓ Groq API client initialized (model: %s)", self.model)
 
-    def _get_client(self) -> HuggingFacePipeline:
-        """Lazy-load the HuggingFace model."""
-        if self._client is None:
-            logger.info("Initializing HuggingFace LLM: %s", self.settings.LLM_MODEL)
+    async def _call_api(self, prompt: str, temperature: float = 0.7, max_tokens: int = 2048) -> str:
+        """Make async API call to Groq with retry logic."""
+        max_retries = self.settings.LLM_MAX_RETRIES
+        
+        for attempt in range(max_retries):
             try:
-                # Create the transformers pipeline first
-                hf_pipeline = pipeline(
-                    "text-generation",
-                    model=self.settings.LLM_MODEL,
-                    device_map="auto",  # Automatically use GPU if available
-                    model_kwargs={
-                        "temperature": 0.7,
-                        "max_new_tokens": 1024,
-                        "torch_dtype": "auto",
-                    },
+                logger.debug(f"Groq API call: model={self.model}, temp={temperature}, prompt_len={len(prompt)}")
+                
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
                 )
                 
-                # Wrap in LangChain
-                self._client = HuggingFacePipeline(
-                    model=hf_pipeline,
-                )
-                logger.info("✓ HuggingFace LLM loaded successfully")
-            except Exception as exc:
-                logger.error("Failed to initialize HuggingFace LLM: %s", exc)
-                logger.error("Make sure the model '%s' is valid", self.settings.LLM_MODEL)
+                result = response.choices[0].message.content
+                logger.debug(f"Groq API response: {len(result)} chars")
+                return result
+                
+            except RateLimitError as exc:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                    logger.warning(f"Rate limit hit (attempt {attempt + 1}/{max_retries}), waiting {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error("Rate limit exceeded after %d retries", max_retries)
+                    raise
+                    
+            except APIError as exc:
+                logger.error(f"Groq API error: {exc}")
                 raise
-        return self._client
+                
+            except Exception as exc:
+                logger.error(f"Unexpected error calling Groq API: {exc}")
+                raise
 
     async def extract_keywords(self, idea: str, clarification_answers: dict[str, str] | None = None) -> dict:
         """Use model to extract technical keywords and capabilities from user idea."""
@@ -88,12 +96,8 @@ Extract and return ONLY valid JSON (no markdown, no explanation):
 }}"""
 
         try:
-            client = self._get_client()
-            # Use executor to avoid blocking
-            response = await asyncio.get_event_loop().run_in_executor(
-                _executor,
-                lambda: client.invoke(prompt)
-            )
+            # Use low temperature for consistent structured output
+            response = await self._call_api(prompt, temperature=0.3, max_tokens=1500)
             
             # Parse JSON from response
             result = self._parse_json_response(response)
@@ -128,19 +132,15 @@ Return ONLY valid JSON array (no markdown):
 ]"""
 
         try:
-            client = self._get_client()
-            response = await asyncio.get_event_loop().run_in_executor(
-                _executor,
-                lambda: client.invoke(prompt)
-            )
+            response = await self._call_api(prompt, temperature=0.5, max_tokens=800)
             questions = self._parse_json_response(response)
             if not isinstance(questions, list):
                 questions = [questions]
             logger.info("✓ Generated %d clarification questions", len(questions))
-            return questions[:4]  # Limit to 4 questions
+            return questions
         except Exception as exc:
             logger.error("Clarification question generation failed: %s", exc)
-            return []
+            raise
 
     async def plan_retrieval_queries(self, idea: str, keywords: dict, repositories: list[dict]) -> dict:
         """Use model to generate targeted retrieval queries for each analysis section."""
@@ -167,14 +167,10 @@ Return ONLY valid JSON (no markdown):
 }}"""
 
         try:
-            client = self._get_client()
-            response = await asyncio.get_event_loop().run_in_executor(
-                _executor,
-                lambda: client.invoke(prompt)
-            )
-            result = self._parse_json_response(response)
-            logger.info("✓ Generated %d retrieval queries", len(result.get("queries", [])))
-            return result
+            response = await self._call_api(prompt, temperature=0.4, max_tokens=1200)
+            plan = self._parse_json_response(response)
+            logger.info("✓ Retrieval plan generated for %d sections", len(plan.get("queries", [])))
+            return plan
         except Exception as exc:
             logger.error("Retrieval planning failed: %s", exc)
             raise
@@ -204,11 +200,7 @@ Return as JSON array:
 No markdown, just the JSON array."""
 
         try:
-            client = self._get_client()
-            response = await asyncio.get_event_loop().run_in_executor(
-                _executor,
-                lambda: client.invoke(prompt)
-            )
+            response = await self._call_api(prompt, temperature=0.6, max_tokens=1500)
             descriptions = self._parse_json_response(response)
             if not isinstance(descriptions, list):
                 descriptions = [descriptions]
@@ -216,7 +208,7 @@ No markdown, just the JSON array."""
             return descriptions
         except Exception as exc:
             logger.error("Repository description generation failed: %s", exc)
-            return [f"Repository reference for {keywords.get('product_type', 'project')}"] * len(repositories)
+            raise
 
     async def generate_learning_path(self, idea: str, keywords: dict, repositories: list[dict]) -> list[dict]:
         """Use model to generate step-by-step learning path."""
@@ -241,11 +233,7 @@ Generate 6-8 concrete learning steps with milestones. Return JSON array (no mark
 ]"""
 
         try:
-            client = self._get_client()
-            response = await asyncio.get_event_loop().run_in_executor(
-                _executor,
-                lambda: client.invoke(prompt)
-            )
+            response = await self._call_api(prompt, temperature=0.7, max_tokens=2000)
             path = self._parse_json_response(response)
             if not isinstance(path, list):
                 path = [path]
@@ -253,7 +241,7 @@ Generate 6-8 concrete learning steps with milestones. Return JSON array (no mark
             return path
         except Exception as exc:
             logger.error("Learning path generation failed: %s", exc)
-            return []
+            raise
 
     async def generate_tech_stack(self, idea: str, keywords: dict, repositories: list[dict]) -> list[dict]:
         """Use model to recommend technology decisions."""
@@ -284,11 +272,7 @@ Return JSON array (no markdown):
 ]"""
 
         try:
-            client = self._get_client()
-            response = await asyncio.get_event_loop().run_in_executor(
-                _executor,
-                lambda: client.invoke(prompt)
-            )
+            response = await self._call_api(prompt, temperature=0.6, max_tokens=1800)
             stack = self._parse_json_response(response)
             if not isinstance(stack, list):
                 stack = [stack]
@@ -296,7 +280,7 @@ Return JSON array (no markdown):
             return stack
         except Exception as exc:
             logger.error("Tech stack generation failed: %s", exc)
-            return []
+            raise
 
     async def generate_architecture_diagram(self, idea: str, keywords: dict, repositories: list[dict]) -> str:
         """Use model to generate Mermaid diagram code."""
@@ -321,11 +305,7 @@ graph TD
   ...nodes and connections..."""
 
         try:
-            client = self._get_client()
-            response = await asyncio.get_event_loop().run_in_executor(
-                _executor,
-                lambda: client.invoke(prompt)
-            )
+            response = await self._call_api(prompt, temperature=0.5, max_tokens=1200)
             # Clean response
             diagram = response.strip()
             if diagram.startswith("```"):
@@ -334,7 +314,154 @@ graph TD
             return diagram
         except Exception as exc:
             logger.error("Architecture diagram generation failed: %s", exc)
-            return "graph TD\n  A[User] --> B[API]\n  B --> C[Database]"
+            raise
+
+    async def generate_search_queries(self, capability: str, idea_context: str, num_queries: int = 3) -> list[str]:
+        """Generate GitHub search queries for a capability using AI."""
+        
+        prompt = f"""Generate {num_queries} diverse GitHub search queries to find repositories that implement: {capability}
+
+Project context: {idea_context}
+
+Return ONLY a JSON array of search query strings:
+["query 1", "query 2", "query 3"]"""
+
+        response = await self._call_api(prompt, temperature=0.4, max_tokens=400)
+        return self._parse_json_response(response)
+
+    async def evaluate_repository_quality(self, repo_name: str, description: str, readme: str, topics: list[str]) -> dict:
+        """Evaluate repository quality and relevance using AI."""
+        
+        prompt = f"""Evaluate this GitHub repository's quality and purpose.
+
+Repository: {repo_name}
+Description: {description}
+Topics: {', '.join(topics)}
+README preview: {readme[:800]}
+
+Return JSON with:
+{{
+  "quality_score": 0.0-1.0,
+  "is_template_or_tutorial": true/false,
+  "is_production_quality": true/false,
+  "primary_purpose": "description",
+  "reasoning": "why this score"
+}}"""
+
+        response = await self._call_api(prompt, temperature=0.3, max_tokens=600)
+        return self._parse_json_response(response)
+
+    async def prioritize_files(self, file_paths: list[str], project_intent: str, max_files: int = 30) -> list[dict]:
+        """Rank files by relevance to project intent using AI."""
+        
+        prompt = f"""Given this project intent: {project_intent}
+
+Rank these files by relevance (most important first):
+{chr(10).join(file_paths[:100])}
+
+Return top {max_files} as JSON array:
+[{{
+  "path": "file path",
+  "priority_score": 0.0-1.0,
+  "reason": "why important"
+}}]"""
+
+        response = await self._call_api(prompt, temperature=0.4, max_tokens=1000)
+        return self._parse_json_response(response)
+
+    async def evaluate_capability_match(self, capability: str, repo_text: str, keywords_context: dict) -> float:
+        """Score how well a repository supports a capability using AI."""
+        
+        prompt = f"""Does this repository support the capability: {capability}?
+
+Repository text:
+{repo_text[:2000]}
+
+Project keywords: {keywords_context.get('keywords', [])}
+Domain terms: {keywords_context.get('domain_terms', [])}
+
+Return JSON:
+{{
+  "match_score": 0.0-1.0,
+  "confidence": "high|medium|low",
+  "evidence": "brief explanation"
+}}"""
+
+        response = await self._call_api(prompt, temperature=0.3, max_tokens=400)
+        result = self._parse_json_response(response)
+        return result.get("match_score", 0.0)
+
+    async def calculate_ranking_weights(self, idea: str, repositories_count: int) -> dict:
+        """Determine optimal repository ranking weights using AI."""
+        
+        prompt = f"""For ranking {repositories_count} repositories for this idea:
+{idea}
+
+Determine importance weights for:
+- readme_semantic_score
+- metadata_semantic_score
+- capability_coverage
+- documentation_quality
+- query_diversity
+- star_quality
+
+Return JSON with weights 0.0-1.0 that sum to 1.0:
+{{
+  "readme_semantic": 0.0-1.0,
+  "metadata_semantic": 0.0-1.0,
+  "capability_coverage": 0.0-1.0,
+  "doc_quality": 0.0-1.0,
+  "query_diversity": 0.0-1.0,
+  "star_quality": 0.0-1.0
+}}"""
+
+        response = await self._call_api(prompt, temperature=0.4, max_tokens=500)
+        return self._parse_json_response(response)
+
+    async def determine_retrieval_weights(self, query_type: str, context: str) -> dict:
+        """Calculate optimal retrieval scoring weights using AI."""
+        
+        prompt = f"""For a {query_type} retrieval query in this context:
+{context}
+
+Determine optimal weights for combining these signals:
+- dense_score (semantic similarity via embeddings)
+- lexical_score (keyword/BM25 matching)
+- repo_prior (repository quality/relevance)
+- role_prior (chunk type relevance)
+
+Return JSON with weights that sum to 1.0:
+{{
+  "dense_weight": 0.0-1.0,
+  "lexical_weight": 0.0-1.0,
+  "repo_weight": 0.0-1.0,
+  "role_weight": 0.0-1.0
+}}"""
+
+        response = await self._call_api(prompt, temperature=0.4, max_tokens=400)
+        return self._parse_json_response(response)
+
+    async def assess_document_quality(self, text: str) -> float:
+        """Evaluate documentation quality using AI."""
+        
+        prompt = f"""Rate this documentation's quality:
+
+{text[:1500]}
+
+Consider:
+- Completeness
+- Clarity
+- Usefulness for learning
+- Examples and code samples
+
+Return JSON:
+{{
+  "quality_score": 0.0-1.0
+}}"""
+
+        response = await self._call_api(prompt, temperature=0.3, max_tokens=300)
+        result = self._parse_json_response(response)
+        return result.get("quality_score", 0.0)
 
     def _parse_json_response(self, response: str) -> dict | list:
         """Extract and parse JSON from model response."""
@@ -375,8 +502,9 @@ graph TD
                 except json.JSONDecodeError:
                     pass
         
-        logger.warning("Could not parse JSON from response: %s", response[:200])
-        return {} if "{" in response else []
+        # FAIL FAST: No fallback, raise error
+        logger.error("Failed to parse JSON from AI response: %s", response[:200])
+        raise ValueError(f"AI model did not return valid JSON. Response preview: {response[:200]}")
 
 
 # Singleton instance

@@ -27,13 +27,8 @@ class EmbeddingService:
         
         try:
             logger.info("Initializing HuggingFace embeddings with model: %s", self.settings.EMBEDDING_MODEL)
-            kwargs = {
-                "model_name": self.settings.EMBEDDING_MODEL,
-            }
-            if self.settings.LLM_TOKEN.strip():
-                kwargs["huggingfacehub_api_token"] = self.settings.LLM_TOKEN
-            
-            return HuggingFaceEmbeddings(**kwargs)
+            # sentence-transformers models are free and don't require API token
+            return HuggingFaceEmbeddings(model_name=self.settings.EMBEDDING_MODEL)
         except Exception as exc:
             logger.error("Failed to initialize HuggingFace embeddings: %s", exc)
             raise

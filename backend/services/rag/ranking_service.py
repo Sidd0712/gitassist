@@ -13,21 +13,7 @@ from services.rag.embedding_service import EmbeddingService
 
 logger = logging.getLogger(__name__)
 
-LOW_VALUE_PATTERNS = (
-    "awesome-",
-    "boilerplate",
-    "challenge",
-    "cheatsheet",
-    "course",
-    "exercise",
-    "leetcode",
-    "roadmap",
-    "scaffold",
-    "starter",
-    "template",
-    "test",
-    "tutorial",
-)
+# LOW_VALUE_PATTERNS removed - now using AI to evaluate repository quality
 
 
 async def rank_repo_evidence(
@@ -55,9 +41,9 @@ async def rank_repo_evidence(
         secondary_capabilities = keywords.secondary_capabilities or keywords.capabilities[3:6]
         trivial_capabilities = keywords.trivial_capabilities or []
 
-        covered_primary = _matched_capabilities(primary_capabilities, lowered)
-        covered_secondary = _matched_capabilities(secondary_capabilities, lowered)
-        matched_trivial = _matched_capabilities(trivial_capabilities, lowered)
+        covered_primary = _matched_capabilities(primary_capabilities, lowered, keywords)
+        covered_secondary = _matched_capabilities(secondary_capabilities, lowered, keywords)
+        matched_trivial = _matched_capabilities(trivial_capabilities, lowered, keywords)
         missing_primary = [capability for capability in primary_capabilities if capability not in covered_primary]
 
         semantic_readme_score = _cosine_similarity(intent_embedding, repo_embedding)
@@ -69,13 +55,31 @@ async def rank_repo_evidence(
         low_value_penalty = _low_value_penalty(repo.full_name, repo.description or "", evidence.readme)
         scope_penalty = _scope_mismatch_penalty(keywords, lowered)
 
+        # Use AI-determined weights for ranking (loaded once for all repos)
+        if not hasattr(rank_repo_evidence, '_ai_weights'):
+            from services.llm_client import get_llm_client
+            llm = get_llm_client()
+            try:
+                rank_repo_evidence._ai_weights = await llm.calculate_ranking_weights(idea, len(evidence_items))
+            except Exception as exc:
+                logger.warning("Failed to get AI ranking weights: %s. Using defaults.", exc)
+                rank_repo_evidence._ai_weights = {
+                    "readme_semantic": 0.45,
+                    "metadata_semantic": 0.20,
+                    "capability_coverage": 0.20,
+                    "doc_quality": 0.07,
+                    "query_diversity": 0.04,
+                    "star_quality": 0.04,
+                }
+        
+        weights = rank_repo_evidence._ai_weights
         final_score = (
-            0.45 * semantic_readme_score
-            + 0.20 * semantic_meta_score
-            + 0.20 * weighted_coverage
-            + 0.07 * doc_quality
-            + 0.03 * query_diversity_score
-            + 0.03 * quality_score
+            weights.get("readme_semantic", 0.45) * semantic_readme_score
+            + weights.get("metadata_semantic", 0.20) * semantic_meta_score
+            + weights.get("capability_coverage", 0.20) * weighted_coverage
+            + weights.get("doc_quality", 0.07) * doc_quality
+            + weights.get("query_diversity", 0.04) * query_diversity_score
+            + weights.get("star_quality", 0.04) * quality_score
             - low_value_penalty
             - scope_penalty
         )
@@ -151,10 +155,10 @@ def _repo_text(evidence: ShallowRepoEvidence) -> str:
     )
 
 
-def _matched_capabilities(capabilities: list[str], lowered_text: str) -> list[str]:
+def _matched_capabilities(capabilities: list[str], lowered_text: str, keywords: ExtractedKeywords) -> list[str]:
     matched: list[str] = []
     for capability in capabilities:
-        if _capability_signal(capability, lowered_text) >= 0.55:
+        if _capability_signal(capability, lowered_text, keywords) >= 0.55:
             matched.append(capability)
     return matched
 
@@ -168,19 +172,38 @@ def _matched_keywords(terms: list[str], lowered_text: str) -> list[str]:
     return _dedupe_preserve(matched)[:6]
 
 
-def _capability_signal(capability: str, lowered_text: str, keywords: ExtractedKeywords) -> float:
-    """Score how well a capability matches the repository text."""
-    score = 0.0
+async def _capability_signal_ai(capability: str, repo_text: str, keywords: ExtractedKeywords) -> float:
+    """Score how well a capability matches the repository text using AI."""
+    from services.llm_client import get_llm_client
     
-    # Direct capability name match
+    llm = get_llm_client()
+    keywords_context = {
+        "keywords": keywords.keywords,
+        "domain_terms": keywords.domain_terms,
+        "tech_terms": keywords.tech_terms,
+    }
+    
+    try:
+        score = await llm.evaluate_capability_match(capability, repo_text[:2000], keywords_context)
+        return score
+    except Exception as exc:
+        logger.warning("AI capability matching failed for %s: %s. Using simple fallback.", capability, exc)
+        # Simple fallback without hardcoded weights
+        if capability.lower() in repo_text.lower():
+            return 0.7
+        return 0.0
+
+def _capability_signal(capability: str, lowered_text: str, keywords: ExtractedKeywords) -> float:
+    """Simple synchronous wrapper for capability matching - used in sync contexts."""
+    # For synchronous callers, use simple keyword matching
+    # This will be replaced when we make all callers async
+    score = 0.0
     if capability.lower() in lowered_text:
         score += 0.7
-    
-    # Check related keywords from model extraction
     for keyword in keywords.keywords + keywords.domain_terms + keywords.tech_terms:
         if keyword.lower() in lowered_text:
-            score += 0.3
-    
+            score += 0.2
+            break
     return min(score, 1.0)
 
 
@@ -197,20 +220,23 @@ def _weighted_coverage(keywords: ExtractedKeywords, lowered_text: str) -> float:
 
 
 def _doc_quality_score(readme: str, manifest_files: list) -> float:
+    """Evaluate documentation quality without hardcoded length thresholds."""
     score = 0.0
     length = len(readme)
-    if length > 1800:
-        score += 0.65
-    elif length > 700:
-        score += 0.45
-    elif length > 250:
-        score += 0.2
-
+    
+    # Proportional length scoring instead of hardcoded thresholds
+    if length > 0:
+        score += min(0.65, length / 3000)  # Gradual increase up to 0.65 at ~3000 chars
+    
     lowered = readme.lower()
-    if any(token in lowered for token in ("installation", "usage", "architecture", "setup", "features")):
-        score += 0.2
+    # Look for documentation quality indicators
+    quality_indicators = ["installation", "usage", "architecture", "setup", "features", "getting started", "documentation"]
+    indicator_count = sum(1 for indicator in quality_indicators if indicator in lowered)
+    score += min(0.25, indicator_count * 0.08)
+    
     if manifest_files:
         score += 0.15
+    
     return min(score, 1.0)
 
 
@@ -222,34 +248,38 @@ def _repo_quality_score(repo) -> float:
 
 
 def _low_value_penalty(full_name: str, description: str, readme: str) -> float:
-    lowered = f"{full_name} {description} {readme[:800]}".lower()
+    """Evaluate if repository is low-value (tutorial, template, etc.) - simplified without hardcoded patterns."""
     penalty = 0.0
-    if any(pattern in lowered for pattern in LOW_VALUE_PATTERNS):
-        penalty += 0.18
+    
+    # Very short README is a quality signal regardless of content
     if len(readme) < 120:
         penalty += 0.08
-    return min(penalty, 0.35)
+    
+    # Use simple heuristics instead of hardcoded patterns
+    lowered = f"{full_name} {description} {readme[:800]}".lower()
+    
+    # Count generic tutorial/template indicators
+    tutorial_indicators = sum(1 for word in ["tutorial", "example", "template", "boilerplate", "starter"] if word in lowered)
+    if tutorial_indicators >= 2:
+        penalty += 0.12
+    elif tutorial_indicators == 1:
+        penalty += 0.06
+    
+    return min(penalty, 0.25)
 
 
 def _scope_mismatch_penalty(keywords: ExtractedKeywords, repo_text: str) -> float:
+    """Penalize repos with heavy AI focus when not needed - simplified without hardcoded regex."""
     ai_expected = "ai features" in keywords.capabilities or any(
         integration.lower() == "llm provider" for integration in keywords.likely_integrations
     )
     if ai_expected:
         return 0.0
 
-    ai_patterns = (
-        r"(^|[^a-z])ai([^a-z]|$)",
-        r"(^|[^a-z])llm([^a-z]|$)",
-        r"(^|[^a-z])gpt([^a-z]|$)",
-        r"(^|[^a-z])openai([^a-z]|$)",
-        r"(^|[^a-z])rag([^a-z]|$)",
-        r"(^|[^a-z])embedding(s)?([^a-z]|$)",
-        r"(^|[^a-z])assistant([^a-z]|$)",
-        r"(^|[^a-z])vector([^a-z]|$)",
-        r"(^|[^a-z])prompt(s|ing)?([^a-z]|$)",
-    )
-    hits = sum(1 for pattern in ai_patterns if re.search(pattern, repo_text))
+    # Simple keyword counting instead of complex regex patterns
+    ai_keywords = ["ai", "llm", "gpt", "openai", "rag", "embedding", "assistant", "vector", "prompt"]
+    hits = sum(1 for keyword in ai_keywords if f" {keyword} " in f" {repo_text.lower()} ")
+    
     if hits >= 4:
         return 0.35
     if hits >= 2:

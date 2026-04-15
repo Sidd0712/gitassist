@@ -37,8 +37,9 @@ class RetrievalService:
             query_embedding = await self.embedding_service.embed_query(query.query)
             dense_hits = self.store.dense_search(query_embedding, allowed_repos, query.top_k)
             lexical_hits = self.store.lexical_search(query.query, allowed_repos, query.top_k)
-            merged_hits = self._merge_hits(
+            merged_hits = await self._merge_hits(
                 section=query.section,
+                query_text=query.query,
                 dense_hits=dense_hits,
                 lexical_hits=lexical_hits,
                 repo_priors=repo_priors,
@@ -50,10 +51,11 @@ class RetrievalService:
 
         return section_hits
 
-    def _merge_hits(
+    async def _merge_hits(
         self,
         *,
         section: str,
+        query_text: str,
         dense_hits: list[dict],
         lexical_hits: list[dict],
         repo_priors: dict[str, float],
@@ -85,15 +87,37 @@ class RetrievalService:
             entry.setdefault("start_line", lexical.get("start_line"))
             entry.setdefault("end_line", lexical.get("end_line"))
 
+        # Get AI-determined weights for this query type (cached per instance)
+        if not hasattr(self, '_retrieval_weights_cache'):
+            self._retrieval_weights_cache = {}
+        
+        cache_key = f"{section}:{query_text[:50]}"
+        if cache_key not in self._retrieval_weights_cache:
+            from services.llm_client import get_llm_client
+            llm = get_llm_client()
+            try:
+                weights = await llm.determine_retrieval_weights(section, query_text)
+                self._retrieval_weights_cache[cache_key] = weights
+            except Exception as exc:
+                logger.warning("Failed to get AI retrieval weights for %s: %s. Using defaults.", section, exc)
+                self._retrieval_weights_cache[cache_key] = {
+                    "dense_weight": 0.5,
+                    "lexical_weight": 0.25,
+                    "repo_weight": 0.15,
+                    "role_weight": 0.1,
+                }
+        
+        weights = self._retrieval_weights_cache[cache_key]
+        
         scored: list[RetrievalHit] = []
         for entry in merged.values():
             repo_prior = repo_priors.get(entry["repo_full_name"], 0.0)
             role_prior = self._role_prior(entry["chunk_role"], preferred_roles, section, entry["path"])
             score = (
-                0.45 * entry.get("dense_score", 0.0)
-                + 0.25 * entry.get("lexical_score", 0.0)
-                + 0.20 * repo_prior
-                + 0.10 * role_prior
+                weights.get("dense_weight", 0.45) * entry.get("dense_score", 0.0)
+                + weights.get("lexical_weight", 0.25) * entry.get("lexical_score", 0.0)
+                + weights.get("repo_weight", 0.20) * repo_prior
+                + weights.get("role_weight", 0.10) * role_prior
             )
             scored.append(
                 RetrievalHit(

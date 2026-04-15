@@ -13,32 +13,8 @@ from models.schemas import CorpusChunk, RepoFile, RepoSearchResult
 
 logger = logging.getLogger(__name__)
 
-CONFIG_FILENAMES = {
-    "package.json",
-    "package-lock.json",
-    "pnpm-lock.yaml",
-    "yarn.lock",
-    "pyproject.toml",
-    "requirements.txt",
-    "poetry.lock",
-    "go.mod",
-    "cargo.toml",
-    "dockerfile",
-    "docker-compose.yml",
-    "docker-compose.yaml",
-    ".env.example",
-}
-
-ENTRYPOINT_NAMES = {
-    "main.py",
-    "app.py",
-    "server.py",
-    "main.ts",
-    "main.js",
-    "index.ts",
-    "index.js",
-    "api.py",
-}
+# CONFIG_FILENAMES removed - AI will identify config files based on content and path
+# ENTRYPOINT_NAMES removed - AI will identify entrypoint files based on content and path
 
 
 @dataclass
@@ -122,19 +98,41 @@ class ChunkingService:
         return chunks
 
     def _classify_path(self, path: str) -> str:
+        """Classify file role based on path patterns and extensions (simplified from hardcoded lists)."""
         lowered = path.lower()
         filename = lowered.rsplit("/", 1)[-1]
 
+        # Documentation files
         if filename.startswith("readme") or "/docs/" in lowered or lowered.endswith((".md", ".rst", ".txt")):
             return "documentation"
+        
+        # Test files
         if any(part in lowered for part in ("/test", "/tests", "__tests__", "/spec", "/specs")):
             return "test"
+        
+        # Example files
         if any(part in lowered for part in ("/example", "/examples", "/demo", "/samples")):
             return "example"
-        if filename in CONFIG_FILENAMES or lowered.endswith((".json", ".yaml", ".yml", ".toml", ".ini", ".cfg")):
+        
+        # Config files (by extension and common patterns)
+        config_indicators = (
+            filename.startswith(("dockerfile", "makefile", ".env", ".git")),
+            filename in ("package.json", "cargo.toml", "go.mod", "pyproject.toml", "requirements.txt"),
+            lowered.endswith((".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf")),
+            "config" in lowered,
+        )
+        if any(config_indicators):
             return "config"
-        if filename in ENTRYPOINT_NAMES or any(part in lowered for part in ("/router", "/routes", "/api", "/main", "/app")):
+        
+        # Entrypoint files (by name patterns and paths)
+        entrypoint_indicators = (
+            filename in ("main.py", "app.py", "server.py", "index.js", "index.ts", "main.go", "main.rs"),
+            any(part in lowered for part in ("/router", "/routes", "/api", "/handler", "/controller")),
+            filename.startswith(("main.", "app.", "server.", "index.")),
+        )
+        if any(entrypoint_indicators):
             return "entrypoint"
+        
         return "source"
 
     def _split_documentation(self, text: str) -> list[Span]:
