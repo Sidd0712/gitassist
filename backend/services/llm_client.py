@@ -300,21 +300,71 @@ Create a Mermaid flowchart showing:
 - External integrations
 - Key data flows
 
-Return ONLY valid Mermaid syntax, no markdown:
+IMPORTANT RULES:
+1. Start with "graph TD" or "graph LR"
+2. Use ONLY alphanumeric node IDs (A, B, C, etc.)
+3. Use proper Mermaid arrow syntax: --> for directed edges
+4. Put labels in square brackets for rectangles: A[Label]
+5. Put labels in parentheses for rounded: A(Label)
+6. Escape special characters in labels
+7. Do NOT use semicolons at line ends
+8. Keep labels short and clear
+
+Example format:
 graph TD
-  ...nodes and connections..."""
+  A[User] --> B[API Gateway]
+  B --> C[Auth Service]
+  C --> D[Database]
+
+Return ONLY valid Mermaid code, no markdown blocks, no explanations."""
 
         try:
-            response = await self._call_api(prompt, temperature=0.5, max_tokens=1200)
+            response = await self._call_api(prompt, temperature=0.3, max_tokens=1200)
             # Clean response
             diagram = response.strip()
+            
+            # Remove markdown code fences if present
             if diagram.startswith("```"):
-                diagram = "\n".join(line for line in diagram.split("\n") if not line.startswith("```"))
+                lines = diagram.split("\n")
+                # Remove first and last lines if they're code fences
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].startswith("```"):
+                    lines = lines[:-1]
+                diagram = "\n".join(lines).strip()
+            
+            # Remove "mermaid" language identifier if present
+            if diagram.lower().startswith("mermaid"):
+                diagram = diagram[7:].strip()
+            
+            # Ensure it starts with graph declaration
+            if not diagram.startswith("graph "):
+                diagram = "graph TD\n" + diagram
+            
+            # Basic validation - check for common issues
+            lines = diagram.split("\n")
+            fixed_lines = []
+            for line in lines:
+                line = line.strip()
+                if not line or line.startswith("//"):
+                    continue
+                # Remove trailing semicolons (not needed in Mermaid)
+                if line.endswith(";"):
+                    line = line[:-1]
+                fixed_lines.append(line)
+            
+            diagram = "\n".join(fixed_lines)
+            
             logger.info("✓ Generated architecture diagram")
             return diagram
         except Exception as exc:
             logger.error("Architecture diagram generation failed: %s", exc)
-            raise
+            # Return a simple fallback diagram
+            return """graph TD
+  A[User/Client] --> B[API Server]
+  B --> C[Business Logic]
+  C --> D[Database]
+  B --> E[External Services]"""
 
     async def generate_search_queries(self, capability: str, idea_context: str, num_queries: int = 3) -> list[str]:
         """Generate GitHub search queries for a capability using AI."""
