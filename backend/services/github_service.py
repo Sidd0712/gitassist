@@ -19,14 +19,29 @@ logger = logging.getLogger(__name__)
 
 _cache: TTLCache = TTLCache(maxsize=512, ttl=get_settings().GITHUB_CACHE_TTL)
 
-# SOURCE_EXTENSIONS removed - AI will determine file relevance based on project intent
+# Common paths to skip during file fetching
+SKIP_PATH_PARTS = {
+    "node_modules", "vendor", ".git", "dist", "build", "coverage",
+    "test", "tests", "__pycache__", ".next", ".nuxt", "target",
+    "bin", "obj", "packages", ".vscode", ".idea"
+}
 
-# IMPORTANT_FILENAMES removed - AI will prioritize files based on project intent
-# SKIP_PATH_PARTS removed - AI will determine which paths to skip
+# Important configuration and documentation files
+IMPORTANT_FILENAMES = {
+    "package.json", "requirements.txt", "cargo.toml", "go.mod",
+    "gemfile", "composer.json", "pom.xml", "build.gradle",
+    "dockerfile", "docker-compose.yml", ".env.example",
+    "config.yml", "config.yaml", "tsconfig.json"
+}
 
-# CAPABILITY_SEARCH_TERMS removed - now using AI to generate search terms dynamically
-
-# LOW_VALUE_PATTERNS removed - now using AI to evaluate repository quality
+# Source code file extensions to fetch
+SOURCE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs",
+    ".rb", ".php", ".c", ".cpp", ".h", ".hpp", ".cs", ".swift",
+    ".kt", ".scala", ".r", ".m", ".vue", ".svelte", ".dart",
+    ".sh", ".bash", ".sql", ".graphql", ".proto", ".yaml", ".yml",
+    ".json", ".xml", ".md", ".txt", ".toml", ".ini", ".cfg"
+}
 
 
 def _headers() -> dict[str, str]:

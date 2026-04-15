@@ -1,4 +1,4 @@
-"""Embedding service with HuggingFace models."""
+"""Embedding service using local sentence-transformers (not HuggingFace API)."""
 
 from __future__ import annotations
 
@@ -23,34 +23,34 @@ class EmbeddingService:
         return self.settings.EMBEDDING_MODEL
 
     def _build_client(self) -> HuggingFaceEmbeddings:
-        """Create a HuggingFace embedding client."""
+        """Create local sentence-transformers embedding client."""
         
         try:
-            logger.info("Initializing HuggingFace embeddings with model: %s", self.settings.EMBEDDING_MODEL)
-            # sentence-transformers models are free and don't require API token
+            logger.info("Initializing local sentence-transformers model: %s", self.settings.EMBEDDING_MODEL)
+            # sentence-transformers models run locally and don't require API token
             return HuggingFaceEmbeddings(model_name=self.settings.EMBEDDING_MODEL)
         except Exception as exc:
-            logger.error("Failed to initialize HuggingFace embeddings: %s", exc)
+            logger.error("Failed to initialize sentence-transformers embeddings: %s", exc)
             raise
 
     async def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        """Embed multiple texts using HuggingFace."""
+        """Embed multiple texts using local sentence-transformers."""
 
         if not texts:
             return []
         try:
-            # HuggingFace embeddings are sync
+            # sentence-transformers embeddings are sync
             return self._client.embed_documents(texts)
         except Exception as exc:
-            logger.error("HuggingFace embeddings failed: %s", exc)
+            logger.error("sentence-transformers embeddings failed: %s", exc)
             raise
 
     async def embed_query(self, text: str) -> list[float]:
-        """Embed a single query using HuggingFace."""
+        """Embed a single query using local sentence-transformers."""
 
         try:
-            # HuggingFace embeddings are sync
+            # sentence-transformers embeddings are sync
             return self._client.embed_query(text)
         except Exception as exc:
-            logger.error("HuggingFace query embedding failed: %s", exc)
+            logger.error("sentence-transformers query embedding failed: %s", exc)
             raise

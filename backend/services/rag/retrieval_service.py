@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 
 from models.schemas import RepoSearchResult, RetrievalHit, RetrievalPlan
 from services.rag.embedding_service import EmbeddingService
 from services.rag.store_service import get_rag_store
+
+logger = logging.getLogger(__name__)
 
 
 class RetrievalService:

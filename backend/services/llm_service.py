@@ -1,4 +1,4 @@
-"""Model-based idea analysis using HuggingFace LLM."""
+"""Model-based idea analysis using Groq API with Llama 3.3."""
 
 from __future__ import annotations
 
@@ -63,14 +63,33 @@ def build_clarification_questions(keywords: ExtractedKeywords) -> list[Clarifica
 
     questions: list[ClarificationQuestion] = []
     
+    # Define default options for common ambiguity axes
+    option_map = {
+        "scale": ["MVP/Prototype", "Production-ready", "Enterprise-scale"],
+        "platform": ["Web only", "Mobile (iOS/Android)", "Both web and mobile", "Desktop app"],
+        "auth": ["Simple email/password", "Social login (Google, etc.)", "Enterprise SSO"],
+        "data_storage": ["Simple database", "Real-time sync", "Offline-first"],
+        "payments": ["Not needed", "One-time payments", "Subscriptions", "Marketplace with escrow"],
+        "feature_priority": keywords.primary_capabilities[:4] if keywords.primary_capabilities else ["All features equally"],
+        "deployment": ["Cloud (AWS/GCP/Azure)", "Self-hosted", "Serverless"],
+        "realtime": ["Not needed", "Basic updates", "Real-time collaboration"],
+    }
+    
     for ambiguity in keywords.ambiguities:
         if ambiguity.resolved or ambiguity.severity != "high":
             continue
         
+        # Get options for this ambiguity axis, or provide generic options
+        options = option_map.get(ambiguity.axis, [
+            "Keep it simple", 
+            "Standard approach", 
+            "Advanced features"
+        ])
+        
         question = ClarificationQuestion(
             key=ambiguity.axis,
             question=ambiguity.reason,
-            options=keywords.primary_capabilities[:4] if ambiguity.axis == "feature_priority" else [],
+            options=options,
             reason=ambiguity.reason,
         )
         questions.append(question)
@@ -127,7 +146,7 @@ async def generate_analysis(
         {
             "full_name": repo.full_name,
             "relevance_score": repo.relevance_score,
-            "url": repo.url,
+            "url": repo.html_url,
         }
         for repo in repositories
     ]

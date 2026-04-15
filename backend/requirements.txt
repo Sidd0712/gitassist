@@ -4,7 +4,8 @@ pydantic
 pydantic-settings
 httpx
 groq
-chromadb
+faiss-cpu
 python-dotenv
 cachetools
 sentence-transformers
+numpy

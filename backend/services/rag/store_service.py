@@ -17,12 +17,11 @@ from models.schemas import CorpusChunk, RepoFile, RepoSearchResult
 logger = logging.getLogger(__name__)
 
 try:
-    import chromadb
+    import faiss
+    import numpy as np
 except ImportError:  # pragma: no cover - optional runtime dependency
-    chromadb = None
-
-
-COLLECTION_NAME = "repo_chunks"
+    faiss = None
+    np = None
 
 
 def sanitize_repo_name(full_name: str) -> str:
@@ -53,7 +52,11 @@ class RAGStore:
         self.vector_store_path = Path(self.settings.RAG_VECTOR_STORE_PATH)
         self.sqlite_path = Path(self.settings.RAG_SQLITE_PATH)
         self._fts_enabled = True
-        self._collection = None
+        self.dimension = 384  # all-MiniLM-L6-v2 embedding dimension
+        self.index = None
+        self.faiss_index_path = self.vector_store_path / "faiss.index"
+        self.faiss_metadata_path = self.vector_store_path / "faiss_metadata.json"
+        self.chunks_metadata = []
 
     def ensure_ready(self) -> None:
         """Create all backing directories and tables."""
@@ -124,22 +127,55 @@ class RAGStore:
                 self._fts_enabled = False
                 logger.warning("SQLite FTS5 is unavailable; lexical retrieval will fall back to LIKE queries.")
             conn.commit()
+        
+        # Initialize or load FAISS index
+        self._load_or_create_faiss_index()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.sqlite_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
 
-    def _get_collection(self):
-        if chromadb is None:
-            return None
-        if self._collection is None:
-            client = chromadb.PersistentClient(path=str(self.vector_store_path))
-            self._collection = client.get_or_create_collection(
-                name=COLLECTION_NAME,
-                metadata={"hnsw:space": "cosine"},
-            )
-        return self._collection
+    def _load_or_create_faiss_index(self) -> None:
+        """Load existing FAISS index or create new one."""
+        if faiss is None:
+            logger.warning("FAISS not available, vector search will be disabled")
+            return
+        
+        if self.faiss_index_path.exists() and self.faiss_metadata_path.exists():
+            try:
+                # Load existing index
+                self.index = faiss.read_index(str(self.faiss_index_path))
+                with open(self.faiss_metadata_path, 'r', encoding='utf-8') as f:
+                    self.chunks_metadata = json.load(f)
+                logger.info(f"Loaded FAISS index with {self.index.ntotal} vectors")
+            except Exception as exc:
+                logger.error(f"Failed to load FAISS index: {exc}, creating new index")
+                self._create_new_faiss_index()
+        else:
+            self._create_new_faiss_index()
+    
+    def _create_new_faiss_index(self) -> None:
+        """Create a new FAISS index."""
+        if faiss is None:
+            return
+        # IndexFlatIP for cosine similarity (after L2 normalization)
+        self.index = faiss.IndexFlatIP(self.dimension)
+        self.chunks_metadata = []
+        logger.info("Created new FAISS index")
+    
+    def _save_faiss_index(self) -> None:
+        """Persist FAISS index and metadata to disk."""
+        if self.index is None or faiss is None:
+            return
+        
+        try:
+            faiss.write_index(self.index, str(self.faiss_index_path))
+            with open(self.faiss_metadata_path, 'w', encoding='utf-8') as f:
+                json.dump(self.chunks_metadata, f)
+            logger.debug(f"Saved FAISS index with {self.index.ntotal} vectors")
+        except Exception as exc:
+            logger.error(f"Failed to save FAISS index: {exc}")
 
     def is_indexed(self, repository: RepoSearchResult, embedding_model: str, chunking_version: str) -> bool:
         """Check whether a repo/commit is already indexed for the current embedding settings."""
@@ -287,33 +323,65 @@ class RAGStore:
                     )
             conn.commit()
 
-        collection = self._get_collection()
-        if collection is not None and chunks:
-            chunk_ids = [chunk.chunk_id for chunk in chunks]
-            try:
-                collection.delete(ids=chunk_ids)
-            except Exception:  # pragma: no cover - Chroma is best effort
-                pass
-
-            collection.add(
-                ids=chunk_ids,
-                embeddings=embeddings,
-                documents=[chunk.text for chunk in chunks],
-                metadatas=[
-                    {
-                        "full_name": chunk.repo_full_name,
-                        "commit_sha": chunk.commit_sha,
-                        "path": chunk.path,
-                        "chunk_role": chunk.chunk_role,
-                        "language": chunk.language or "",
-                        "symbol": chunk.symbol or "",
-                        "start_line": chunk.start_line or 0,
-                        "end_line": chunk.end_line or 0,
-                        "repo_score": chunk.repo_score,
-                    }
-                    for chunk in chunks
-                ],
-            )
+        # Add to FAISS index
+        if self.index is not None and chunks and faiss is not None and np is not None:
+            # Convert embeddings to numpy array and normalize for cosine similarity
+            embeddings_np = np.array(embeddings, dtype=np.float32)
+            faiss.normalize_L2(embeddings_np)
+            
+            # Remove old chunks from metadata for this repo
+            self.chunks_metadata = [
+                meta for meta in self.chunks_metadata
+                if not (meta["repo_full_name"] == repository.full_name and meta["commit_sha"] == repository.commit_sha)
+            ]
+            
+            # Rebuild index with remaining + new chunks
+            # (FAISS doesn't support deletion, so we rebuild)
+            if len(self.chunks_metadata) > 0:
+                # Get embeddings for existing chunks from SQLite
+                existing_embeddings = []
+                with self._connect() as conn:
+                    for meta in self.chunks_metadata:
+                        row = conn.execute(
+                            "SELECT embedding_json FROM embeddings WHERE chunk_id = ?",
+                            (meta["chunk_id"],)
+                        ).fetchone()
+                        if row:
+                            existing_embeddings.append(json.loads(row["embedding_json"]))
+                
+                if existing_embeddings:
+                    existing_np = np.array(existing_embeddings, dtype=np.float32)
+                    faiss.normalize_L2(existing_np)
+                    all_embeddings = np.vstack([existing_np, embeddings_np])
+                else:
+                    all_embeddings = embeddings_np
+            else:
+                all_embeddings = embeddings_np
+            
+            # Recreate index with all embeddings
+            self.index = faiss.IndexFlatIP(self.dimension)
+            if all_embeddings.shape[0] > 0:
+                self.index.add(all_embeddings)
+            
+            # Add new chunks to metadata
+            start_idx = len(self.chunks_metadata)
+            for i, chunk in enumerate(chunks):
+                self.chunks_metadata.append({
+                    "idx": start_idx + i,
+                    "chunk_id": chunk.chunk_id,
+                    "repo_full_name": chunk.repo_full_name,
+                    "commit_sha": chunk.commit_sha,
+                    "path": chunk.path,
+                    "chunk_role": chunk.chunk_role,
+                    "language": chunk.language or "",
+                    "symbol": chunk.symbol or "",
+                    "start_line": chunk.start_line or 0,
+                    "end_line": chunk.end_line or 0,
+                    "repo_score": chunk.repo_score,
+                })
+            
+            # Persist FAISS index
+            self._save_faiss_index()
 
     def load_repository(self, full_name: str, commit_sha: str, embedding_model: str, chunking_version: str) -> RepoSearchResult | None:
         """Load stored repo metadata for a specific index."""
@@ -338,7 +406,7 @@ class RAGStore:
         allowed_repos: dict[str, str],
         top_k: int,
     ) -> list[dict[str, Any]]:
-        """Dense retrieval over stored embeddings."""
+        """Dense retrieval over stored embeddings using FAISS."""
 
         self.ensure_ready()
         if not query_embedding or not allowed_repos:
@@ -346,43 +414,60 @@ class RAGStore:
 
         allowed_names = list(allowed_repos.keys())
 
-        collection = self._get_collection()
-        if collection is not None:
+        # Use FAISS for fast vector search
+        if self.index is not None and faiss is not None and np is not None and self.index.ntotal > 0:
             try:
-                response = collection.query(
-                    query_embeddings=[query_embedding],
-                    n_results=max(top_k * 4, top_k),
-                    include=["metadatas", "documents", "distances"],
-                )
-                docs = response.get("documents", [[]])[0]
-                metas = response.get("metadatas", [[]])[0]
-                ids = response.get("ids", [[]])[0]
-                distances = response.get("distances", [[]])[0]
+                # Normalize query embedding for cosine similarity
+                query_np = np.array([query_embedding], dtype=np.float32)
+                faiss.normalize_L2(query_np)
+                
+                # Search FAISS (get more candidates for filtering)
+                search_k = min(max(top_k * 4, top_k), self.index.ntotal)
+                scores, indices = self.index.search(query_np, search_k)
+                
+                # Filter and build results
                 results: list[dict[str, Any]] = []
-                for chunk_id, document, meta, distance in zip(ids, docs, metas, distances):
-                    if meta["full_name"] not in allowed_repos:
+                for score, idx in zip(scores[0], indices[0]):
+                    if idx < 0 or idx >= len(self.chunks_metadata):
                         continue
-                    if meta.get("commit_sha") != allowed_repos[meta["full_name"]]:
+                    
+                    metadata = self.chunks_metadata[idx]
+                    
+                    # Apply repo and commit filters
+                    if metadata["repo_full_name"] not in allowed_repos:
                         continue
-                    results.append(
-                        {
-                            "chunk_id": chunk_id,
-                            "repo_full_name": meta["full_name"],
-                            "path": meta["path"],
-                            "chunk_role": meta["chunk_role"],
-                            "language": meta["language"] or None,
-                            "start_line": meta["start_line"] or None,
-                            "end_line": meta["end_line"] or None,
-                            "repo_score": float(meta.get("repo_score", 0.0)),
-                            "text": document,
-                            "dense_score": max(0.0, 1.0 - float(distance)),
-                        }
-                    )
+                    if metadata["commit_sha"] != allowed_repos[metadata["repo_full_name"]]:
+                        continue
+                    
+                    # Get chunk text from SQLite
+                    with self._connect() as conn:
+                        row = conn.execute(
+                            "SELECT text FROM chunks WHERE chunk_id = ?",
+                            (metadata["chunk_id"],)
+                        ).fetchone()
+                        if not row:
+                            continue
+                        text = row["text"]
+                    
+                    results.append({
+                        "chunk_id": metadata["chunk_id"],
+                        "repo_full_name": metadata["repo_full_name"],
+                        "path": metadata["path"],
+                        "chunk_role": metadata["chunk_role"],
+                        "language": metadata["language"] or None,
+                        "start_line": metadata["start_line"] or None,
+                        "end_line": metadata["end_line"] or None,
+                        "repo_score": float(metadata["repo_score"]),
+                        "text": text,
+                        "dense_score": max(0.0, float(score)),  # Score already normalized [0,1]
+                    })
+                    
                     if len(results) >= top_k * 2:
                         break
+                
                 return results
-            except Exception as exc:  # pragma: no cover - Chroma is optional
-                logger.warning("Dense search via Chroma failed, falling back to SQLite vectors: %s", exc)
+            except Exception as exc:
+                logger.warning(f"Dense search via FAISS failed, falling back to SQLite: {exc}")
 
         placeholders = ",".join("?" for _ in allowed_names)
         with self._connect() as conn:

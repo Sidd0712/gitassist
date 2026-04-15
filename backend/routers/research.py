@@ -40,7 +40,13 @@ async def research_idea(request: IdeaRequest) -> AnalysisResponse:
         logger.info("Keyword extraction completed in %.2fs", perf_counter() - keyword_started)
 
         clarification_questions = build_clarification_questions(keywords)
-        if clarification_questions and not request.clarification_answers:
+        
+        # Check if we need clarifications and haven't received valid answers yet
+        has_meaningful_answers = bool(request.clarification_answers and any(
+            v and v.strip() for v in request.clarification_answers.values()
+        ))
+        
+        if clarification_questions and not has_meaningful_answers:
             logger.info("Returning %d clarification questions before repository search", len(clarification_questions))
             return AnalysisResponse(
                 idea_summary=keywords.summary or request.idea,

@@ -21,10 +21,12 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
-    get_rag_store().ensure_ready()
+    store = get_rag_store()
+    store.ensure_ready()
     logger.info("%s starting up", settings.APP_NAME)
     logger.info("  LLM model: %s", settings.LLM_MODEL)
     logger.info("  Embedding model: %s", settings.EMBEDDING_MODEL)
+    logger.info("  Vector store: FAISS (%d vectors indexed)", store.index.ntotal if store.index else 0)
     logger.info("  Candidate repo limit: %d", settings.RAG_CANDIDATE_REPO_LIMIT)
     logger.info("  Deep index repo limit: %d", settings.RAG_DEEP_INDEX_REPO_LIMIT)
     yield
