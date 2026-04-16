@@ -8,4 +8,5 @@ faiss-cpu
 python-dotenv
 cachetools
 sentence-transformers
+langchain-community
 numpy
