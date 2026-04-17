@@ -74,6 +74,14 @@ class LLMClient:
 Project Idea:
 {idea}{clarification}
 
+Important instructions:
+- Treat clarification answers as authoritative. Use them to sharpen the extracted keywords, stack families, integrations, and likely components.
+- Only include ambiguities that are still unresolved after considering the clarification answers.
+- Ambiguities should focus on build decisions that would materially change GitHub repository search terms, architecture, data model, deployment shape, or the main frameworks/services to look for.
+- Each ambiguity must include 2-4 concrete, mutually exclusive options that would help narrow repository search and keyword extraction.
+- Keep ambiguity axes stable and machine-friendly using concise snake_case keys.
+- Do not invent generic filler options like "simple", "standard", or "advanced" unless the project idea itself truly implies those choices.
+
 Extract and return ONLY valid JSON (no markdown, no explanation):
 {{
   "summary": "one-line technical summary",
@@ -91,7 +99,13 @@ Extract and return ONLY valid JSON (no markdown, no explanation):
   "constraints": ["constraint 1"],
   "assumptions": ["assumption 1"],
   "ambiguities": [
-    {{"axis": "ambiguity name", "reason": "why it matters", "severity": "high/medium/low"}}
+    {{
+      "axis": "ambiguity_name",
+      "question": "single concrete question to ask the user",
+      "reason": "why the answer changes repo search, architecture, or stack decisions",
+      "options": ["option 1", "option 2", "option 3"],
+      "severity": "high/medium/low"
+    }}
   ]
 }}"""
 

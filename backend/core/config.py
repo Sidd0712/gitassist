@@ -1,9 +1,12 @@
 """Application configuration via environment variables."""
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings
+
+BACKEND_DIR = Path(__file__).resolve().parents[1]
 
 
 class Settings(BaseSettings):
@@ -54,7 +57,11 @@ class Settings(BaseSettings):
     RAG_SQLITE_PATH: str = "data/retrieval.db"
     RAG_CORPUS_PATH: str = "data/corpora"
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
+    model_config = {
+        "env_file": str(BACKEND_DIR / ".env"),
+        "env_file_encoding": "utf-8",
+        "extra": "ignore",
+    }
 
     @field_validator("DEBUG", mode="before")
     @classmethod

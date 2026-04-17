@@ -38,10 +38,10 @@ async def extract_keywords(idea: str, clarification_answers: dict[str, str] | No
         capabilities=extracted.get("primary_capabilities", []) + extracted.get("secondary_capabilities", [])[:12],
         primary_capabilities=extracted.get("primary_capabilities", [])[:3],
         secondary_capabilities=extracted.get("secondary_capabilities", [])[:6],
-        trivial_capabilities=[],
-        capability_weights={},
-        domain_terms=extracted.get("keywords", [])[:12],
-        tech_terms=extracted.get("frameworks", []) + extracted.get("languages", [])[:10],
+        trivial_capabilities=extracted.get("trivial_capabilities", [])[:8],
+        capability_weights=_normalize_capability_weights(extracted.get("capability_weights", {})),
+        domain_terms=(extracted.get("domain_terms") or extracted.get("keywords", []))[:12],
+        tech_terms=(extracted.get("tech_terms") or (extracted.get("frameworks", []) + extracted.get("languages", [])))[:10],
         constraints=extracted.get("constraints", [])[:8],
         likely_components=extracted.get("likely_components", [])[:10],
         likely_integrations=extracted.get("likely_integrations", [])[:8],
@@ -59,43 +59,40 @@ async def extract_keywords(idea: str, clarification_answers: dict[str, str] | No
 
 
 def build_clarification_questions(keywords: ExtractedKeywords) -> list[ClarificationQuestion]:
-    """Build clarification questions from detected ambiguities."""
+    """Build clarification questions directly from model-generated ambiguities."""
 
     questions: list[ClarificationQuestion] = []
-    
-    # Define default options for common ambiguity axes
-    option_map = {
-        "scale": ["MVP/Prototype", "Production-ready", "Enterprise-scale"],
-        "platform": ["Web only", "Mobile (iOS/Android)", "Both web and mobile", "Desktop app"],
-        "auth": ["Simple email/password", "Social login (Google, etc.)", "Enterprise SSO"],
-        "data_storage": ["Simple database", "Real-time sync", "Offline-first"],
-        "payments": ["Not needed", "One-time payments", "Subscriptions", "Marketplace with escrow"],
-        "feature_priority": keywords.primary_capabilities[:4] if keywords.primary_capabilities else ["All features equally"],
-        "deployment": ["Cloud (AWS/GCP/Azure)", "Self-hosted", "Serverless"],
-        "realtime": ["Not needed", "Basic updates", "Real-time collaboration"],
-    }
-    
+    seen_axes: set[str] = set()
+
     for ambiguity in keywords.ambiguities:
         if ambiguity.resolved or ambiguity.severity != "high":
             continue
-        
-        # Get options for this ambiguity axis, or provide generic options
-        options = option_map.get(ambiguity.axis, [
-            "Keep it simple", 
-            "Standard approach", 
-            "Advanced features"
-        ])
-        
+
+        axis = ambiguity.axis.strip()
+        if not axis or axis.lower() in seen_axes:
+            continue
+
+        options = _normalize_clarification_options(ambiguity.options)
+        if len(options) < 2:
+            logger.warning("Skipping ambiguity '%s' because the model did not return enough usable options", axis)
+            continue
+
+        question_text = (ambiguity.question or ambiguity.reason).strip()
+        if not question_text:
+            logger.warning("Skipping ambiguity '%s' because the model did not return a usable question", axis)
+            continue
+
         question = ClarificationQuestion(
-            key=ambiguity.axis,
-            question=ambiguity.reason,
+            key=axis,
+            question=question_text,
             options=options,
             reason=ambiguity.reason,
         )
         questions.append(question)
+        seen_axes.add(axis.lower())
         if len(questions) >= 4:
             break
-    
+
     return questions
 
 
@@ -166,6 +163,8 @@ async def generate_analysis(
             title=item.get("title", ""),
             description=item.get("description", ""),
             milestone=item.get("milestone", ""),
+            concepts=item.get("concepts", [])[:6],
+            resources=item.get("resources", [])[:6],
         )
         for i, item in enumerate(learning_path_data)
     ]
@@ -178,6 +177,7 @@ async def generate_analysis(
             name=item.get("technology", ""),
             category=item.get("layer", ""),
             why_recommended=item.get("reasoning", ""),
+            supported_by=item.get("supported_by", [])[:6],
             pros=item.get("pros", []),
             cons=item.get("cons", []),
         )
@@ -207,10 +207,60 @@ def _convert_ambiguities(ambiguities: list[dict]) -> list:
         result.append(
             AmbiguityFlag(
                 axis=amb.get("axis", "unknown"),
+                question=amb.get("question", ""),
                 reason=amb.get("reason", ""),
+                options=_normalize_clarification_options(amb.get("options", [])),
                 severity=amb.get("severity", "medium"),
                 resolved=False,
                 answer=None,
             )
         )
     return result
+
+
+def _normalize_clarification_options(options: object) -> list[str]:
+    """Sanitize, deduplicate, and cap model-generated clarification options."""
+
+    if isinstance(options, str):
+        raw_options = [options]
+    elif isinstance(options, list):
+        raw_options = [option for option in options if isinstance(option, str)]
+    else:
+        raw_options = []
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+
+    for option in raw_options:
+        cleaned = option.strip().lstrip("-*").strip()
+        if not cleaned:
+            continue
+        lowered = cleaned.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        normalized.append(cleaned)
+        if len(normalized) >= 4:
+            break
+
+    return normalized
+
+
+def _normalize_capability_weights(raw_weights: object) -> dict[str, float]:
+    """Coerce capability weights into a clean string->float mapping."""
+
+    if not isinstance(raw_weights, dict):
+        return {}
+
+    normalized: dict[str, float] = {}
+    for key, value in raw_weights.items():
+        if not isinstance(key, str):
+            continue
+        try:
+            normalized_key = key.strip()
+            if not normalized_key:
+                continue
+            normalized[normalized_key] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return normalized

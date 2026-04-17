@@ -18,7 +18,9 @@ class AmbiguityFlag(BaseModel):
     """An unresolved or resolved ambiguity axis for a project idea."""
 
     axis: str
+    question: str = ""
     reason: str
+    options: list[str] = Field(default_factory=list)
     severity: Literal["low", "medium", "high"] = "high"
     resolved: bool = False
     answer: str | None = None
