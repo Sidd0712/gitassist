@@ -2,17 +2,21 @@ import hashlib
 import re
 import sys
 import unittest
+from base64 import b64encode
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from models.schemas import AnalysisResponse, ExtractedKeywords, IdeaRequest, RepoFetchPlan, RepoSearchResult, RepoSnapshot, ShallowRepoEvidence
+from models.schemas import AnalysisResponse, ExtractedKeywords, IdeaRequest, RepoFetchPlan, RepoSearchResult, RepoSnapshot, RetrievalPlan, ShallowRepoEvidence
 from routers.research import research_idea
-from services.github_service import build_repo_fetch_plan, build_search_queries
-from services.llm_service import build_clarification_questions, extract_keywords, generate_analysis
+import services.github_service as github_service_module
+from services.github_service import build_repo_fetch_plan, build_search_queries, fetch_repo_snapshot, fetch_shallow_repo_evidence
+from services.llm_service import build_clarification_questions, extract_keywords, generate_analysis, plan_retrieval_queries
+from services.pipeline_cache_service import clear_memory_caches
 from services.rag.ranking_service import rank_repo_evidence
 
 
@@ -226,6 +230,21 @@ class FakeLLMClient:
 
         raise AssertionError(f"Unhandled fake extract_keywords input: {idea}")
 
+    async def generate_search_queries_batch(
+        self,
+        idea_context: str,
+        capabilities: list[str],
+        domain_terms: list[str],
+        languages: list[str],
+        max_queries: int = 6,
+    ) -> list[str]:
+        queries: list[str] = []
+        for capability in capabilities[:3]:
+            queries.extend(await self.generate_search_queries(capability, idea_context, num_queries=2))
+        if domain_terms:
+            queries.append(" ".join(domain_terms[:3]))
+        return queries[:max_queries]
+
     async def generate_search_queries(self, capability: str, idea_context: str, num_queries: int = 3) -> list[str]:
         capability_map = {
             "realtime collaboration": [
@@ -299,7 +318,13 @@ class FakeLLMClient:
             for repo in repositories
         ]
 
-    async def generate_learning_path(self, idea: str, keywords: dict, repositories: list[dict]) -> list[dict]:
+    async def generate_learning_path(
+        self,
+        idea: str,
+        keywords: dict,
+        repositories: list[dict],
+        evidence: dict | None = None,
+    ) -> list[dict]:
         if keywords.get("product_type") == "meal prep assistant":
             return [
                 {
@@ -355,7 +380,13 @@ class FakeLLMClient:
             },
         ]
 
-    async def generate_tech_stack(self, idea: str, keywords: dict, repositories: list[dict]) -> list[dict]:
+    async def generate_tech_stack(
+        self,
+        idea: str,
+        keywords: dict,
+        repositories: list[dict],
+        evidence: dict | None = None,
+    ) -> list[dict]:
         if keywords.get("product_type") == "meal prep assistant":
             return [
                 {
@@ -403,7 +434,13 @@ class FakeLLMClient:
             },
         ]
 
-    async def generate_architecture_diagram(self, idea: str, keywords: dict, repositories: list[dict]) -> str:
+    async def generate_architecture_diagram(
+        self,
+        idea: str,
+        keywords: dict,
+        repositories: list[dict],
+        evidence: dict | None = None,
+    ) -> str:
         if keywords.get("product_type") == "meal prep assistant":
             return """graph TD
   A[Mobile App] --> B[Meal Planning API]
@@ -442,9 +479,8 @@ class HermeticAsyncTestCase(unittest.IsolatedAsyncioTestCase):
         for patcher in self.patchers:
             patcher.start()
             self.addCleanup(patcher.stop)
-
-        if hasattr(rank_repo_evidence, "_ai_weights"):
-            delattr(rank_repo_evidence, "_ai_weights")
+        clear_memory_caches()
+        github_service_module._cache.clear()
 
 
 class IntentExtractionTests(HermeticAsyncTestCase):
@@ -501,6 +537,18 @@ class IntentExtractionTests(HermeticAsyncTestCase):
         self.assertIn("file uploads", keywords.trivial_capabilities)
         self.assertIn("notifications", keywords.trivial_capabilities)
         self.assertNotIn("file uploads", keywords.primary_capabilities)
+
+    async def test_search_query_builder_prefers_batched_generation(self):
+        keywords = await extract_keywords("an app where friends can draw together online")
+        self.fake_llm.generate_search_queries_batch = AsyncMock(
+            return_value=["collaborative whiteboard realtime collaboration", "shared canvas websocket"]
+        )
+        self.fake_llm.generate_search_queries = AsyncMock(side_effect=AssertionError("legacy per-capability path should not run"))
+
+        queries = await build_search_queries(keywords)
+
+        self.fake_llm.generate_search_queries_batch.assert_awaited_once()
+        self.assertIn("collaborative whiteboard", " | ".join(queries).lower())
 
 
 class RankingAndGenerationTests(HermeticAsyncTestCase):
@@ -756,6 +804,137 @@ class RankingAndGenerationTests(HermeticAsyncTestCase):
         self.assertNotIn("example/travel-chat-b", full_names)
 
 
+class CacheAndFallbackTests(HermeticAsyncTestCase):
+    async def test_retrieval_plan_falls_back_when_model_times_out(self):
+        keywords = await extract_keywords("Build a real-time collaborative whiteboard with WebSocket and canvas")
+        repositories = [
+            RepoSearchResult(
+                full_name="example/collab-board",
+                description="Collaborative whiteboard",
+                html_url="https://github.com/example/collab-board",
+                stars=120,
+                language="TypeScript",
+                commit_sha="commit-123",
+            )
+        ]
+
+        with patch.object(self.fake_llm, "plan_retrieval_queries", AsyncMock(side_effect=TimeoutError("slow"))):
+            plan = await plan_retrieval_queries(
+                "Build a real-time collaborative whiteboard with WebSocket and canvas",
+                keywords,
+                repositories,
+            )
+
+        sections = {query.section for query in plan.queries}
+        self.assertEqual(
+            {"repo_descriptions", "learning_path", "architecture_diagram", "tech_stack"},
+            sections,
+        )
+
+    async def test_snapshot_cache_reuses_first_response(self):
+        repository = RepoSearchResult(
+            full_name="example/collab-board",
+            description="Collaborative whiteboard",
+            html_url="https://github.com/example/collab-board",
+            stars=120,
+            language="TypeScript",
+            updated_at="2026-04-18T10:00:00Z",
+        )
+
+        class FakeResponse:
+            def __init__(self, *, status_code: int = 200, json_data: dict | None = None, text: str = "") -> None:
+                self.status_code = status_code
+                self._json = json_data or {}
+                self.text = text
+
+            def json(self) -> dict:
+                return self._json
+
+            def raise_for_status(self) -> None:
+                if self.status_code >= 400:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
+        class CountingGitHubClient:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            async def get(self, url: str, headers=None, params=None):
+                self.calls.append(url)
+                if url.endswith("/repos/example/collab-board"):
+                    return FakeResponse(
+                        json_data={
+                            "default_branch": "main",
+                            "description": "Collaborative whiteboard",
+                            "html_url": "https://github.com/example/collab-board",
+                            "stargazers_count": 120,
+                            "language": "TypeScript",
+                            "topics": ["whiteboard", "canvas"],
+                            "updated_at": "2026-04-18T10:00:00Z",
+                            "archived": False,
+                        }
+                    )
+                if "/commits/" in url:
+                    return FakeResponse(json_data={"sha": "commit-123"})
+                if "/git/trees/" in url:
+                    return FakeResponse(json_data={"tree": [{"path": "src/app.tsx", "type": "blob", "size": 1200}]})
+                raise AssertionError(f"Unexpected URL: {url}")
+
+        client = CountingGitHubClient()
+        with patch("services.github_service.get_github_client", return_value=client):
+            first = await fetch_repo_snapshot(repository)
+            second = await fetch_repo_snapshot(repository)
+
+        self.assertEqual("commit-123", first.commit_sha)
+        self.assertEqual("commit-123", second.commit_sha)
+        self.assertEqual(3, len(client.calls))
+
+    async def test_shallow_evidence_cache_skips_refetch(self):
+        repository = RepoSearchResult(
+            full_name="example/collab-board",
+            description="Collaborative whiteboard",
+            html_url="https://github.com/example/collab-board",
+            stars=120,
+            language="TypeScript",
+            updated_at="2026-04-18T10:00:00Z",
+        )
+        package_payload = {
+            "encoding": "base64",
+            "content": b64encode(b'{"name":"collab-board"}').decode("ascii"),
+        }
+
+        class FakeResponse:
+            def __init__(self, *, status_code: int = 200, json_data: dict | None = None, text: str = "") -> None:
+                self.status_code = status_code
+                self._json = json_data or {}
+                self.text = text
+
+            def json(self) -> dict:
+                return self._json
+
+        class CountingGitHubClient:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            async def get(self, url: str, headers=None, params=None):
+                self.calls.append(url)
+                if url.endswith("/readme"):
+                    return FakeResponse(status_code=200, text="Collaborative whiteboard README")
+                if url.endswith("/contents/package.json"):
+                    return FakeResponse(status_code=200, json_data=package_payload)
+                return FakeResponse(status_code=404, json_data={})
+
+        client = CountingGitHubClient()
+        with patch("services.github_service.get_github_client", return_value=client):
+            first = await fetch_shallow_repo_evidence(repository)
+            first_call_count = len(client.calls)
+            second = await fetch_shallow_repo_evidence(repository)
+
+        self.assertEqual(first.readme, second.readme)
+        self.assertEqual(first.highlighted_paths, second.highlighted_paths)
+        self.assertGreaterEqual(first_call_count, 1)
+        self.assertEqual(first_call_count, len(client.calls))
+
+
 class ResearchPipelineOrchestrationTests(HermeticAsyncTestCase):
     async def test_research_request_enqueues_background_indexing_without_blocking(self):
         keywords = ExtractedKeywords(
@@ -774,15 +953,22 @@ class ResearchPipelineOrchestrationTests(HermeticAsyncTestCase):
             language="TypeScript",
             topics=["whiteboard", "canvas", "websocket"],
         )
-        shallow = ShallowRepoEvidence(
-            repository=repository,
-            readme_path="README.md",
-            readme="Collaborative whiteboard with realtime collaboration and canvas rendering.",
-            highlighted_paths=["README.md", "src/socket/server.ts"],
+        secondary_repository = RepoSearchResult(
+            full_name="example/secondary-board",
+            description="Secondary whiteboard reference",
+            html_url="https://github.com/example/secondary-board",
+            stars=80,
+            language="TypeScript",
+            topics=["whiteboard", "multiplayer"],
         )
         snapshot = RepoSnapshot(
             **repository.model_dump(exclude={"commit_sha"}),
             commit_sha="commit-123",
+            tree=[],
+        )
+        secondary_snapshot = RepoSnapshot(
+            **secondary_repository.model_dump(exclude={"commit_sha"}),
+            commit_sha="commit-456",
             tree=[],
         )
         fetch_plan = RepoFetchPlan(
@@ -791,6 +977,41 @@ class ResearchPipelineOrchestrationTests(HermeticAsyncTestCase):
             skipped_paths=[],
             estimated_chars=500,
             rationale=["Prioritized README and realtime code paths."],
+        )
+        secondary_fetch_plan = RepoFetchPlan(
+            repository=RepoSearchResult(**{**secondary_repository.model_dump(), "commit_sha": "commit-456"}),
+            selected_paths=["README.md", "src/canvas/index.ts"],
+            skipped_paths=[],
+            estimated_chars=420,
+            rationale=["Prioritized collaborative canvas paths."],
+        )
+        shallow = ShallowRepoEvidence(
+            repository=RepoSearchResult(
+                **repository.model_dump(),
+                reference_type="end_to_end",
+                fit_score=0.91,
+                fit_summary="It behaves like an end to end reference covering realtime collaboration and canvas rendering.",
+                covered_primary=["realtime collaboration", "canvas rendering"],
+                missing_primary=["presence"],
+                semantic_readme_score=0.82,
+                relevance_score=0.91,
+                rank_reasons=["covers primary capabilities: realtime collaboration, canvas rendering"],
+            ),
+            readme="Collaborative whiteboard with realtime collaboration and canvas rendering.",
+        )
+        secondary_shallow = ShallowRepoEvidence(
+            repository=RepoSearchResult(
+                **secondary_repository.model_dump(),
+                reference_type="subsystem",
+                fit_score=0.73,
+                fit_summary="It behaves like a subsystem reference covering canvas rendering.",
+                covered_primary=["canvas rendering"],
+                missing_primary=["realtime collaboration", "presence"],
+                semantic_readme_score=0.67,
+                relevance_score=0.73,
+                rank_reasons=["covers primary capabilities: canvas rendering"],
+            ),
+            readme="Collaborative canvas UI focused on drawing interactions.",
         )
         generated_analysis = AnalysisResponse(
             idea_summary=keywords.summary,
@@ -805,36 +1026,294 @@ class ResearchPipelineOrchestrationTests(HermeticAsyncTestCase):
 
         class FakeCorpusService:
             queued: list[str] = []
+            indexed: list[str] = []
 
             def __init__(self) -> None:
                 self.queued = []
                 type(self).queued = self.queued
+                self.indexed = []
+                type(self).indexed = self.indexed
 
             def load_indexed_repository(self, repo: RepoSearchResult) -> RepoSearchResult | None:
                 return None
 
-            def enqueue_index_job(self, plan: RepoFetchPlan, shallow_evidence: ShallowRepoEvidence) -> bool:
+            def enqueue_index_job_placeholder(self, plan: RepoFetchPlan) -> bool:
                 self.queued.append(f"{plan.repository.full_name}@{plan.repository.commit_sha}")
                 return True
 
+            async def index_repository_plan(self, plan: RepoFetchPlan) -> RepoSearchResult:
+                self.indexed.append(f"{plan.repository.full_name}@{plan.repository.commit_sha}")
+                return plan.repository
+
+        class FakeRetrievalService:
+            async def retrieve(self, plan, repositories) -> dict:
+                return {}
+
         with (
+            patch(
+                "routers.research.get_settings",
+                return_value=SimpleNamespace(
+                    PIPELINE_REQUEST_BUDGET_SECONDS=110,
+                    RAG_DEEP_INDEX_REPO_LIMIT=2,
+                    RAG_README_RERANK_LIMIT=2,
+                    INDEXING_MODE="background",
+                    RAG_INLINE_BOOTSTRAP_REPO_LIMIT=1,
+                    PIPELINE_RETRIEVAL_MIN_BUDGET_SECONDS=25,
+                    INDEXER_MAX_CONCURRENCY=2,
+                ),
+            ),
+            patch("routers.research.extract_keywords", AsyncMock(return_value=keywords)),
+            patch("routers.research.search_repo_candidates", AsyncMock(return_value=[repository, secondary_repository])),
+            patch("routers.research.fetch_shallow_repo_evidence_batch", AsyncMock(return_value=[shallow, secondary_shallow])),
+            patch("routers.research.rank_repo_evidence", AsyncMock(return_value=[shallow, secondary_shallow])),
+            patch("routers.research.fetch_repo_snapshot", AsyncMock(side_effect=[snapshot, secondary_snapshot])),
+            patch("routers.research.build_repo_fetch_plan", side_effect=[fetch_plan, secondary_fetch_plan]),
+            patch("routers.research.CorpusService", FakeCorpusService),
+            patch("routers.research.plan_retrieval_queries", AsyncMock(return_value=RetrievalPlan(queries=[]))) as plan_mock,
+            patch("routers.research.RetrievalService", return_value=FakeRetrievalService()),
+            patch("routers.research.generate_analysis", AsyncMock(return_value=generated_analysis)) as generate_mock,
+        ):
+            response = await research_idea(IdeaRequest(idea="an app where friends can draw together online"))
+
+        self.assertEqual("complete", response.status)
+        self.assertEqual(["example/secondary-board@commit-456"], FakeCorpusService.queued)
+        self.assertEqual(["example/collab-board@commit-123"], FakeCorpusService.indexed)
+        plan_mock.assert_awaited_once()
+        generate_mock.assert_awaited_once()
+        self.assertEqual({}, generate_mock.await_args.args[3])
+
+    async def test_research_request_inlines_five_repositories_when_bootstrap_limit_is_five(self):
+        keywords = ExtractedKeywords(
+            summary="Collaborative whiteboard for shared online drawing sessions.",
+            core_intent="Build a realtime shared canvas experience for multiple users.",
+            product_type="collaborative whiteboard",
+            capabilities=["realtime collaboration", "canvas rendering", "presence"],
+            primary_capabilities=["realtime collaboration", "canvas rendering", "presence"],
+            keywords=["whiteboard", "canvas", "realtime"],
+        )
+        repositories = [
+            RepoSearchResult(
+                full_name=f"example/collab-board-{index}",
+                description=f"Collaborative whiteboard #{index}",
+                html_url=f"https://github.com/example/collab-board-{index}",
+                stars=120 - index,
+                language="TypeScript",
+                topics=["whiteboard", "canvas", "websocket"],
+            )
+            for index in range(5)
+        ]
+        snapshots = [
+            RepoSnapshot(
+                **repository.model_dump(exclude={"commit_sha"}),
+                commit_sha=f"commit-{index}",
+                tree=[],
+            )
+            for index, repository in enumerate(repositories)
+        ]
+        shallow_evidence = [
+            ShallowRepoEvidence(
+                repository=RepoSearchResult(
+                    **repository.model_dump(),
+                    reference_type="end_to_end" if index == 0 else "subsystem",
+                    fit_score=round(0.92 - (index * 0.06), 2),
+                    fit_summary="It behaves like a strong collaborative drawing reference.",
+                    covered_primary=["realtime collaboration", "canvas rendering"],
+                    missing_primary=["presence"] if index < 3 else [],
+                    semantic_readme_score=round(0.86 - (index * 0.04), 2),
+                    relevance_score=round(0.92 - (index * 0.06), 2),
+                    rank_reasons=["covers primary capabilities: realtime collaboration, canvas rendering"],
+                ),
+                readme="Collaborative whiteboard with realtime collaboration and canvas rendering.",
+            )
+            for index, repository in enumerate(repositories)
+        ]
+        fetch_plans = [
+            RepoFetchPlan(
+                repository=RepoSearchResult(**{**repository.model_dump(), "commit_sha": f"commit-{index}"}),
+                selected_paths=["README.md", f"src/realtime/{index}.ts"],
+                skipped_paths=[],
+                estimated_chars=500 + index,
+                rationale=["Prioritized collaborative drawing paths."],
+            )
+            for index, repository in enumerate(repositories)
+        ]
+        generated_analysis = AnalysisResponse(
+            idea_summary=keywords.summary,
+            keywords=keywords,
+            repositories=repositories,
+            repo_descriptions=[
+                f"{repository.full_name} is useful because it demonstrates realtime collaboration."
+                for repository in repositories
+            ],
+            learning_path=[],
+            architecture_diagram="graph TD; User-->App;",
+            tech_stack=[],
+            status="complete",
+        )
+
+        class FakeCorpusService:
+            queued: list[str] = []
+            indexed: list[str] = []
+
+            def __init__(self) -> None:
+                self.queued = []
+                type(self).queued = self.queued
+                self.indexed = []
+                type(self).indexed = self.indexed
+
+            def load_indexed_repository(self, repo: RepoSearchResult) -> RepoSearchResult | None:
+                return None
+
+            def enqueue_index_job_placeholder(self, plan: RepoFetchPlan) -> bool:
+                self.queued.append(f"{plan.repository.full_name}@{plan.repository.commit_sha}")
+                return True
+
+            async def index_repository_plan(self, plan: RepoFetchPlan) -> RepoSearchResult:
+                self.indexed.append(f"{plan.repository.full_name}@{plan.repository.commit_sha}")
+                return plan.repository
+
+        class FakeRetrievalService:
+            async def retrieve(self, plan, repositories) -> dict:
+                return {}
+
+        with (
+            patch(
+                "routers.research.get_settings",
+                return_value=SimpleNamespace(
+                    PIPELINE_REQUEST_BUDGET_SECONDS=110,
+                    RAG_DEEP_INDEX_REPO_LIMIT=5,
+                    RAG_README_RERANK_LIMIT=5,
+                    INDEXING_MODE="background",
+                    RAG_INLINE_BOOTSTRAP_REPO_LIMIT=5,
+                    PIPELINE_RETRIEVAL_MIN_BUDGET_SECONDS=25,
+                    INDEXER_MAX_CONCURRENCY=3,
+                ),
+            ),
+            patch("routers.research.extract_keywords", AsyncMock(return_value=keywords)),
+            patch("routers.research.search_repo_candidates", AsyncMock(return_value=repositories)),
+            patch("routers.research.fetch_shallow_repo_evidence_batch", AsyncMock(return_value=shallow_evidence)),
+            patch("routers.research.rank_repo_evidence", AsyncMock(return_value=shallow_evidence)),
+            patch("routers.research.fetch_repo_snapshot", AsyncMock(side_effect=snapshots)),
+            patch("routers.research.build_repo_fetch_plan", side_effect=fetch_plans),
+            patch("routers.research.CorpusService", FakeCorpusService),
+            patch("routers.research.plan_retrieval_queries", AsyncMock(return_value=RetrievalPlan(queries=[]))),
+            patch("routers.research.RetrievalService", return_value=FakeRetrievalService()),
+            patch("routers.research.generate_analysis", AsyncMock(return_value=generated_analysis)),
+        ):
+            response = await research_idea(IdeaRequest(idea="an app where friends can draw together online"))
+
+        self.assertEqual("complete", response.status)
+        self.assertEqual([], FakeCorpusService.queued)
+        self.assertEqual(
+            [f"example/collab-board-{index}@commit-{index}" for index in range(5)],
+            FakeCorpusService.indexed,
+        )
+
+    async def test_research_request_merges_fresh_fit_metrics_into_cached_repositories(self):
+        keywords = ExtractedKeywords(
+            summary="Collaborative whiteboard for shared online drawing sessions.",
+            core_intent="Build a realtime shared canvas experience for multiple users.",
+            product_type="collaborative whiteboard",
+            capabilities=["realtime collaboration", "canvas rendering", "presence"],
+            primary_capabilities=["realtime collaboration", "canvas rendering", "presence"],
+            keywords=["whiteboard", "canvas", "realtime"],
+        )
+        repository = RepoSearchResult(
+            full_name="example/cached-board",
+            description="Collaborative whiteboard",
+            html_url="https://github.com/example/cached-board",
+            stars=120,
+            language="TypeScript",
+            topics=["whiteboard", "canvas", "websocket"],
+        )
+        ranked_repository = RepoSearchResult(
+            **repository.model_dump(),
+            reference_type="end_to_end",
+            fit_score=0.88,
+            fit_summary="It behaves like an end to end reference covering realtime collaboration and canvas rendering.",
+            covered_primary=["realtime collaboration", "canvas rendering"],
+            missing_primary=["presence"],
+            semantic_meta_score=0.71,
+            semantic_readme_score=0.81,
+            relevance_score=0.88,
+            query_hit_count=3,
+            rank_reasons=["covers primary capabilities: realtime collaboration, canvas rendering"],
+        )
+        shallow = ShallowRepoEvidence(
+            repository=ranked_repository,
+            readme="Collaborative whiteboard with realtime collaboration and canvas rendering.",
+        )
+        snapshot = RepoSnapshot(
+            **repository.model_dump(exclude={"commit_sha"}),
+            commit_sha="commit-cached",
+            tree=[],
+        )
+        fetch_plan = RepoFetchPlan(
+            repository=RepoSearchResult(**{**ranked_repository.model_dump(), "commit_sha": "commit-cached"}),
+            selected_paths=["README.md", "src/socket/server.ts"],
+            skipped_paths=[],
+            estimated_chars=500,
+            rationale=["Prioritized README and realtime code paths."],
+        )
+        cached_repository = RepoSearchResult(
+            **{**repository.model_dump(), "commit_sha": "commit-cached"},
+            reference_type="candidate",
+            fit_score=0.0,
+            fit_summary="",
+            covered_primary=[],
+            missing_primary=[],
+            relevance_score=0.0,
+        )
+        generated_analysis = AnalysisResponse(
+            idea_summary=keywords.summary,
+            keywords=keywords,
+            repositories=[cached_repository],
+            repo_descriptions=["example/cached-board is useful because it demonstrates realtime collaboration."],
+            learning_path=[],
+            architecture_diagram="graph TD; User-->App;",
+            tech_stack=[],
+            status="complete",
+        )
+
+        class FakeCorpusService:
+            def load_indexed_repository(self, repo: RepoSearchResult) -> RepoSearchResult | None:
+                return cached_repository
+
+        class FakeRetrievalService:
+            async def retrieve(self, plan, repositories) -> dict:
+                return {}
+
+        with (
+            patch(
+                "routers.research.get_settings",
+                return_value=SimpleNamespace(
+                    PIPELINE_REQUEST_BUDGET_SECONDS=110,
+                    RAG_DEEP_INDEX_REPO_LIMIT=1,
+                    RAG_README_RERANK_LIMIT=1,
+                    INDEXING_MODE="background",
+                    RAG_INLINE_BOOTSTRAP_REPO_LIMIT=1,
+                    PIPELINE_RETRIEVAL_MIN_BUDGET_SECONDS=25,
+                    INDEXER_MAX_CONCURRENCY=2,
+                ),
+            ),
             patch("routers.research.extract_keywords", AsyncMock(return_value=keywords)),
             patch("routers.research.search_repo_candidates", AsyncMock(return_value=[repository])),
             patch("routers.research.fetch_shallow_repo_evidence_batch", AsyncMock(return_value=[shallow])),
             patch("routers.research.rank_repo_evidence", AsyncMock(return_value=[shallow])),
             patch("routers.research.fetch_repo_snapshot", AsyncMock(return_value=snapshot)),
             patch("routers.research.build_repo_fetch_plan", return_value=fetch_plan),
-            patch("routers.research.CorpusService", FakeCorpusService),
-            patch("routers.research.plan_retrieval_queries", AsyncMock()) as plan_mock,
+            patch("routers.research.CorpusService", return_value=FakeCorpusService()),
+            patch("routers.research.plan_retrieval_queries", AsyncMock(return_value=RetrievalPlan(queries=[]))),
+            patch("routers.research.RetrievalService", return_value=FakeRetrievalService()),
             patch("routers.research.generate_analysis", AsyncMock(return_value=generated_analysis)) as generate_mock,
         ):
             response = await research_idea(IdeaRequest(idea="an app where friends can draw together online"))
 
         self.assertEqual("complete", response.status)
-        self.assertEqual(["example/collab-board@commit-123"], FakeCorpusService.queued)
-        plan_mock.assert_not_awaited()
-        generate_mock.assert_awaited_once()
-        self.assertEqual({}, generate_mock.await_args.args[3])
+        routed_repo = generate_mock.await_args.args[2][0]
+        self.assertEqual("end_to_end", routed_repo.reference_type)
+        self.assertEqual(0.88, routed_repo.fit_score)
+        self.assertIn("realtime collaboration", routed_repo.covered_primary)
 
 
 if __name__ == "__main__":

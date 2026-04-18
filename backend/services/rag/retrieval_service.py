@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import defaultdict
 
-from models.schemas import RepoSearchResult, RetrievalHit, RetrievalPlan
+from models.schemas import RepoSearchResult, RetrievalHit, RetrievalPlan, RetrievalQuery, RetrievalWeights
+from services.pipeline_cache_service import PipelineCacheService, stable_cache_key
 from services.rag.embedding_service import EmbeddingService
 from services.rag.store_service import get_rag_store
 
 logger = logging.getLogger(__name__)
+
+_cache = PipelineCacheService()
 
 
 class RetrievalService:
@@ -26,7 +30,7 @@ class RetrievalService:
     ) -> dict[str, list[RetrievalHit]]:
         """Retrieve evidence hits for each analysis section."""
 
-        if not repositories:
+        if not repositories or not plan.queries:
             return {}
 
         allowed_repos = {repo.full_name: repo.commit_sha for repo in repositories}
@@ -34,53 +38,92 @@ class RetrievalService:
         repo_priors = {
             repo.full_name: (repo.relevance_score / max_repo_score if max_repo_score else 0.0) for repo in repositories
         }
-
+        repo_cache_key = [(repo.full_name, repo.commit_sha) for repo in repositories]
         section_hits: dict[str, list[RetrievalHit]] = {}
+        pending_queries: list[tuple[RetrievalQuery, str]] = []
+
         for query in plan.queries:
-            query_embedding = await self.embedding_service.embed_query(query.query)
-            dense_hits = self.store.dense_search(query_embedding, allowed_repos, query.top_k)
-            lexical_hits = self.store.lexical_search(query.query, allowed_repos, query.top_k)
-            merged_hits = await self._merge_hits(
-                section=query.section,
-                query_text=query.query,
-                dense_hits=dense_hits,
-                lexical_hits=lexical_hits,
-                repo_priors=repo_priors,
-                preferred_roles=query.preferred_roles,
-                top_k=query.top_k,
+            cache_key = stable_cache_key(
+                {
+                    "repositories": repo_cache_key,
+                    "section": query.section,
+                    "query": query.query,
+                    "top_k": query.top_k,
+                    "preferred_roles": query.preferred_roles,
+                    "weights": query.weights.model_dump(),
+                }
             )
-            existing_hits = section_hits.get(query.section, [])
-            section_hits[query.section] = self._merge_section_hits(existing_hits, merged_hits, query.top_k)
+            cached = _cache.get_json("retrieval_hits", cache_key)
+            if isinstance(cached, list):
+                hits = [RetrievalHit(**item) for item in cached if isinstance(item, dict)]
+                existing_hits = section_hits.get(query.section, [])
+                section_hits[query.section] = self._merge_section_hits(existing_hits, hits, query.top_k)
+                continue
+            pending_queries.append((query, cache_key))
+
+        if not pending_queries:
+            return section_hits
+
+        query_embeddings = await self.embedding_service.embed_documents([query.query for query, _cache_key in pending_queries])
+        retrieval_tasks = [
+            self._retrieve_query(
+                query=query,
+                cache_key=cache_key,
+                query_embedding=query_embedding,
+                allowed_repos=allowed_repos,
+                repo_priors=repo_priors,
+            )
+            for (query, cache_key), query_embedding in zip(pending_queries, query_embeddings)
+        ]
+
+        for section, top_k, hits in await asyncio.gather(*retrieval_tasks):
+            existing_hits = section_hits.get(section, [])
+            section_hits[section] = self._merge_section_hits(existing_hits, hits, top_k)
 
         return section_hits
 
-    async def _merge_hits(
+    async def _retrieve_query(
+        self,
+        *,
+        query: RetrievalQuery,
+        cache_key: str,
+        query_embedding: list[float],
+        allowed_repos: dict[str, str],
+        repo_priors: dict[str, float],
+    ) -> tuple[str, int, list[RetrievalHit]]:
+        dense_hits_task = asyncio.to_thread(self.store.dense_search, query_embedding, allowed_repos, query.top_k)
+        lexical_hits_task = asyncio.to_thread(self.store.lexical_search, query.query, allowed_repos, query.top_k)
+        dense_hits, lexical_hits = await asyncio.gather(dense_hits_task, lexical_hits_task)
+        merged_hits = self._merge_hits(
+            section=query.section,
+            dense_hits=dense_hits,
+            lexical_hits=lexical_hits,
+            repo_priors=repo_priors,
+            preferred_roles=query.preferred_roles,
+            top_k=query.top_k,
+            weights=query.weights,
+        )
+        _cache.set_json("retrieval_hits", cache_key, [hit.model_dump() for hit in merged_hits])
+        return query.section, query.top_k, merged_hits
+
+    def _merge_hits(
         self,
         *,
         section: str,
-        query_text: str,
         dense_hits: list[dict],
         lexical_hits: list[dict],
         repo_priors: dict[str, float],
         preferred_roles: list[str],
         top_k: int,
+        weights: RetrievalWeights,
     ) -> list[RetrievalHit]:
         merged: dict[str, dict] = {}
 
         for dense in dense_hits:
-            merged[dense["chunk_id"]] = {
-                **dense,
-                "lexical_score": 0.0,
-            }
+            merged[dense["chunk_id"]] = {**dense, "lexical_score": 0.0}
 
         for lexical in lexical_hits:
-            entry = merged.setdefault(
-                lexical["chunk_id"],
-                {
-                    **lexical,
-                    "dense_score": 0.0,
-                },
-            )
+            entry = merged.setdefault(lexical["chunk_id"], {**lexical, "dense_score": 0.0})
             entry["lexical_score"] = max(entry.get("lexical_score", 0.0), lexical.get("lexical_score", 0.0))
             entry.setdefault("repo_score", lexical.get("repo_score", 0.0))
             entry.setdefault("text", lexical.get("text", ""))
@@ -90,37 +133,15 @@ class RetrievalService:
             entry.setdefault("start_line", lexical.get("start_line"))
             entry.setdefault("end_line", lexical.get("end_line"))
 
-        # Get AI-determined weights for this query type (cached per instance)
-        if not hasattr(self, '_retrieval_weights_cache'):
-            self._retrieval_weights_cache = {}
-        
-        cache_key = f"{section}:{query_text[:50]}"
-        if cache_key not in self._retrieval_weights_cache:
-            from services.llm_client import get_llm_client
-            llm = get_llm_client()
-            try:
-                weights = await llm.determine_retrieval_weights(section, query_text)
-                self._retrieval_weights_cache[cache_key] = weights
-            except Exception as exc:
-                logger.warning("Failed to get AI retrieval weights for %s: %s. Using defaults.", section, exc)
-                self._retrieval_weights_cache[cache_key] = {
-                    "dense_weight": 0.5,
-                    "lexical_weight": 0.25,
-                    "repo_weight": 0.15,
-                    "role_weight": 0.1,
-                }
-        
-        weights = self._retrieval_weights_cache[cache_key]
-        
         scored: list[RetrievalHit] = []
         for entry in merged.values():
             repo_prior = repo_priors.get(entry["repo_full_name"], 0.0)
             role_prior = self._role_prior(entry["chunk_role"], preferred_roles, section, entry["path"])
             score = (
-                weights.get("dense_weight", 0.45) * entry.get("dense_score", 0.0)
-                + weights.get("lexical_weight", 0.25) * entry.get("lexical_score", 0.0)
-                + weights.get("repo_weight", 0.20) * repo_prior
-                + weights.get("role_weight", 0.10) * role_prior
+                weights.dense_weight * entry.get("dense_score", 0.0)
+                + weights.lexical_weight * entry.get("lexical_score", 0.0)
+                + weights.repo_weight * repo_prior
+                + weights.role_weight * role_prior
             )
             scored.append(
                 RetrievalHit(

@@ -229,6 +229,25 @@ class RAGStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pipeline_cache_entries (
+                    namespace TEXT NOT NULL,
+                    cache_key TEXT NOT NULL,
+                    payload_json JSONB NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (namespace, cache_key)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS pipeline_cache_entries_expiry_idx
+                ON pipeline_cache_entries (expires_at ASC)
+                """
+            )
 
         self._ready = True
 
@@ -255,6 +274,63 @@ class RAGStore:
             "completed_repos": int(row["completed_repos"]) if row else 0,
             "chunks": int(row["chunks"]) if row else 0,
         }
+
+    def get_cache_entry(self, namespace: str, cache_key: str) -> Any | None:
+        """Load a non-expired cached pipeline artifact."""
+
+        self.ensure_ready()
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
+            row = conn.execute(
+                """
+                SELECT payload_json
+                FROM pipeline_cache_entries
+                WHERE namespace = %s
+                  AND cache_key = %s
+                  AND expires_at > NOW()
+                """,
+                (namespace, cache_key),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    DELETE FROM pipeline_cache_entries
+                    WHERE namespace = %s
+                      AND cache_key = %s
+                      AND expires_at <= NOW()
+                    """,
+                    (namespace, cache_key),
+                )
+                return None
+        return _load_json(row["payload_json"], None)
+
+    def set_cache_entry(self, namespace: str, cache_key: str, payload: Any, ttl_seconds: int) -> None:
+        """Persist a cached artifact with a TTL."""
+
+        self.ensure_ready()
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
+            conn.execute(
+                """
+                INSERT INTO pipeline_cache_entries (
+                    namespace,
+                    cache_key,
+                    payload_json,
+                    expires_at,
+                    updated_at
+                )
+                VALUES (%s, %s, %s::jsonb, NOW() + (%s * INTERVAL '1 second'), NOW())
+                ON CONFLICT (namespace, cache_key)
+                DO UPDATE SET
+                    payload_json = EXCLUDED.payload_json,
+                    expires_at = EXCLUDED.expires_at,
+                    updated_at = NOW()
+                """,
+                (
+                    namespace,
+                    cache_key,
+                    json.dumps(payload),
+                    ttl_seconds,
+                ),
+            )
 
     def is_indexed(self, repository: RepoSearchResult, embedding_model: str, chunking_version: str) -> bool:
         """Check whether a repo commit is already indexed for the active corpus settings."""

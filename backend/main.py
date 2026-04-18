@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from core.config import get_settings
 from routers.research import router as research_router
+from services.github_client_service import close_github_client
 from services.rag.store_service import get_rag_store
 
 logging.basicConfig(
@@ -35,7 +36,9 @@ async def lifespan(app: FastAPI):
     )
     logger.info("  Candidate repo limit: %d", settings.RAG_CANDIDATE_REPO_LIMIT)
     logger.info("  Deep index repo limit: %d", settings.RAG_DEEP_INDEX_REPO_LIMIT)
+    logger.info("  Inline bootstrap repo limit: %d", settings.RAG_INLINE_BOOTSTRAP_REPO_LIMIT)
     yield
+    await close_github_client()
     store.close()
     logger.info("%s shutting down", settings.APP_NAME)
 

@@ -4,49 +4,57 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import logging
 import math
+import posixpath
+import zipfile
 from collections import defaultdict
 
-import httpx
 from cachetools import TTLCache
 
 from core.config import get_settings
 from models.schemas import ExtractedKeywords, RepoFetchPlan, RepoFile, RepoSearchResult, RepoSnapshot, RepoTreeEntry, ShallowRepoEvidence
+from services.github_client_service import get_github_client
+from services.pipeline_cache_service import PipelineCacheService, stable_cache_key
 from services.rag.embedding_service import EmbeddingService
 
 logger = logging.getLogger(__name__)
 
 _cache: TTLCache = TTLCache(maxsize=512, ttl=get_settings().GITHUB_CACHE_TTL)
+_persistent_cache = PipelineCacheService()
+_SEARCH_RANKING_WEIGHTS = {
+    "metadata_semantic": 0.65,
+    "query_diversity": 0.2,
+    "capability_coverage": 0.1,
+    "star_quality": 0.05,
+}
 
-# Common paths to skip during file fetching
 SKIP_PATH_PARTS = {
     "node_modules", "vendor", ".git", "dist", "build", "coverage",
     "test", "tests", "__pycache__", ".next", ".nuxt", "target",
-    "bin", "obj", "packages", ".vscode", ".idea"
+    "bin", "obj", "packages", ".vscode", ".idea",
 }
 
-# Important configuration and documentation files
 IMPORTANT_FILENAMES = {
     "package.json", "requirements.txt", "cargo.toml", "go.mod",
     "gemfile", "composer.json", "pom.xml", "build.gradle",
     "dockerfile", "docker-compose.yml", ".env.example",
-    "config.yml", "config.yaml", "tsconfig.json"
+    "config.yml", "config.yaml", "tsconfig.json",
 }
 
-# Source code file extensions to fetch
 SOURCE_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs",
     ".rb", ".php", ".c", ".cpp", ".h", ".hpp", ".cs", ".swift",
     ".kt", ".scala", ".r", ".m", ".vue", ".svelte", ".dart",
     ".sh", ".bash", ".sql", ".graphql", ".proto", ".yaml", ".yml",
-    ".json", ".xml", ".md", ".txt", ".toml", ".ini", ".cfg"
+    ".json", ".xml", ".md", ".txt", ".toml", ".ini", ".cfg",
 }
 
 
-def _headers() -> dict[str, str]:
+def _headers(accept: str = "application/vnd.github+json") -> dict[str, str]:
     settings = get_settings()
-    headers = {"Accept": "application/vnd.github+json"}
+    headers = {"Accept": accept}
     if settings.GITHUB_TOKEN:
         headers["Authorization"] = f"token {settings.GITHUB_TOKEN}"
     return headers
@@ -90,39 +98,76 @@ def _path_priority(path: str, idea_terms: set[str]) -> int:
     return score
 
 
+def _normalize_archive_path(member_name: str) -> str:
+    normalized = member_name.replace("\\", "/").strip("/")
+    if not normalized:
+        return ""
+    parts = normalized.split("/", 1)
+    if len(parts) == 1:
+        return ""
+    return posixpath.normpath(parts[1]).lstrip("./")
+
+
+def _looks_binary(data: bytes) -> bool:
+    if not data:
+        return False
+    if b"\x00" in data:
+        return True
+    text_bytes = sum(1 for byte in data[:1024] if 9 <= byte <= 13 or 32 <= byte <= 126)
+    return text_bytes / max(len(data[:1024]), 1) < 0.7
+
+
 async def build_search_queries(keywords: ExtractedKeywords) -> list[str]:
-    """Build multiple GitHub search queries using AI."""
-    
-    from services.llm_client import get_llm_client
-    
+    """Build multiple GitHub search queries using one model call."""
+
     settings = get_settings()
+    cache_key = stable_cache_key(
+        {
+            "summary": keywords.summary,
+            "core_intent": keywords.core_intent,
+            "product_type": keywords.product_type,
+            "primary_capabilities": keywords.primary_capabilities,
+            "secondary_capabilities": keywords.secondary_capabilities,
+            "domain_terms": keywords.domain_terms,
+            "languages": keywords.languages,
+        }
+    )
+    cached = _persistent_cache.get_json("llm_search_queries", cache_key)
+    if isinstance(cached, list):
+        return [query for query in cached if isinstance(query, str)]
+
+    from services.llm_client import get_llm_client
+
     llm = get_llm_client()
-    
     idea_context = f"{keywords.core_intent or keywords.summary}. Capabilities: {', '.join(keywords.primary_capabilities or keywords.capabilities[:3])}"
-    
-    # Generate queries for primary capabilities using AI
     queries: list[str] = []
-    
-    for capability in (keywords.primary_capabilities or keywords.capabilities[:3]):
-        try:
-            capability_queries = await llm.generate_search_queries(capability, idea_context, num_queries=2)
-            queries.extend(capability_queries)
-        except Exception as exc:
-            logger.warning("Failed to generate AI queries for %s: %s", capability, exc)
-            # Simple fallback query without hardcoded terms
-            queries.append(f"{capability} {keywords.product_type or ''}")
-    
-    # Add broad domain query
+
+    try:
+        queries = await llm.generate_search_queries_batch(
+            idea_context=idea_context,
+            capabilities=keywords.primary_capabilities or keywords.capabilities[:4],
+            domain_terms=keywords.domain_terms or keywords.keywords,
+            languages=keywords.languages,
+            max_queries=settings.RAG_QUERY_LIMIT,
+        )
+    except Exception as exc:
+        logger.warning("Failed to generate batched AI search queries: %s", exc)
+
+    if not queries:
+        for capability in keywords.primary_capabilities or keywords.capabilities[:3]:
+            try:
+                queries.extend(await llm.generate_search_queries(capability, idea_context, num_queries=2))
+            except Exception as exc:
+                logger.warning("Failed to generate fallback queries for %s: %s", capability, exc)
+                queries.append(f"{capability} {keywords.product_type or ''}".strip())
+
     if keywords.domain_terms:
         queries.append(" ".join(keywords.domain_terms[:3]))
-    
-    # Add language-qualified query if specified
     if keywords.languages:
         qualifier = " ".join([keywords.product_type or "", keywords.core_intent or ""][:2]).strip()
         if qualifier:
             queries.append(f"{qualifier} language:{keywords.languages[0]}")
-    
-    # Deduplicate
+
     deduped: list[str] = []
     seen: set[str] = set()
     for query in queries:
@@ -133,33 +178,14 @@ async def build_search_queries(keywords: ExtractedKeywords) -> list[str]:
         seen.add(normalized.lower())
         if len(deduped) >= settings.RAG_QUERY_LIMIT:
             break
-    
-    return deduped or [keywords.summary]  # Ultimate fallback to avoid empty list
 
-
-def _clean_query_terms(terms: list[str]) -> list[str]:
-    cleaned: list[str] = []
-    seen: set[str] = set()
-    for term in terms:
-        normalized = term.strip().lower().replace(",", "")
-        if not normalized or normalized in {"and", "for", "the", "with", "api", "backend", "client"}:
-            continue
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        cleaned.append(normalized)
-    return cleaned
-
-
-def _query_join(terms: list[str]) -> str:
-    return " ".join(term for term in terms if term).strip()
+    final_queries = deduped or [keywords.summary]
+    _persistent_cache.set_json("llm_search_queries", cache_key, final_queries)
+    return final_queries
 
 
 def _language_bucket(language: str | None) -> str:
     return (language or "Unknown").strip() or "Unknown"
-
-
-# _candidate_quality_penalty and _candidate_quality_score removed - using AI evaluation
 
 
 def _intent_search_text(keywords: ExtractedKeywords) -> str:
@@ -205,49 +231,56 @@ async def search_repo_candidates(keywords: ExtractedKeywords) -> list[RepoSearch
     query_map: defaultdict[str, set[str]] = defaultdict(set)
     embedding_service = EmbeddingService()
     intent_text = _intent_search_text(keywords)
+    client = get_github_client()
+    semaphore = asyncio.Semaphore(settings.RAG_MAX_SEARCH_CONCURRENCY)
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        semaphore = asyncio.Semaphore(settings.RAG_MAX_SEARCH_CONCURRENCY)
+    async def fetch_query(query: str) -> tuple[str, list[dict]]:
+        cache_payload = {"query": query, "per_page": settings.RAG_SEARCH_PER_QUERY}
+        cache_key = stable_cache_key(cache_payload)
+        memory_key = f"search:{query}:{settings.RAG_SEARCH_PER_QUERY}"
+        if memory_key in _cache:
+            return query, _cache[memory_key]
+        cached = _persistent_cache.get_json("github_search", cache_key)
+        if isinstance(cached, list):
+            _cache[memory_key] = cached
+            return query, cached
 
-        async def fetch_query(query: str) -> tuple[str, list[dict]]:
-            cache_key = f"search:{query}:{settings.RAG_SEARCH_PER_QUERY}"
-            if cache_key in _cache:
-                return query, _cache[cache_key]
-            async with semaphore:
-                response = await client.get(
-                    f"{settings.GITHUB_API_BASE}/search/repositories",
-                    headers=_headers(),
-                    params={
-                        "q": query,
-                        "per_page": settings.RAG_SEARCH_PER_QUERY,
-                    },
-                )
-                response.raise_for_status()
-                items = response.json().get("items", [])
-                _cache[cache_key] = items
-                return query, items
+        async with semaphore:
+            response = await client.get(
+                f"{settings.GITHUB_API_BASE}/search/repositories",
+                headers=_headers(),
+                params={
+                    "q": query,
+                    "per_page": settings.RAG_SEARCH_PER_QUERY,
+                },
+            )
+            response.raise_for_status()
+            items = response.json().get("items", [])
+            _cache[memory_key] = items
+            _persistent_cache.set_json("github_search", cache_key, items)
+            return query, items
 
-        query_results = await asyncio.gather(*(fetch_query(query) for query in queries), return_exceptions=True)
-        for result in query_results:
-            if isinstance(result, Exception):
-                logger.warning("GitHub query failed during candidate discovery: %s", result)
-                continue
-            query, items = result
-            for item in items:
-                existing = merged.get(item["full_name"])
-                repo = RepoSearchResult(
-                    full_name=item["full_name"],
-                    description=item.get("description"),
-                    html_url=item["html_url"],
-                    stars=item.get("stargazers_count", 0),
-                    language=item.get("language"),
-                    topics=item.get("topics", []),
-                    archived=item.get("archived", False),
-                    updated_at=item.get("updated_at"),
-                )
-                if existing is None or repo.stars > existing.stars:
-                    merged[repo.full_name] = repo
-                query_map[repo.full_name].add(query)
+    query_results = await asyncio.gather(*(fetch_query(query) for query in queries), return_exceptions=True)
+    for result in query_results:
+        if isinstance(result, Exception):
+            logger.warning("GitHub query failed during candidate discovery: %s", result)
+            continue
+        query, items = result
+        for item in items:
+            existing = merged.get(item["full_name"])
+            repo = RepoSearchResult(
+                full_name=item["full_name"],
+                description=item.get("description"),
+                html_url=item["html_url"],
+                stars=item.get("stargazers_count", 0),
+                language=item.get("language"),
+                topics=item.get("topics", []),
+                archived=item.get("archived", False),
+                updated_at=item.get("updated_at"),
+            )
+            if existing is None or repo.stars > existing.stars:
+                merged[repo.full_name] = repo
+            query_map[repo.full_name].add(query)
 
     if not merged:
         return []
@@ -256,36 +289,17 @@ async def search_repo_candidates(keywords: ExtractedKeywords) -> list[RepoSearch
     query_hit_max = max((len(query_map[repo.full_name]) for repo in candidates), default=1)
     intent_embedding = await embedding_service.embed_query(intent_text)
     metadata_embeddings = await embedding_service.embed_documents([_repo_metadata_text(repo) for repo in candidates])
+    weights = dict(_SEARCH_RANKING_WEIGHTS)
 
-    # Use AI to determine optimal scoring weights
-    from services.llm_client import get_llm_client
-    llm = get_llm_client()
-    
-    try:
-        weights = await llm.calculate_ranking_weights(keywords.summary or keywords.core_intent, len(candidates))
-    except Exception as exc:
-        logger.warning("Failed to get AI ranking weights: %s. Using semantic-first defaults.", exc)
-        weights = {
-            "readme_semantic": 0.7,
-            "metadata_semantic": 0.15,
-            "capability_coverage": 0.1,
-            "doc_quality": 0.0,
-            "query_diversity": 0.05,
-            "star_quality": 0.0,
-        }
-    
     preliminary: list[RepoSearchResult] = []
     for repo, embedding in zip(candidates, metadata_embeddings):
         repo.query_hit_count = len(query_map[repo.full_name])
         repo.semantic_meta_score = round(_cosine_similarity(intent_embedding, embedding), 5)
         query_score = repo.query_hit_count / max(query_hit_max, 1)
-        
-        # Simple quality indicators without hardcoded patterns
         is_archived = repo.archived
         has_recent_activity = repo.updated_at is not None
         star_score = min(math.log10(repo.stars + 10) / 4.0, 1.0)
         quality_score = star_score * (0.5 if is_archived else 1.0) * (1.1 if has_recent_activity else 0.9)
-        
         coverage_overlap = len(
             {
                 term.lower()
@@ -293,8 +307,7 @@ async def search_repo_candidates(keywords: ExtractedKeywords) -> list[RepoSearch
                 if term and term.lower() in _repo_metadata_text(repo).lower()
             }
         ) / max(len(keywords.primary_capabilities[:3]) + len(keywords.domain_terms[:6]), 1)
-        
-        # Use AI-determined weights
+
         repo.relevance_score = round(
             max(
                 0.0,
@@ -312,77 +325,78 @@ async def search_repo_candidates(keywords: ExtractedKeywords) -> list[RepoSearch
         preliminary.append(repo)
 
     preliminary.sort(key=lambda repo: repo.relevance_score, reverse=True)
-    
-    # Apply diversity constraints from config (not hardcoded)
     language_counts: defaultdict[str, int] = defaultdict(int)
     shortlisted: list[RepoSearchResult] = []
-    max_per_language = settings.RAG_MAX_PER_LANGUAGE if hasattr(settings, 'RAG_MAX_PER_LANGUAGE') else 999
-    
+
     for repo in preliminary:
         bucket = _language_bucket(repo.language)
-        if language_counts[bucket] >= max_per_language:
+        if language_counts[bucket] >= settings.RAG_MAX_PER_LANGUAGE:
             continue
         shortlisted.append(repo)
         language_counts[bucket] += 1
         if len(shortlisted) >= settings.RAG_CANDIDATE_REPO_LIMIT:
             break
 
-    candidates = shortlisted
-    logger.info("GitHub candidate search produced %d repositories across %d queries", len(candidates), len(queries))
-    return candidates
+    logger.info("GitHub candidate search produced %d repositories across %d queries", len(shortlisted), len(queries))
+    return shortlisted
 
 
 async def fetch_repo_snapshot(repo: RepoSearchResult) -> RepoSnapshot:
     """Fetch repo metadata, commit SHA, and tree."""
 
     settings = get_settings()
-    cache_key = f"snapshot:{repo.full_name}"
-    if cache_key in _cache:
-        return RepoSnapshot(**_cache[cache_key])
+    cache_key = stable_cache_key({"repo": repo.full_name, "updated_at": repo.updated_at})
+    memory_key = f"snapshot:{repo.full_name}"
+    if memory_key in _cache:
+        return RepoSnapshot(**_cache[memory_key])
+    cached = _persistent_cache.get_json("github_snapshot", cache_key)
+    if isinstance(cached, dict):
+        _cache[memory_key] = cached
+        return RepoSnapshot(**cached)
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        repo_response = await client.get(
-            f"{settings.GITHUB_API_BASE}/repos/{repo.full_name}",
-            headers=_headers(),
-        )
-        repo_response.raise_for_status()
-        repo_data = repo_response.json()
+    client = get_github_client()
+    repo_response = await client.get(
+        f"{settings.GITHUB_API_BASE}/repos/{repo.full_name}",
+        headers=_headers(),
+    )
+    repo_response.raise_for_status()
+    repo_data = repo_response.json()
 
-        default_branch = repo_data.get("default_branch") or repo.default_branch or "HEAD"
-        commit_sha = repo.commit_sha or default_branch
-        commit_response = await client.get(
-            f"{settings.GITHUB_API_BASE}/repos/{repo.full_name}/commits/{default_branch}",
-            headers=_headers(),
+    default_branch = repo_data.get("default_branch") or repo.default_branch or "HEAD"
+    commit_sha = repo.commit_sha or default_branch
+    commit_response = await client.get(
+        f"{settings.GITHUB_API_BASE}/repos/{repo.full_name}/commits/{default_branch}",
+        headers=_headers(),
+    )
+    if commit_response.status_code == 200:
+        commit_sha = commit_response.json().get("sha", "") or commit_sha
+    else:
+        logger.warning(
+            "Could not resolve commit SHA for %s on branch %s (status %d); using fallback key",
+            repo.full_name,
+            default_branch,
+            commit_response.status_code,
         )
-        if commit_response.status_code == 200:
-            commit_sha = commit_response.json().get("sha", "") or commit_sha
-        else:
-            logger.warning(
-                "Could not resolve commit SHA for %s on branch %s (status %d); using fallback key",
-                repo.full_name,
-                default_branch,
-                commit_response.status_code,
-            )
 
-        tree_response = await client.get(
-            f"{settings.GITHUB_API_BASE}/repos/{repo.full_name}/git/trees/{default_branch}",
-            headers=_headers(),
-            params={"recursive": 1},
+    tree_response = await client.get(
+        f"{settings.GITHUB_API_BASE}/repos/{repo.full_name}/git/trees/{default_branch}",
+        headers=_headers(),
+        params={"recursive": 1},
+    )
+    tree_entries: list[RepoTreeEntry] = []
+    if tree_response.status_code == 200:
+        tree_entries = [
+            RepoTreeEntry(path=item["path"], type=item.get("type", "blob"), size=item.get("size", 0))
+            for item in tree_response.json().get("tree", [])
+            if item.get("type") == "blob"
+        ]
+    else:
+        logger.warning(
+            "Could not fetch tree for %s on branch %s (status %d)",
+            repo.full_name,
+            default_branch,
+            tree_response.status_code,
         )
-        tree_entries: list[RepoTreeEntry] = []
-        if tree_response.status_code == 200:
-            tree_entries = [
-                RepoTreeEntry(path=item["path"], type=item.get("type", "blob"), size=item.get("size", 0))
-                for item in tree_response.json().get("tree", [])
-                if item.get("type") == "blob"
-            ]
-        else:
-            logger.warning(
-                "Could not fetch tree for %s on branch %s (status %d)",
-                repo.full_name,
-                default_branch,
-                tree_response.status_code,
-            )
 
     snapshot_payload = repo.model_dump()
     snapshot_payload.update(
@@ -400,7 +414,9 @@ async def fetch_repo_snapshot(repo: RepoSearchResult) -> RepoSnapshot:
         }
     )
     snapshot = RepoSnapshot(**snapshot_payload)
-    _cache[cache_key] = snapshot.model_dump()
+    payload = snapshot.model_dump()
+    _cache[memory_key] = payload
+    _persistent_cache.set_json("github_snapshot", cache_key, payload)
     return snapshot
 
 
@@ -421,50 +437,69 @@ def _root_manifest_candidates(language: str | None) -> list[str]:
 async def fetch_shallow_repo_evidence(repository: RepoSearchResult) -> ShallowRepoEvidence:
     """Fetch README and root manifests for semantic reranking."""
 
+    cache_key = stable_cache_key(
+        {
+            "repo": repository.full_name,
+            "updated_at": repository.updated_at,
+            "language": repository.language,
+        }
+    )
+    cached = _persistent_cache.get_json("github_shallow", cache_key)
+    if isinstance(cached, dict):
+        return ShallowRepoEvidence(**cached)
+
     readme_candidates = ["README.md", "readme.md", "README", "docs/README.md"]
     manifest_candidates = _root_manifest_candidates(repository.language)[:5]
     manifest_files: list[RepoFile] = []
     readme_text = ""
     readme_path: str | None = None
     highlighted_paths: list[str] = []
+    client = get_github_client()
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        readme_cache_key = f"readme:{repository.full_name}"
-        if readme_cache_key in _cache:
-            readme_text = _cache[readme_cache_key]
-            readme_path = "README.md" if readme_text else None
-        else:
-            response = await client.get(
-                f"{get_settings().GITHUB_API_BASE}/repos/{repository.full_name}/readme",
-                headers={**_headers(), "Accept": "application/vnd.github.raw+json"},
-            )
-            if response.status_code == 200:
-                readme_text = response.text
-                readme_path = "README.md"
-                _cache[readme_cache_key] = readme_text
-        for path in readme_candidates:
-            if readme_text:
-                break
-            readme_text = await _fetch_file_content(client, repository.full_name, path) or ""
-            if readme_text:
-                readme_path = path
-                break
-        for path in manifest_candidates:
-            content = await _fetch_file_content(client, repository.full_name, path)
-            if content:
-                manifest_files.append(RepoFile(path=path, content=content, size=len(content)))
-                highlighted_paths.append(path)
+    readme_cache_key = f"readme:{repository.full_name}"
+    if readme_cache_key in _cache:
+        readme_text = _cache[readme_cache_key]
+        readme_path = "README.md" if readme_text else None
+    else:
+        response = await client.get(
+            f"{get_settings().GITHUB_API_BASE}/repos/{repository.full_name}/readme",
+            headers=_headers("application/vnd.github.raw+json"),
+        )
+        if response.status_code == 200:
+            readme_text = response.text
+            readme_path = "README.md"
+            _cache[readme_cache_key] = readme_text
+
+    for path in readme_candidates:
+        if readme_text:
+            break
+        readme_text = await _fetch_file_content(client, repository.full_name, path) or ""
+        if readme_text:
+            readme_path = path
+            break
+
+    async def fetch_manifest(path: str) -> tuple[str, str | None]:
+        return path, await _fetch_file_content(client, repository.full_name, path)
+
+    manifest_results = await asyncio.gather(*(fetch_manifest(path) for path in manifest_candidates))
+    for path, content in manifest_results:
+        if not content:
+            continue
+        manifest_files.append(RepoFile(path=path, content=content, size=len(content)))
+        highlighted_paths.append(path)
 
     if readme_path:
         highlighted_paths.insert(0, readme_path)
 
-    return ShallowRepoEvidence(
+    evidence = ShallowRepoEvidence(
         repository=repository.model_copy(deep=True),
         readme_path=readme_path,
         readme=readme_text,
         manifest_files=manifest_files,
         highlighted_paths=highlighted_paths[:10],
     )
+    _persistent_cache.set_json("github_shallow", cache_key, evidence.model_dump())
+    return evidence
 
 
 async def fetch_shallow_repo_evidence_batch(repositories: list[RepoSearchResult]) -> list[ShallowRepoEvidence]:
@@ -485,8 +520,17 @@ async def fetch_shallow_repo_evidence_batch(repositories: list[RepoSearchResult]
     return [item for item in results if item is not None]
 
 
-def build_repo_fetch_plan(snapshot: RepoSnapshot, shallow: ShallowRepoEvidence, intent: ExtractedKeywords) -> RepoFetchPlan:
+def build_repo_fetch_plan(
+    snapshot: RepoSnapshot,
+    intent: ExtractedKeywords | ShallowRepoEvidence,
+    shallow: ShallowRepoEvidence | ExtractedKeywords | None = None,
+) -> RepoFetchPlan:
     """Select the highest-value files for deep indexing."""
+
+    if isinstance(intent, ShallowRepoEvidence) and isinstance(shallow, ExtractedKeywords):
+        intent, shallow = shallow, intent
+    if not isinstance(intent, ExtractedKeywords):
+        raise TypeError("build_repo_fetch_plan expects ExtractedKeywords as the resolved intent.")
 
     settings = get_settings()
     idea_terms = {
@@ -497,12 +541,10 @@ def build_repo_fetch_plan(snapshot: RepoSnapshot, shallow: ShallowRepoEvidence, 
             *intent.secondary_capabilities[:4],
             *intent.keywords[:6],
             *intent.likely_components[:4],
-            *shallow.matched_capabilities[:4],
+            *(shallow.matched_capabilities[:4] if shallow else []),
         ]
         if len(term) > 2
     }
-    max_files = min(settings.RAG_MAX_FILES_PER_REPO, 30)
-    max_chars = min(settings.RAG_MAX_CHARS_PER_REPO, 150_000)
     prioritized = sorted(
         (
             entry
@@ -518,24 +560,13 @@ def build_repo_fetch_plan(snapshot: RepoSnapshot, shallow: ShallowRepoEvidence, 
     estimated_chars = 0
     selected_set: set[str] = set()
 
-    readme_seed = RepoFile(
-        path=shallow.readme_path or "README.md",
-        content=shallow.readme,
-        size=len(shallow.readme),
-    )
-    for repo_file in [*shallow.manifest_files, readme_seed]:
-        if repo_file.content and repo_file.path not in selected_set:
-            selected_paths.append(repo_file.path)
-            selected_set.add(repo_file.path)
-            estimated_chars += repo_file.size
-
     for entry in prioritized:
         if entry.path in selected_set:
             continue
-        if len(selected_paths) >= max_files:
+        if len(selected_paths) >= settings.RAG_MAX_FILES_PER_REPO:
             skipped_paths.append(entry.path)
             continue
-        if estimated_chars + entry.size > max_chars:
+        if estimated_chars + entry.size > settings.RAG_MAX_CHARS_PER_REPO:
             skipped_paths.append(entry.path)
             continue
         selected_paths.append(entry.path)
@@ -543,13 +574,11 @@ def build_repo_fetch_plan(snapshot: RepoSnapshot, shallow: ShallowRepoEvidence, 
         estimated_chars += entry.size
 
     rationale = [
-        "Prioritized README, manifests, and paths aligned with the resolved product capabilities first.",
-        "Skipped generated/binary/oversized files and capped total indexed characters.",
+        "Selected files directly from the full Git tree instead of probing only README or manifest files.",
+        "Prioritized paths aligned with the resolved capabilities, then included additional eligible source/config/docs files until the per-repo caps were reached.",
     ]
 
-    repo_payload = snapshot.model_dump(
-        exclude={"tree", "search_queries", "files"},
-    )
+    repo_payload = snapshot.model_dump(exclude={"tree", "search_queries", "files"})
     ranked_overrides = shallow.repository.model_dump(
         include={
             "reference_type",
@@ -563,7 +592,7 @@ def build_repo_fetch_plan(snapshot: RepoSnapshot, shallow: ShallowRepoEvidence, 
             "semantic_readme_score",
             "query_hit_count",
         },
-    )
+    ) if shallow else {}
     repository = RepoSearchResult(**{**repo_payload, **ranked_overrides})
 
     return RepoFetchPlan(
@@ -576,20 +605,77 @@ def build_repo_fetch_plan(snapshot: RepoSnapshot, shallow: ShallowRepoEvidence, 
 
 
 async def fetch_repo_files_for_indexing(plan: RepoFetchPlan) -> list[RepoFile]:
-    """Fetch the planned files for indexing."""
+    """Fetch planned files by downloading one repo archive and extracting selected paths."""
 
-    files: list[RepoFile] = []
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        for path in plan.selected_paths:
-            content = await _fetch_file_content(client, plan.repository.full_name, path)
-            if not content:
+    settings = get_settings()
+    client = get_github_client()
+    archive_ref = plan.repository.commit_sha or plan.repository.default_branch or "HEAD"
+    response = await client.get(
+        f"{settings.GITHUB_API_BASE}/repos/{plan.repository.full_name}/zipball/{archive_ref}",
+        headers=_headers("application/vnd.github+json"),
+    )
+    response.raise_for_status()
+
+    archive_bytes = response.content
+    if len(archive_bytes) > settings.RAG_ARCHIVE_MAX_BYTES:
+        raise ValueError(
+            f"Archive for {plan.repository.full_name} exceeded the max download size of {settings.RAG_ARCHIVE_MAX_BYTES} bytes."
+        )
+
+    selected_lookup = {path.replace("\\", "/"): index for index, path in enumerate(plan.selected_paths)}
+    extracted_bytes = 0
+    extracted_files = 0
+    files_by_index: dict[int, RepoFile] = {}
+
+    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+        for member in archive.infolist():
+            if member.is_dir():
                 continue
-            files.append(RepoFile(path=path, content=content, size=len(content)))
-    logger.info("Fetched %d planned files for %s", len(files), plan.repository.full_name)
-    return files
+            relative_path = _normalize_archive_path(member.filename)
+            if not relative_path:
+                continue
+            normalized_path = relative_path.replace("\\", "/")
+            target_index = selected_lookup.get(normalized_path)
+            if target_index is None:
+                continue
+            if member.file_size > settings.RAG_MAX_FILE_SIZE:
+                continue
+
+            extracted_files += 1
+            if extracted_files > settings.RAG_ARCHIVE_MAX_FILES:
+                break
+
+            with archive.open(member) as file_handle:
+                raw = file_handle.read()
+
+            extracted_bytes += len(raw)
+            if extracted_bytes > settings.RAG_ARCHIVE_MAX_EXTRACTED_BYTES:
+                logger.warning(
+                    "Stopped extracting %s after %d bytes to stay within archive limits",
+                    plan.repository.full_name,
+                    extracted_bytes,
+                )
+                break
+            if _looks_binary(raw):
+                continue
+
+            content = raw.decode("utf-8", errors="replace")
+            files_by_index[target_index] = RepoFile(
+                path=normalized_path,
+                content=content,
+                size=len(content),
+            )
+
+    ordered_files = [files_by_index[index] for index in sorted(files_by_index)]
+    logger.info(
+        "Fetched %d planned files for %s from one archive download",
+        len(ordered_files),
+        plan.repository.full_name,
+    )
+    return ordered_files
 
 
-async def _fetch_file_content(client: httpx.AsyncClient, full_name: str, path: str) -> str | None:
+async def _fetch_file_content(client, full_name: str, path: str) -> str | None:
     """Fetch and decode a repository file via the contents API."""
 
     settings = get_settings()
@@ -609,7 +695,7 @@ async def _fetch_file_content(client: httpx.AsyncClient, full_name: str, path: s
         return None
     try:
         content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
-    except Exception:  # pragma: no cover - defensive decode guard
+    except Exception:
         return None
     _cache[cache_key] = content
     return content

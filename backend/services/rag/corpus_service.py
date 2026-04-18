@@ -48,6 +48,30 @@ class CorpusService:
             self.chunking_version,
         )
 
+    def enqueue_index_job_placeholder(self, plan: RepoFetchPlan) -> bool:
+        """Queue a deep indexing job without any shallow evidence payload."""
+
+        return self.enqueue_index_job(
+            plan,
+            ShallowRepoEvidence(repository=plan.repository.model_copy(deep=True)),
+        )
+
+    async def index_repository_plan(
+        self,
+        plan: RepoFetchPlan,
+        shallow: ShallowRepoEvidence | None = None,
+    ) -> RepoSearchResult:
+        """Index a repository plan immediately in-process."""
+
+        existing = self.load_indexed_repository(plan.repository)
+        if existing is not None:
+            return existing
+
+        placeholder = shallow or ShallowRepoEvidence(repository=plan.repository.model_copy(deep=True))
+        self.enqueue_index_job(plan, placeholder)
+        job = ClaimedIndexJob(plan=plan, shallow_summary={}, retry_count=0)
+        return await self.process_index_job(job)
+
     def claim_index_job(self, worker_id: str) -> ClaimedIndexJob | None:
         return self.store.claim_index_job(worker_id, self.embedding_model_name, self.chunking_version)
 

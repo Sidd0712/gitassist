@@ -9,6 +9,7 @@ from collections import Counter
 
 from core.config import get_settings
 from models.schemas import ExtractedKeywords, ShallowRepoEvidence
+from services.llm_service import get_ranking_weights
 from services.rag.embedding_service import EmbeddingService
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,7 @@ async def rank_repo_evidence(
     repo_texts = [_repo_text(evidence) for evidence in evidence_items]
     repo_embeddings = await embedding_service.embed_documents(repo_texts)
     max_query_hits = max((evidence.repository.query_hit_count for evidence in evidence_items), default=1)
+    weights = await get_ranking_weights(idea, len(evidence_items))
 
     for evidence, repo_embedding, repo_text in zip(evidence_items, repo_embeddings, repo_texts):
         repo = evidence.repository
@@ -55,24 +57,6 @@ async def rank_repo_evidence(
         low_value_penalty = _low_value_penalty(repo.full_name, repo.description or "", evidence.readme)
         scope_penalty = _scope_mismatch_penalty(keywords, lowered)
 
-        # Use AI-determined weights for ranking (loaded once for all repos)
-        if not hasattr(rank_repo_evidence, '_ai_weights'):
-            from services.llm_client import get_llm_client
-            llm = get_llm_client()
-            try:
-                rank_repo_evidence._ai_weights = await llm.calculate_ranking_weights(idea, len(evidence_items))
-            except Exception as exc:
-                logger.warning("Failed to get AI ranking weights: %s. Using defaults.", exc)
-                rank_repo_evidence._ai_weights = {
-                    "readme_semantic": 0.45,
-                    "metadata_semantic": 0.20,
-                    "capability_coverage": 0.20,
-                    "doc_quality": 0.07,
-                    "query_diversity": 0.04,
-                    "star_quality": 0.04,
-                }
-        
-        weights = rank_repo_evidence._ai_weights
         final_score = (
             weights.get("readme_semantic", 0.45) * semantic_readme_score
             + weights.get("metadata_semantic", 0.20) * semantic_meta_score

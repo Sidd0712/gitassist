@@ -2,20 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from time import perf_counter
 
 from fastapi import APIRouter, HTTPException
 
 from core.config import get_settings
-from models.schemas import AnalysisResponse, IdeaRequest, RepoSnapshot, ShallowRepoEvidence
+from models.schemas import AnalysisResponse, IdeaRequest, RepoSearchResult, RepoSnapshot
 from services.github_service import (
     build_repo_fetch_plan,
-    fetch_repo_snapshot,
     fetch_shallow_repo_evidence_batch,
+    fetch_repo_snapshot,
     search_repo_candidates,
 )
 from services.llm_service import build_clarification_questions, extract_keywords, generate_analysis, plan_retrieval_queries
+from services.pipeline_budget import RequestBudget
 from services.rag.corpus_service import CorpusService
 from services.rag.ranking_service import rank_repo_evidence
 from services.rag.retrieval_service import RetrievalService
@@ -29,7 +31,9 @@ router = APIRouter(prefix="/api", tags=["research"])
 async def research_idea(request: IdeaRequest) -> AnalysisResponse:
     """Run the project-research pipeline using staged ingestion and hybrid retrieval."""
 
-    started = perf_counter()
+    settings = get_settings()
+    budget = RequestBudget(total_seconds=settings.PIPELINE_REQUEST_BUDGET_SECONDS)
+
     try:
         logger.info("=" * 72)
         logger.info("NEW RESEARCH REQUEST: %s", request.idea[:120])
@@ -37,15 +41,12 @@ async def research_idea(request: IdeaRequest) -> AnalysisResponse:
 
         keyword_started = perf_counter()
         keywords = await extract_keywords(request.idea, request.clarification_answers)
-        logger.info("Keyword extraction completed in %.2fs", perf_counter() - keyword_started)
+        logger.info("Keyword extraction completed in %.2fs", budget.record_stage("keyword_extraction", keyword_started))
 
         clarification_questions = build_clarification_questions(keywords)
-        
-        # Check if we need clarifications and haven't received valid answers yet
-        has_meaningful_answers = bool(request.clarification_answers and any(
-            v and v.strip() for v in request.clarification_answers.values()
-        ))
-        
+        has_meaningful_answers = bool(
+            request.clarification_answers and any(value and value.strip() for value in request.clarification_answers.values())
+        )
         if clarification_questions and not has_meaningful_answers:
             logger.info("Returning %d clarification questions before repository search", len(clarification_questions))
             return AnalysisResponse(
@@ -58,87 +59,196 @@ async def research_idea(request: IdeaRequest) -> AnalysisResponse:
 
         search_started = perf_counter()
         candidates = await search_repo_candidates(keywords)
-        logger.info("Candidate search completed in %.2fs with %d repos", perf_counter() - search_started, len(candidates))
+        for candidate in candidates:
+            _apply_baseline_fit_metrics(candidate)
+        logger.info(
+            "Candidate search completed in %.2fs with %d repos",
+            budget.record_stage("candidate_search", search_started),
+            len(candidates),
+        )
         if not candidates:
             analysis = await generate_analysis(request.idea, keywords, [], {})
             analysis.repo_descriptions = ["No strong GitHub reference repositories were found for this idea yet."]
-            return AnalysisResponse(
-                **analysis.model_dump(),
-            )
+            logger.info("Research completed in %.2fs (no candidates)", perf_counter() - budget.started_at)
+            return analysis
 
-        ingest_started = perf_counter()
-        settings = get_settings()
-        evidence_items = await fetch_shallow_repo_evidence_batch(candidates[: settings.RAG_README_RERANK_LIMIT])
-        logger.info("Shallow ingest completed in %.2fs", perf_counter() - ingest_started)
-
-        if not evidence_items:
-            analysis = await generate_analysis(request.idea, keywords, [], {})
-            analysis.status = "error"
-            analysis.error = "GitHub references could not be ingested successfully for this idea."
-            analysis.repo_descriptions = ["GitHub references were unavailable, so the recommendations below are idea-first without repo support."]
-            return AnalysisResponse(
-                **analysis.model_dump(),
-            )
-
-        ranking_started = perf_counter()
-        ranked = await rank_repo_evidence(request.idea, keywords, evidence_items)
-        selected = ranked[: settings.RAG_DEEP_INDEX_REPO_LIMIT]
+        rerank_started = perf_counter()
+        rerank_pool = candidates[: settings.RAG_README_RERANK_LIMIT]
+        shallow_evidence = await fetch_shallow_repo_evidence_batch(rerank_pool)
+        ranked_evidence = await rank_repo_evidence(request.idea, keywords, shallow_evidence)
         logger.info(
-            "Reranking completed in %.2fs; selected %d repos for shared indexing consideration and %d for output",
-            perf_counter() - ranking_started,
+            "Shallow rerank completed in %.2fs for %d repositories",
+            budget.record_stage("shallow_rerank", rerank_started),
+            len(ranked_evidence),
+        )
+
+        selected = [evidence.repository for evidence in ranked_evidence[: settings.RAG_DEEP_INDEX_REPO_LIMIT]]
+        selected_evidence_map = {evidence.repository.full_name: evidence for evidence in ranked_evidence}
+        if not selected:
+            selected = candidates[: settings.RAG_DEEP_INDEX_REPO_LIMIT]
+        logger.info(
+            "Selected %d repositories for deep analysis from %d search candidates",
             len(selected),
-            len(ranked),
+            len(candidates),
         )
 
         corpus_service = CorpusService()
         index_started = perf_counter()
         indexed_repositories = []
         queued_jobs = 0
-        for evidence in selected:
-            snapshot = await fetch_repo_snapshot(evidence.repository)
-            plan = build_repo_fetch_plan(snapshot, evidence, keywords)
+        inline_plans = []
+
+        snapshot_pairs = await _fetch_selected_snapshots(selected)
+        for repository, snapshot in snapshot_pairs:
+            shallow = selected_evidence_map.get(repository.full_name)
+            plan = build_repo_fetch_plan(snapshot, keywords, shallow)
             cached_repository = corpus_service.load_indexed_repository(plan.repository)
             if cached_repository is not None:
-                indexed_repositories.append(cached_repository)
+                indexed_repositories.append(_merge_ranked_repository_metrics(cached_repository, plan.repository))
                 continue
 
-            if corpus_service.enqueue_index_job(plan, evidence):
-                queued_jobs += 1
+            if settings.INDEXING_MODE.lower() == "background":
+                if len(inline_plans) < max(1, settings.RAG_INLINE_BOOTSTRAP_REPO_LIMIT):
+                    inline_plans.append(plan)
+                    continue
+                if corpus_service.enqueue_index_job_placeholder(plan):
+                    queued_jobs += 1
+                continue
+
+            inline_plans.append(plan)
+
+        if inline_plans:
+            newly_indexed = await _index_selected_plans(corpus_service, inline_plans)
+            indexed_repositories.extend(newly_indexed)
+
         logger.info(
-            "Index staging completed in %.2fs; %d cached repos ready and %d jobs queued",
-            perf_counter() - index_started,
+            "Deep index preparation completed in %.2fs; %d repos ready and %d background jobs queued",
+            budget.record_stage("snapshot_and_index_stage", index_started),
             len(indexed_repositories),
             queued_jobs,
         )
 
+        if not indexed_repositories:
+            analysis = await generate_analysis(request.idea, keywords, [], {})
+            analysis.status = "error"
+            analysis.error = "Deep repository indexing did not complete for any shortlisted repository."
+            analysis.repo_descriptions = [
+                "Deep repository analysis could not finish for the shortlisted repositories. Try again or reduce the scope of the idea."
+            ]
+            logger.info("Research completed in %.2fs (no deep repos ready)", perf_counter() - budget.started_at)
+            return analysis
+
         section_hits = {}
-        if indexed_repositories:
-            retrieval_started = perf_counter()
+        if budget.has_time_for(settings.PIPELINE_RETRIEVAL_MIN_BUDGET_SECONDS):
+            retrieval_plan_started = perf_counter()
             retrieval_plan = await plan_retrieval_queries(request.idea, keywords, indexed_repositories)
+            logger.info("Retrieval plan completed in %.2fs", budget.record_stage("retrieval_planning", retrieval_plan_started))
+
+            retrieval_started = perf_counter()
             retrieval_service = RetrievalService()
             section_hits = await retrieval_service.retrieve(retrieval_plan, indexed_repositories)
-            logger.info("Retrieval completed in %.2fs", perf_counter() - retrieval_started)
+            logger.info("Retrieval completed in %.2fs", budget.record_stage("retrieval", retrieval_started))
         else:
-            logger.info("Skipping deep retrieval because no indexed repos were available yet; using shallow repo evidence only")
+            logger.info(
+                "Skipping deep retrieval because only %.2fs remain in the request budget",
+                budget.remaining_seconds(),
+            )
 
         generation_started = perf_counter()
         analysis = await generate_analysis(
             request.idea,
             keywords,
-            [evidence.repository for evidence in ranked],
+            indexed_repositories,
             section_hits,
         )
-        logger.info("Grounded generation completed in %.2fs", perf_counter() - generation_started)
+        logger.info("Grounded generation completed in %.2fs", budget.record_stage("generation", generation_started))
 
         for repository in analysis.repositories:
             repository.files = []
 
-        logger.info("Research completed in %.2fs", perf_counter() - started)
+        logger.info(
+            "Research completed in %.2fs with stage timings: %s",
+            perf_counter() - budget.started_at,
+            budget.stage_durations,
+        )
         return analysis
 
     except Exception as exc:
         logger.exception("Research pipeline failed")
         raise HTTPException(status_code=500, detail=f"Research pipeline error: {exc}") from exc
+
+
+async def _fetch_selected_snapshots(
+    selected: list[RepoSearchResult],
+) -> list[tuple[RepoSearchResult, RepoSnapshot]]:
+    if not selected:
+        return []
+
+    snapshots = await asyncio.gather(*(fetch_repo_snapshot(repository) for repository in selected), return_exceptions=True)
+    pairs: list[tuple[RepoSearchResult, RepoSnapshot]] = []
+    for repository, snapshot in zip(selected, snapshots):
+        if isinstance(snapshot, Exception):
+            logger.warning("Skipping snapshot for %s: %s", repository.full_name, snapshot)
+            continue
+        pairs.append((repository, snapshot))
+    return pairs
+
+
+async def _index_selected_plans(corpus_service: CorpusService, plans) -> list[RepoSearchResult]:
+    if not plans:
+        return []
+
+    settings = get_settings()
+    semaphore = asyncio.Semaphore(max(1, min(settings.INDEXER_MAX_CONCURRENCY, len(plans))))
+
+    async def run(plan):
+        async with semaphore:
+            try:
+                return await corpus_service.index_repository_plan(plan)
+            except Exception as exc:
+                logger.warning("Deep indexing failed for %s: %s", plan.repository.full_name, exc)
+                return None
+
+    results = await asyncio.gather(*(run(plan) for plan in plans))
+    return [repository for repository in results if repository is not None]
+
+
+def _merge_ranked_repository_metrics(repository: RepoSearchResult, ranked_repository: RepoSearchResult) -> RepoSearchResult:
+    merged = repository.model_copy(deep=True)
+    merged.description = ranked_repository.description or merged.description
+    merged.html_url = ranked_repository.html_url or merged.html_url
+    merged.language = ranked_repository.language or merged.language
+    merged.stars = ranked_repository.stars or merged.stars
+    merged.topics = ranked_repository.topics or merged.topics
+    merged.updated_at = ranked_repository.updated_at or merged.updated_at
+    merged.archived = ranked_repository.archived
+    merged.default_branch = ranked_repository.default_branch or merged.default_branch
+    merged.commit_sha = ranked_repository.commit_sha or merged.commit_sha
+    merged.relevance_score = ranked_repository.relevance_score
+    merged.semantic_meta_score = ranked_repository.semantic_meta_score
+    merged.semantic_readme_score = ranked_repository.semantic_readme_score
+    merged.query_hit_count = ranked_repository.query_hit_count
+    merged.rank_reasons = ranked_repository.rank_reasons[:]
+    merged.reference_type = ranked_repository.reference_type
+    merged.fit_score = ranked_repository.fit_score
+    merged.fit_summary = ranked_repository.fit_summary
+    merged.covered_primary = ranked_repository.covered_primary[:]
+    merged.missing_primary = ranked_repository.missing_primary[:]
+    _apply_baseline_fit_metrics(merged)
+    return merged
+
+
+def _apply_baseline_fit_metrics(repository: RepoSearchResult) -> None:
+    if repository.fit_score <= 0 and repository.relevance_score > 0:
+        repository.fit_score = round(repository.relevance_score, 4)
+    if repository.reference_type == "candidate" and repository.fit_score > 0 and not repository.fit_summary:
+        if repository.query_hit_count and repository.semantic_meta_score > 0:
+            repository.fit_summary = (
+                "Selected from GitHub candidate search with strong metadata alignment "
+                f"({repository.semantic_meta_score:.2f}) across {repository.query_hit_count} query families."
+            )
+        else:
+            repository.fit_summary = "Selected from GitHub candidate search based on metadata and query relevance."
 
 
 @router.get("/health")

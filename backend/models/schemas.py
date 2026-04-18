@@ -134,6 +134,15 @@ class RepoFetchPlan(BaseModel):
     rationale: list[str] = Field(default_factory=list)
 
 
+class RetrievalWeights(BaseModel):
+    """Signal weights used when merging dense and lexical retrieval hits."""
+
+    dense_weight: float = 0.5
+    lexical_weight: float = 0.25
+    repo_weight: float = 0.15
+    role_weight: float = 0.1
+
+
 class RetrievalQuery(BaseModel):
     """A query targeted at a specific analysis section."""
 
@@ -141,6 +150,7 @@ class RetrievalQuery(BaseModel):
     query: str
     preferred_roles: list[str] = Field(default_factory=list)
     top_k: int = 8
+    weights: RetrievalWeights = Field(default_factory=RetrievalWeights)
 
 
 class RetrievalPlan(BaseModel):

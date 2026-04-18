@@ -1,7 +1,8 @@
-"""Model-based idea analysis using Groq API with Llama 3.3."""
+"""Model-based idea analysis using Groq API with warm-path caching."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from models.schemas import (
@@ -13,20 +14,45 @@ from models.schemas import (
     RetrievalHit,
     RetrievalPlan,
     RetrievalQuery,
+    RetrievalWeights,
     TechRecommendation,
 )
 from services.llm_client import get_llm_client
+from services.pipeline_cache_service import PipelineCacheService, compact_mapping, stable_cache_key
 from services.rag.citation_service import build_analysis_evidence
+from services.rag.query_planning_service import build_default_retrieval_plan
 
 logger = logging.getLogger(__name__)
+
+_cache = PipelineCacheService()
+_DEFAULT_RANKING_WEIGHTS = {
+    "readme_semantic": 0.45,
+    "metadata_semantic": 0.2,
+    "capability_coverage": 0.2,
+    "doc_quality": 0.07,
+    "query_diversity": 0.04,
+    "star_quality": 0.04,
+}
+_DEFAULT_RETRIEVAL_WEIGHTS = RetrievalWeights()
 
 
 async def extract_keywords(idea: str, clarification_answers: dict[str, str] | None = None) -> ExtractedKeywords:
     """Extract structured technical intent from the user's idea using LLM."""
 
-    llm = get_llm_client()
-    extracted = await llm.extract_keywords(idea, clarification_answers)
-    
+    cache_key = stable_cache_key(
+        {
+            "idea": idea.strip(),
+            "clarification_answers": compact_mapping(clarification_answers or {}),
+        }
+    )
+    cached = _cache.get_json("llm_extract_keywords", cache_key)
+    if isinstance(cached, dict):
+        extracted = cached
+    else:
+        llm = get_llm_client()
+        extracted = await llm.extract_keywords(idea, clarification_answers)
+        _cache.set_json("llm_extract_keywords", cache_key, extracted)
+
     result = ExtractedKeywords(
         keywords=extracted.get("keywords", [])[:12],
         frameworks=extracted.get("frameworks", [])[:8],
@@ -82,13 +108,14 @@ def build_clarification_questions(keywords: ExtractedKeywords) -> list[Clarifica
             logger.warning("Skipping ambiguity '%s' because the model did not return a usable question", axis)
             continue
 
-        question = ClarificationQuestion(
-            key=axis,
-            question=question_text,
-            options=options,
-            reason=ambiguity.reason,
+        questions.append(
+            ClarificationQuestion(
+                key=axis,
+                question=question_text,
+                options=options,
+                reason=ambiguity.reason,
+            )
         )
-        questions.append(question)
         seen_axes.add(axis.lower())
         if len(questions) >= 4:
             break
@@ -96,37 +123,79 @@ def build_clarification_questions(keywords: ExtractedKeywords) -> list[Clarifica
     return questions
 
 
+async def get_ranking_weights(idea: str, repositories_count: int) -> dict[str, float]:
+    """Load cached ranking weights or compute them once for the current idea."""
+
+    cache_key = stable_cache_key(
+        {
+            "idea": idea.strip(),
+            "repositories_count": repositories_count,
+        }
+    )
+    cached = _cache.get_json("llm_ranking_weights", cache_key)
+    if isinstance(cached, dict):
+        return _normalize_ranking_weights(cached)
+
+    llm = get_llm_client()
+    try:
+        weights = await llm.calculate_ranking_weights(idea, repositories_count)
+    except Exception as exc:
+        logger.warning("Failed to get AI ranking weights: %s. Using defaults.", exc)
+        return dict(_DEFAULT_RANKING_WEIGHTS)
+
+    normalized = _normalize_ranking_weights(weights)
+    _cache.set_json("llm_ranking_weights", cache_key, normalized)
+    return normalized
+
+
 async def plan_retrieval_queries(
     idea: str,
     keywords: ExtractedKeywords,
     repositories: list[RepoSearchResult],
 ) -> RetrievalPlan:
-    """Create retrieval plan using model."""
+    """Create retrieval plan using the model, with deterministic fallback."""
 
-    llm = get_llm_client()
-    
+    if not repositories:
+        return build_default_retrieval_plan(idea, keywords, top_k=8)
+
     repo_dicts = [
         {
             "full_name": repo.full_name,
+            "commit_sha": repo.commit_sha,
             "relevance_score": repo.relevance_score,
         }
         for repo in repositories
     ]
-    
-    plan_dict = await llm.plan_retrieval_queries(idea, keywords.model_dump(), repo_dicts)
-    
-    queries = []
-    for q in plan_dict.get("queries", []):
-        queries.append(
-            RetrievalQuery(
-                section=q.get("section", "repo_descriptions"),
-                query=q.get("query", ""),
-                preferred_roles=[],
-                top_k=q.get("top_k", 8),
-            )
-        )
-    
-    return RetrievalPlan(queries=queries)
+    cache_key = stable_cache_key(
+        {
+            "idea": idea.strip(),
+            "keywords": compact_mapping(
+                {
+                    "summary": keywords.summary,
+                    "primary_capabilities": keywords.primary_capabilities,
+                    "secondary_capabilities": keywords.secondary_capabilities,
+                    "domain_terms": keywords.domain_terms,
+                    "frameworks": keywords.frameworks,
+                    "languages": keywords.languages,
+                }
+            ),
+            "repositories": repo_dicts,
+        }
+    )
+
+    cached = _cache.get_json("llm_retrieval_plan", cache_key)
+    if isinstance(cached, dict):
+        return _retrieval_plan_from_dict(cached, keywords, idea)
+
+    llm = get_llm_client()
+    try:
+        plan_dict = await llm.plan_retrieval_queries(idea, keywords.model_dump(), repo_dicts)
+    except Exception as exc:
+        logger.warning("Falling back to deterministic retrieval plan: %s", exc)
+        return build_default_retrieval_plan(idea, keywords, top_k=8)
+
+    _cache.set_json("llm_retrieval_plan", cache_key, plan_dict)
+    return _retrieval_plan_from_dict(plan_dict, keywords, idea)
 
 
 async def generate_analysis(
@@ -135,43 +204,60 @@ async def generate_analysis(
     repositories: list[RepoSearchResult],
     section_hits: dict[str, list[RetrievalHit]],
 ) -> AnalysisResponse:
-    """Generate analysis using models."""
+    """Generate the final analysis using compact evidence packs and parallel sections."""
 
     llm = get_llm_client()
-    
     repo_dicts = [
         {
             "full_name": repo.full_name,
             "relevance_score": repo.relevance_score,
             "url": repo.html_url,
+            "description": repo.description or "",
+            "fit_summary": repo.fit_summary,
+            "reference_type": repo.reference_type,
         }
-        for repo in repositories
+        for repo in repositories[:8]
     ]
-    
-    # Generate all sections in parallel concept
-    repo_descriptions = await llm.generate_repo_descriptions(
-        idea,
-        keywords.model_dump(),
-        repo_dicts,
-        {},
+    evidence_pack = _build_generation_evidence(repositories, section_hits)
+
+    repo_descriptions_data, learning_path_data, architecture_diagram, tech_stack_data = await asyncio.gather(
+        llm.generate_repo_descriptions(
+            idea,
+            keywords.model_dump(),
+            repo_dicts,
+            evidence_pack["repo_descriptions"],
+        ),
+        llm.generate_learning_path(
+            idea,
+            keywords.model_dump(),
+            repo_dicts,
+            evidence_pack["learning_path"],
+        ),
+        llm.generate_architecture_diagram(
+            idea,
+            keywords.model_dump(),
+            repo_dicts,
+            evidence_pack["architecture_diagram"],
+        ),
+        llm.generate_tech_stack(
+            idea,
+            keywords.model_dump(),
+            repo_dicts,
+            evidence_pack["tech_stack"],
+        ),
     )
-    
-    learning_path_data = await llm.generate_learning_path(idea, keywords.model_dump(), repo_dicts)
+
     learning_path = [
         LearningStep(
-            step_number=item.get("step", i + 1),
+            step_number=item.get("step", index + 1),
             title=item.get("title", ""),
             description=item.get("description", ""),
             milestone=item.get("milestone", ""),
             concepts=item.get("concepts", [])[:6],
             resources=item.get("resources", [])[:6],
         )
-        for i, item in enumerate(learning_path_data)
+        for index, item in enumerate(learning_path_data)
     ]
-    
-    architecture_diagram = await llm.generate_architecture_diagram(idea, keywords.model_dump(), repo_dicts)
-    
-    tech_stack_data = await llm.generate_tech_stack(idea, keywords.model_dump(), repo_dicts)
     tech_stack = [
         TechRecommendation(
             name=item.get("technology", ""),
@@ -189,7 +275,7 @@ async def generate_analysis(
         keywords=keywords,
         assumptions=keywords.assumptions,
         repositories=repositories,
-        repo_descriptions=repo_descriptions,
+        repo_descriptions=repo_descriptions_data,
         learning_path=learning_path,
         architecture_diagram=architecture_diagram,
         tech_stack=tech_stack,
@@ -200,17 +286,18 @@ async def generate_analysis(
 
 def _convert_ambiguities(ambiguities: list[dict]) -> list:
     """Convert model ambiguities to schema objects."""
+
     from models.schemas import AmbiguityFlag
-    
+
     result = []
-    for amb in ambiguities:
+    for ambiguity in ambiguities:
         result.append(
             AmbiguityFlag(
-                axis=amb.get("axis", "unknown"),
-                question=amb.get("question", ""),
-                reason=amb.get("reason", ""),
-                options=_normalize_clarification_options(amb.get("options", [])),
-                severity=amb.get("severity", "medium"),
+                axis=ambiguity.get("axis", "unknown"),
+                question=ambiguity.get("question", ""),
+                reason=ambiguity.get("reason", ""),
+                options=_normalize_clarification_options(ambiguity.get("options", [])),
+                severity=ambiguity.get("severity", "medium"),
                 resolved=False,
                 answer=None,
             )
@@ -230,7 +317,6 @@ def _normalize_clarification_options(options: object) -> list[str]:
 
     normalized: list[str] = []
     seen: set[str] = set()
-
     for option in raw_options:
         cleaned = option.strip().lstrip("-*").strip()
         if not cleaned:
@@ -242,12 +328,11 @@ def _normalize_clarification_options(options: object) -> list[str]:
         normalized.append(cleaned)
         if len(normalized) >= 4:
             break
-
     return normalized
 
 
 def _normalize_capability_weights(raw_weights: object) -> dict[str, float]:
-    """Coerce capability weights into a clean string->float mapping."""
+    """Coerce capability weights into a clean string-to-float mapping."""
 
     if not isinstance(raw_weights, dict):
         return {}
@@ -264,3 +349,104 @@ def _normalize_capability_weights(raw_weights: object) -> dict[str, float]:
         except (TypeError, ValueError):
             continue
     return normalized
+
+
+def _normalize_ranking_weights(raw_weights: object) -> dict[str, float]:
+    normalized = dict(_DEFAULT_RANKING_WEIGHTS)
+    if not isinstance(raw_weights, dict):
+        return normalized
+    for key, value in raw_weights.items():
+        if key not in normalized:
+            continue
+        try:
+            normalized[key] = max(0.0, float(value))
+        except (TypeError, ValueError):
+            continue
+    total = sum(normalized.values()) or 1.0
+    return {key: value / total for key, value in normalized.items()}
+
+
+def _normalize_retrieval_weights(raw_weights: object) -> RetrievalWeights:
+    if isinstance(raw_weights, RetrievalWeights):
+        return raw_weights
+    if not isinstance(raw_weights, dict):
+        return _DEFAULT_RETRIEVAL_WEIGHTS.model_copy(deep=True)
+
+    normalized = _DEFAULT_RETRIEVAL_WEIGHTS.model_dump()
+    for key in normalized:
+        try:
+            normalized[key] = max(0.0, float(raw_weights.get(key, normalized[key])))
+        except (TypeError, ValueError):
+            continue
+    total = sum(normalized.values()) or 1.0
+    return RetrievalWeights(**{key: value / total for key, value in normalized.items()})
+
+
+def _retrieval_plan_from_dict(plan_dict: dict, keywords: ExtractedKeywords, idea: str) -> RetrievalPlan:
+    queries: list[RetrievalQuery] = []
+    allowed_sections = {"repo_descriptions", "learning_path", "architecture_diagram", "tech_stack"}
+    for raw_query in plan_dict.get("queries", []):
+        section = raw_query.get("section", "repo_descriptions")
+        if section not in allowed_sections:
+            section = "repo_descriptions"
+        query_text = raw_query.get("query", "").strip()
+        if not query_text:
+            continue
+        queries.append(
+            RetrievalQuery(
+                section=section,
+                query=query_text,
+                preferred_roles=[role for role in raw_query.get("preferred_roles", []) if isinstance(role, str)][:4],
+                top_k=int(raw_query.get("top_k", 8) or 8),
+                weights=_normalize_retrieval_weights(raw_query.get("weights", {})),
+            )
+        )
+
+    if queries:
+        return RetrievalPlan(queries=queries)
+    return build_default_retrieval_plan(idea, keywords, top_k=8)
+
+
+def _build_generation_evidence(
+    repositories: list[RepoSearchResult],
+    section_hits: dict[str, list[RetrievalHit]],
+) -> dict[str, dict]:
+    shared_repositories = [
+        {
+            "full_name": repo.full_name,
+            "reference_type": repo.reference_type,
+            "fit_summary": repo.fit_summary,
+            "score": round(repo.relevance_score, 4),
+            "description": (repo.description or "")[:220],
+        }
+        for repo in repositories[:5]
+    ]
+
+    def pack_hits(section: str) -> dict:
+        hits = section_hits.get(section, [])
+        return {
+            "repositories": shared_repositories,
+            "hits": [
+                {
+                    "repo": hit.repo_full_name,
+                    "path": hit.path,
+                    "reason": hit.reason,
+                    "snippet": _truncate_text(hit.text, 360),
+                }
+                for hit in hits[:4]
+            ],
+        }
+
+    return {
+        "repo_descriptions": pack_hits("repo_descriptions"),
+        "learning_path": pack_hits("learning_path"),
+        "architecture_diagram": pack_hits("architecture_diagram"),
+        "tech_stack": pack_hits("tech_stack"),
+    }
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[: limit - 3].rstrip() + "..."
