@@ -547,8 +547,27 @@ def build_repo_fetch_plan(snapshot: RepoSnapshot, shallow: ShallowRepoEvidence, 
         "Skipped generated/binary/oversized files and capped total indexed characters.",
     ]
 
+    repo_payload = snapshot.model_dump(
+        exclude={"tree", "search_queries", "files"},
+    )
+    ranked_overrides = shallow.repository.model_dump(
+        include={
+            "reference_type",
+            "fit_score",
+            "fit_summary",
+            "covered_primary",
+            "missing_primary",
+            "rank_reasons",
+            "relevance_score",
+            "semantic_meta_score",
+            "semantic_readme_score",
+            "query_hit_count",
+        },
+    )
+    repository = RepoSearchResult(**{**repo_payload, **ranked_overrides})
+
     return RepoFetchPlan(
-        repository=shallow.repository.model_copy(deep=True),
+        repository=repository,
         selected_paths=selected_paths,
         skipped_paths=skipped_paths[:20],
         estimated_chars=estimated_chars,

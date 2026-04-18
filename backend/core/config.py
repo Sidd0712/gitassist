@@ -53,9 +53,16 @@ class Settings(BaseSettings):
     RAG_DEDUP_THRESHOLD: float = 0.92
     RAG_MAX_PER_LANGUAGE: int = 4
     RAG_CHUNKING_VERSION: str = "v1"
-    RAG_VECTOR_STORE_PATH: str = "data/chroma"
-    RAG_SQLITE_PATH: str = "data/retrieval.db"
-    RAG_CORPUS_PATH: str = "data/corpora"
+    RAG_STORE_BACKEND: str = "postgres"
+    DATABASE_URL: str = ""
+    PGVECTOR_DIMENSION: int = 384
+    INDEXING_MODE: str = "background"
+    INDEX_JOB_TIMEOUT_SECONDS: int = 900
+    INDEX_JOB_MAX_RETRIES: int = 3
+    INDEXER_POLL_INTERVAL_SECONDS: int = 5
+    INDEXER_MAX_CONCURRENCY: int = 2
+    RAG_DB_POOL_MIN_SIZE: int = 1
+    RAG_DB_POOL_MAX_SIZE: int = 4
 
     model_config = {
         "env_file": str(BACKEND_DIR / ".env"),

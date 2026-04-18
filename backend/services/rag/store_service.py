@@ -1,90 +1,182 @@
-"""Persistence layer for repo corpora, metadata, and retrieval indexes."""
+"""Shared Postgres + pgvector persistence for repo corpora and indexing jobs."""
 
 from __future__ import annotations
 
 import json
 import logging
-import math
-import re
-import sqlite3
-from datetime import UTC, datetime
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any
 
 from core.config import get_settings
-from models.schemas import CorpusChunk, RepoFile, RepoSearchResult
+from models.schemas import RepoFetchPlan, RepoSearchResult, ShallowRepoEvidence
 
 logger = logging.getLogger(__name__)
 
-try:
-    import faiss
+try:  # pragma: no cover - exercised in integration environments
     import numpy as np
 except ImportError:  # pragma: no cover - optional runtime dependency
-    faiss = None
     np = None
 
+try:  # pragma: no cover - exercised in integration environments
+    from pgvector.psycopg import register_vector
+    from psycopg import sql
+    from psycopg.rows import dict_row
+    from psycopg_pool import ConnectionPool
+except ImportError:  # pragma: no cover - optional runtime dependency
+    ConnectionPool = None
+    dict_row = None
+    register_vector = None
+    sql = None
 
-def sanitize_repo_name(full_name: str) -> str:
-    """Convert owner/repo to a filesystem-safe folder name."""
 
-    return full_name.replace("/", "__")
+def _load_json(value: Any, fallback: Any) -> Any:
+    if value is None:
+        return fallback
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return fallback
+    return fallback
 
 
-def cosine_similarity(left: list[float], right: list[float]) -> float:
-    """Compute cosine similarity between two vectors."""
+def _as_vector(values: list[float]) -> Any:
+    if np is None:
+        return values
+    return np.asarray(values, dtype=np.float32)
 
-    if not left or not right or len(left) != len(right):
-        return 0.0
-    numerator = sum(a * b for a, b in zip(left, right))
-    left_norm = math.sqrt(sum(a * a for a in left))
-    right_norm = math.sqrt(sum(b * b for b in right))
-    if not left_norm or not right_norm:
-        return 0.0
-    return numerator / (left_norm * right_norm)
+
+def _serialize_shallow_evidence(shallow: ShallowRepoEvidence) -> dict[str, Any]:
+    return {
+        "readme_path": shallow.readme_path,
+        "readme_excerpt": shallow.readme[:4000],
+        "manifest_paths": [repo_file.path for repo_file in shallow.manifest_files[:10]],
+        "highlighted_paths": shallow.highlighted_paths[:10],
+        "matched_keywords": shallow.matched_keywords[:8],
+        "matched_frameworks": shallow.matched_frameworks[:8],
+        "matched_capabilities": shallow.matched_capabilities[:8],
+        "matched_stack_families": shallow.matched_stack_families[:8],
+        "capability_coverage": shallow.capability_coverage,
+        "score": shallow.score,
+        "score_reasons": shallow.score_reasons[:6],
+    }
+
+
+def _allowed_repo_clause(allowed_repos: dict[str, str]) -> tuple[Any, list[Any]]:
+    if sql is None:
+        raise RuntimeError("psycopg is not installed")
+
+    clauses = []
+    params: list[Any] = []
+    for full_name, commit_sha in allowed_repos.items():
+        clauses.append(sql.SQL("(full_name = %s AND commit_sha = %s)"))
+        params.extend([full_name, commit_sha])
+    return sql.SQL(" OR ").join(clauses), params
+
+
+@dataclass(slots=True)
+class ClaimedIndexJob:
+    """A claimed background indexing lease."""
+
+    plan: RepoFetchPlan
+    shallow_summary: dict[str, Any]
+    retry_count: int = 0
 
 
 class RAGStore:
-    """Storage service for repo corpora and retrieval indexes."""
+    """Shared Postgres-backed store for repo corpora, chunks, and job leases."""
 
     def __init__(self) -> None:
         self.settings = get_settings()
-        self.corpus_path = Path(self.settings.RAG_CORPUS_PATH)
-        self.vector_store_path = Path(self.settings.RAG_VECTOR_STORE_PATH)
-        self.sqlite_path = Path(self.settings.RAG_SQLITE_PATH)
-        self._fts_enabled = True
-        self.dimension = 384  # all-MiniLM-L6-v2 embedding dimension
-        self.index = None
-        self.faiss_index_path = self.vector_store_path / "faiss.index"
-        self.faiss_metadata_path = self.vector_store_path / "faiss_metadata.json"
-        self.chunks_metadata = []
+        self.dimension = self.settings.PGVECTOR_DIMENSION
+        self._pool: ConnectionPool | None = None
+        self._ready = False
+
+    @property
+    def backend_name(self) -> str:
+        return self.settings.RAG_STORE_BACKEND
 
     def ensure_ready(self) -> None:
-        """Create all backing directories and tables."""
+        """Initialize the shared Postgres schema and indexes."""
 
-        self.corpus_path.mkdir(parents=True, exist_ok=True)
-        self.vector_store_path.mkdir(parents=True, exist_ok=True)
-        self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+        if self._ready:
+            return
 
-        with self._connect() as conn:
+        if self.settings.RAG_STORE_BACKEND.lower() != "postgres":
+            raise RuntimeError("RAG_STORE_BACKEND must be set to 'postgres'.")
+        if not self.settings.DATABASE_URL:
+            raise RuntimeError("DATABASE_URL must be set for the Postgres RAG store.")
+        if ConnectionPool is None or register_vector is None or dict_row is None or sql is None:
+            raise RuntimeError(
+                "Postgres RAG dependencies are missing. Install psycopg[binary], psycopg-pool, and pgvector."
+            )
+
+        def configure(conn) -> None:
+            register_vector(conn)
+
+        self._pool = ConnectionPool(
+            conninfo=self.settings.DATABASE_URL,
+            min_size=self.settings.RAG_DB_POOL_MIN_SIZE,
+            max_size=self.settings.RAG_DB_POOL_MAX_SIZE,
+            timeout=30.0,
+            kwargs={"autocommit": True, "row_factory": dict_row},
+            configure=configure,
+            open=True,
+        )
+
+        with self._pool.connection() as conn:
+            conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
             conn.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS repo_indexes (
                     full_name TEXT NOT NULL,
                     commit_sha TEXT NOT NULL,
                     embedding_model TEXT NOT NULL,
                     chunking_version TEXT NOT NULL,
-                    indexed_at TEXT NOT NULL,
-                    repo_json TEXT NOT NULL,
+                    index_state TEXT NOT NULL DEFAULT 'queued',
+                    chunk_count INTEGER NOT NULL DEFAULT 0,
+                    repo_json JSONB NOT NULL,
+                    shallow_evidence_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                    selected_paths_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    skipped_paths_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    estimated_chars INTEGER NOT NULL DEFAULT 0,
+                    rationale_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    indexed_at TIMESTAMPTZ,
+                    last_accessed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     PRIMARY KEY (full_name, commit_sha, embedding_model, chunking_version)
                 )
                 """
             )
             conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS chunks (
+                CREATE TABLE IF NOT EXISTS repo_index_jobs (
+                    full_name TEXT NOT NULL,
+                    commit_sha TEXT NOT NULL,
+                    embedding_model TEXT NOT NULL,
+                    chunking_version TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    claimed_by TEXT,
+                    claimed_at TIMESTAMPTZ,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    enqueued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (full_name, commit_sha, embedding_model, chunking_version)
+                )
+                """
+            )
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS corpus_chunks (
                     chunk_id TEXT PRIMARY KEY,
                     full_name TEXT NOT NULL,
                     commit_sha TEXT NOT NULL,
+                    embedding_model TEXT NOT NULL,
+                    chunking_version TEXT NOT NULL,
                     path TEXT NOT NULL,
                     chunk_role TEXT NOT NULL,
                     language TEXT,
@@ -93,312 +185,520 @@ class RAGStore:
                     start_line INTEGER,
                     end_line INTEGER,
                     token_count INTEGER NOT NULL,
-                    repo_score REAL NOT NULL,
+                    repo_score DOUBLE PRECISION NOT NULL,
                     content_hash TEXT NOT NULL,
-                    text TEXT NOT NULL
+                    text TEXT NOT NULL,
+                    embedding VECTOR({self.dimension}) NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
                 """
             )
             conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS embeddings (
-                    chunk_id TEXT PRIMARY KEY,
-                    full_name TEXT NOT NULL,
-                    commit_sha TEXT NOT NULL,
-                    embedding_json TEXT NOT NULL
+                CREATE INDEX IF NOT EXISTS repo_indexes_state_idx
+                ON repo_indexes (index_state, updated_at DESC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS repo_index_jobs_status_idx
+                ON repo_index_jobs (status, updated_at ASC)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS corpus_chunks_repo_idx
+                ON corpus_chunks (full_name, commit_sha, embedding_model, chunking_version)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS corpus_chunks_embedding_hnsw_idx
+                ON corpus_chunks USING hnsw (embedding vector_cosine_ops)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS corpus_chunks_fts_idx
+                ON corpus_chunks
+                USING GIN (
+                    to_tsvector(
+                        'simple',
+                        coalesce(path, '') || ' ' || coalesce(symbol, '') || ' ' || coalesce(chunk_role, '') || ' ' || coalesce(text, '')
+                    )
                 )
                 """
             )
-            try:
-                conn.execute(
-                    """
-                    CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts
-                    USING fts5(
-                        chunk_id UNINDEXED,
-                        full_name,
-                        path,
-                        symbol,
-                        chunk_role,
-                        text
-                    )
-                    """
-                )
-            except sqlite3.OperationalError:
-                self._fts_enabled = False
-                logger.warning("SQLite FTS5 is unavailable; lexical retrieval will fall back to LIKE queries.")
-            conn.commit()
-        
-        # Initialize or load FAISS index
-        self._load_or_create_faiss_index()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.sqlite_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        return conn
+        self._ready = True
 
-    def _load_or_create_faiss_index(self) -> None:
-        """Load existing FAISS index or create new one."""
-        if faiss is None:
-            logger.warning("FAISS not available, vector search will be disabled")
-            return
-        
-        if self.faiss_index_path.exists() and self.faiss_metadata_path.exists():
-            try:
-                # Load existing index
-                self.index = faiss.read_index(str(self.faiss_index_path))
-                with open(self.faiss_metadata_path, 'r', encoding='utf-8') as f:
-                    self.chunks_metadata = json.load(f)
-                logger.info(f"Loaded FAISS index with {self.index.ntotal} vectors")
-            except Exception as exc:
-                logger.error(f"Failed to load FAISS index: {exc}, creating new index")
-                self._create_new_faiss_index()
-        else:
-            self._create_new_faiss_index()
-    
-    def _create_new_faiss_index(self) -> None:
-        """Create a new FAISS index."""
-        if faiss is None:
-            return
-        # IndexFlatIP for cosine similarity (after L2 normalization)
-        self.index = faiss.IndexFlatIP(self.dimension)
-        self.chunks_metadata = []
-        logger.info("Created new FAISS index")
-    
-    def _save_faiss_index(self) -> None:
-        """Persist FAISS index and metadata to disk."""
-        if self.index is None or faiss is None:
-            return
-        
-        try:
-            faiss.write_index(self.index, str(self.faiss_index_path))
-            with open(self.faiss_metadata_path, 'w', encoding='utf-8') as f:
-                json.dump(self.chunks_metadata, f)
-            logger.debug(f"Saved FAISS index with {self.index.ntotal} vectors")
-        except Exception as exc:
-            logger.error(f"Failed to save FAISS index: {exc}")
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.close()
+            self._pool = None
+        self._ready = False
 
-    def is_indexed(self, repository: RepoSearchResult, embedding_model: str, chunking_version: str) -> bool:
-        """Check whether a repo/commit is already indexed for the current embedding settings."""
+    def get_stats(self) -> dict[str, int]:
+        """Return a lightweight store summary for startup logging."""
 
         self.ensure_ready()
-        with self._connect() as conn:
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
+            row = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(CASE WHEN index_state = 'completed' THEN 1 ELSE 0 END), 0) AS completed_repos,
+                    COALESCE((SELECT COUNT(*) FROM corpus_chunks), 0) AS chunks
+                FROM repo_indexes
+                """
+            ).fetchone()
+        return {
+            "completed_repos": int(row["completed_repos"]) if row else 0,
+            "chunks": int(row["chunks"]) if row else 0,
+        }
+
+    def is_indexed(self, repository: RepoSearchResult, embedding_model: str, chunking_version: str) -> bool:
+        """Check whether a repo commit is already indexed for the active corpus settings."""
+
+        self.ensure_ready()
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
             row = conn.execute(
                 """
                 SELECT 1
                 FROM repo_indexes
-                WHERE full_name = ? AND commit_sha = ? AND embedding_model = ? AND chunking_version = ?
+                WHERE full_name = %s
+                  AND commit_sha = %s
+                  AND embedding_model = %s
+                  AND chunking_version = %s
+                  AND index_state = 'completed'
                 """,
                 (repository.full_name, repository.commit_sha, embedding_model, chunking_version),
             ).fetchone()
+            if row:
+                conn.execute(
+                    """
+                    UPDATE repo_indexes
+                    SET last_accessed_at = NOW(), updated_at = NOW()
+                    WHERE full_name = %s AND commit_sha = %s AND embedding_model = %s AND chunking_version = %s
+                    """,
+                    (repository.full_name, repository.commit_sha, embedding_model, chunking_version),
+                )
         return row is not None
 
-    def save_repository_artifacts(
+    def load_repository(
         self,
-        repository: RepoSearchResult,
-        files: list[RepoFile],
-        chunks: list[CorpusChunk],
-    ) -> None:
-        """Persist raw repo data so index state is inspectable on disk."""
-
-        repo_dir = self.corpus_path / sanitize_repo_name(repository.full_name) / repository.commit_sha
-        repo_dir.mkdir(parents=True, exist_ok=True)
-
-        repo_payload = repository.model_dump()
-        repo_payload["files"] = []
-        (repo_dir / "repo.json").write_text(json.dumps(repo_payload, indent=2), encoding="utf-8")
-        with (repo_dir / "files.jsonl").open("w", encoding="utf-8") as handle:
-            for repo_file in files:
-                handle.write(json.dumps(repo_file.model_dump()) + "\n")
-        with (repo_dir / "chunks.jsonl").open("w", encoding="utf-8") as handle:
-            for chunk in chunks:
-                handle.write(json.dumps(chunk.model_dump()) + "\n")
-
-    def replace_repository_index(
-        self,
-        repository: RepoSearchResult,
-        chunks: list[CorpusChunk],
-        embeddings: list[list[float]],
+        full_name: str,
+        commit_sha: str,
         embedding_model: str,
         chunking_version: str,
-    ) -> None:
-        """Replace all stored chunks/embeddings for a repo commit."""
+    ) -> RepoSearchResult | None:
+        """Load stored repo metadata for a completed repo index."""
 
         self.ensure_ready()
-
-        if len(chunks) != len(embeddings):
-            raise ValueError("Each chunk must have a matching embedding vector.")
-
-        repo_payload = repository.model_dump()
-        repo_payload["files"] = []
-        indexed_at = datetime.now(UTC).isoformat()
-
-        with self._connect() as conn:
-            conn.execute(
-                """
-                DELETE FROM repo_indexes
-                WHERE full_name = ? AND commit_sha = ? AND embedding_model = ? AND chunking_version = ?
-                """,
-                (repository.full_name, repository.commit_sha, embedding_model, chunking_version),
-            )
-            conn.execute(
-                "DELETE FROM embeddings WHERE full_name = ? AND commit_sha = ?",
-                (repository.full_name, repository.commit_sha),
-            )
-            conn.execute(
-                "DELETE FROM chunks WHERE full_name = ? AND commit_sha = ?",
-                (repository.full_name, repository.commit_sha),
-            )
-            if self._fts_enabled:
-                conn.execute(
-                    "DELETE FROM chunk_fts WHERE full_name = ?",
-                    (repository.full_name,),
-                )
-
-            conn.execute(
-                """
-                INSERT INTO repo_indexes (full_name, commit_sha, embedding_model, chunking_version, indexed_at, repo_json)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    repository.full_name,
-                    repository.commit_sha,
-                    embedding_model,
-                    chunking_version,
-                    indexed_at,
-                    json.dumps(repo_payload),
-                ),
-            )
-
-            for chunk, embedding in zip(chunks, embeddings):
-                conn.execute(
-                    """
-                    INSERT INTO chunks (
-                        chunk_id, full_name, commit_sha, path, chunk_role, language, symbol, heading,
-                        start_line, end_line, token_count, repo_score, content_hash, text
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        chunk.chunk_id,
-                        chunk.repo_full_name,
-                        chunk.commit_sha,
-                        chunk.path,
-                        chunk.chunk_role,
-                        chunk.language,
-                        chunk.symbol,
-                        chunk.heading,
-                        chunk.start_line,
-                        chunk.end_line,
-                        chunk.token_count,
-                        chunk.repo_score,
-                        chunk.content_hash,
-                        chunk.text,
-                    ),
-                )
-                conn.execute(
-                    """
-                    INSERT INTO embeddings (chunk_id, full_name, commit_sha, embedding_json)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (
-                        chunk.chunk_id,
-                        chunk.repo_full_name,
-                        chunk.commit_sha,
-                        json.dumps(embedding),
-                    ),
-                )
-                if self._fts_enabled:
-                    conn.execute(
-                        """
-                        INSERT INTO chunk_fts (chunk_id, full_name, path, symbol, chunk_role, text)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            chunk.chunk_id,
-                            chunk.repo_full_name,
-                            chunk.path,
-                            chunk.symbol or "",
-                            chunk.chunk_role,
-                            chunk.text,
-                        ),
-                    )
-            conn.commit()
-
-        # Add to FAISS index
-        if self.index is not None and chunks and faiss is not None and np is not None:
-            # Convert embeddings to numpy array and normalize for cosine similarity
-            embeddings_np = np.array(embeddings, dtype=np.float32)
-            faiss.normalize_L2(embeddings_np)
-            
-            # Remove old chunks from metadata for this repo
-            self.chunks_metadata = [
-                meta for meta in self.chunks_metadata
-                if not (meta["repo_full_name"] == repository.full_name and meta["commit_sha"] == repository.commit_sha)
-            ]
-            
-            # Rebuild index with remaining + new chunks
-            # (FAISS doesn't support deletion, so we rebuild)
-            if len(self.chunks_metadata) > 0:
-                # Get embeddings for existing chunks from SQLite
-                existing_embeddings = []
-                with self._connect() as conn:
-                    for meta in self.chunks_metadata:
-                        row = conn.execute(
-                            "SELECT embedding_json FROM embeddings WHERE chunk_id = ?",
-                            (meta["chunk_id"],)
-                        ).fetchone()
-                        if row:
-                            existing_embeddings.append(json.loads(row["embedding_json"]))
-                
-                if existing_embeddings:
-                    existing_np = np.array(existing_embeddings, dtype=np.float32)
-                    faiss.normalize_L2(existing_np)
-                    all_embeddings = np.vstack([existing_np, embeddings_np])
-                else:
-                    all_embeddings = embeddings_np
-            else:
-                all_embeddings = embeddings_np
-            
-            # Recreate index with all embeddings
-            self.index = faiss.IndexFlatIP(self.dimension)
-            if all_embeddings.shape[0] > 0:
-                self.index.add(all_embeddings)
-            
-            # Add new chunks to metadata
-            start_idx = len(self.chunks_metadata)
-            for i, chunk in enumerate(chunks):
-                self.chunks_metadata.append({
-                    "idx": start_idx + i,
-                    "chunk_id": chunk.chunk_id,
-                    "repo_full_name": chunk.repo_full_name,
-                    "commit_sha": chunk.commit_sha,
-                    "path": chunk.path,
-                    "chunk_role": chunk.chunk_role,
-                    "language": chunk.language or "",
-                    "symbol": chunk.symbol or "",
-                    "start_line": chunk.start_line or 0,
-                    "end_line": chunk.end_line or 0,
-                    "repo_score": chunk.repo_score,
-                })
-            
-            # Persist FAISS index
-            self._save_faiss_index()
-
-    def load_repository(self, full_name: str, commit_sha: str, embedding_model: str, chunking_version: str) -> RepoSearchResult | None:
-        """Load stored repo metadata for a specific index."""
-
-        self.ensure_ready()
-        with self._connect() as conn:
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
             row = conn.execute(
                 """
                 SELECT repo_json
                 FROM repo_indexes
-                WHERE full_name = ? AND commit_sha = ? AND embedding_model = ? AND chunking_version = ?
+                WHERE full_name = %s
+                  AND commit_sha = %s
+                  AND embedding_model = %s
+                  AND chunking_version = %s
+                  AND index_state = 'completed'
                 """,
                 (full_name, commit_sha, embedding_model, chunking_version),
             ).fetchone()
+            if row:
+                conn.execute(
+                    """
+                    UPDATE repo_indexes
+                    SET last_accessed_at = NOW(), updated_at = NOW()
+                    WHERE full_name = %s AND commit_sha = %s AND embedding_model = %s AND chunking_version = %s
+                    """,
+                    (full_name, commit_sha, embedding_model, chunking_version),
+                )
         if row is None:
             return None
-        return RepoSearchResult(**json.loads(row["repo_json"]))
+        return RepoSearchResult(**_load_json(row["repo_json"], {}))
+
+    def enqueue_index_job(
+        self,
+        plan: RepoFetchPlan,
+        shallow: ShallowRepoEvidence,
+        embedding_model: str,
+        chunking_version: str,
+    ) -> bool:
+        """Persist plan metadata and enqueue a deduplicated background indexing job."""
+
+        self.ensure_ready()
+        repository = plan.repository
+        shallow_summary = _serialize_shallow_evidence(shallow)
+        repo_json = json.dumps(repository.model_dump())
+        selected_paths_json = json.dumps(plan.selected_paths)
+        skipped_paths_json = json.dumps(plan.skipped_paths)
+        rationale_json = json.dumps(plan.rationale)
+        shallow_json = json.dumps(shallow_summary)
+
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
+            with conn.transaction():
+                conn.execute(
+                    """
+                    INSERT INTO repo_indexes (
+                        full_name,
+                        commit_sha,
+                        embedding_model,
+                        chunking_version,
+                        index_state,
+                        repo_json,
+                        shallow_evidence_json,
+                        selected_paths_json,
+                        skipped_paths_json,
+                        estimated_chars,
+                        rationale_json,
+                        last_accessed_at,
+                        updated_at
+                    ) VALUES (%s, %s, %s, %s, 'queued', %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s::jsonb, NOW(), NOW())
+                    ON CONFLICT (full_name, commit_sha, embedding_model, chunking_version)
+                    DO UPDATE SET
+                        repo_json = EXCLUDED.repo_json,
+                        shallow_evidence_json = EXCLUDED.shallow_evidence_json,
+                        selected_paths_json = EXCLUDED.selected_paths_json,
+                        skipped_paths_json = EXCLUDED.skipped_paths_json,
+                        estimated_chars = EXCLUDED.estimated_chars,
+                        rationale_json = EXCLUDED.rationale_json,
+                        index_state = CASE
+                            WHEN repo_indexes.index_state = 'completed' THEN repo_indexes.index_state
+                            ELSE 'queued'
+                        END,
+                        last_accessed_at = NOW(),
+                        updated_at = NOW()
+                    """,
+                    (
+                        repository.full_name,
+                        repository.commit_sha,
+                        embedding_model,
+                        chunking_version,
+                        repo_json,
+                        shallow_json,
+                        selected_paths_json,
+                        skipped_paths_json,
+                        plan.estimated_chars,
+                        rationale_json,
+                    ),
+                )
+
+                existing = conn.execute(
+                    """
+                    SELECT status, claimed_at
+                    FROM repo_index_jobs
+                    WHERE full_name = %s AND commit_sha = %s AND embedding_model = %s AND chunking_version = %s
+                    FOR UPDATE
+                    """,
+                    (repository.full_name, repository.commit_sha, embedding_model, chunking_version),
+                ).fetchone()
+
+                if existing is None:
+                    conn.execute(
+                        """
+                        INSERT INTO repo_index_jobs (
+                            full_name, commit_sha, embedding_model, chunking_version, status, updated_at
+                        ) VALUES (%s, %s, %s, %s, 'queued', NOW())
+                        """,
+                        (repository.full_name, repository.commit_sha, embedding_model, chunking_version),
+                    )
+                    return True
+
+                claimed_at = existing.get("claimed_at")
+                if existing["status"] == "completed":
+                    return False
+                if existing["status"] == "running" and claimed_at is not None:
+                    conn.execute(
+                        """
+                        UPDATE repo_indexes
+                        SET index_state = 'running', updated_at = NOW()
+                        WHERE full_name = %s AND commit_sha = %s AND embedding_model = %s AND chunking_version = %s
+                        """,
+                        (repository.full_name, repository.commit_sha, embedding_model, chunking_version),
+                    )
+                    return False
+
+                conn.execute(
+                    """
+                    UPDATE repo_index_jobs
+                    SET status = 'queued',
+                        claimed_by = NULL,
+                        claimed_at = NULL,
+                        last_error = NULL,
+                        updated_at = NOW()
+                    WHERE full_name = %s AND commit_sha = %s AND embedding_model = %s AND chunking_version = %s
+                    """,
+                    (repository.full_name, repository.commit_sha, embedding_model, chunking_version),
+                )
+                conn.execute(
+                    """
+                    UPDATE repo_indexes
+                    SET index_state = 'queued', updated_at = NOW()
+                    WHERE full_name = %s AND commit_sha = %s AND embedding_model = %s AND chunking_version = %s
+                    """,
+                    (repository.full_name, repository.commit_sha, embedding_model, chunking_version),
+                )
+                return True
+
+    def claim_index_job(self, worker_id: str, embedding_model: str, chunking_version: str) -> ClaimedIndexJob | None:
+        """Claim the next available indexing job using row-level locking."""
+
+        self.ensure_ready()
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
+            with conn.transaction():
+                row = conn.execute(
+                    """
+                    SELECT
+                        j.full_name,
+                        j.commit_sha,
+                        j.retry_count,
+                        i.repo_json,
+                        i.shallow_evidence_json,
+                        i.selected_paths_json,
+                        i.skipped_paths_json,
+                        i.estimated_chars,
+                        i.rationale_json
+                    FROM repo_index_jobs j
+                    JOIN repo_indexes i
+                      ON i.full_name = j.full_name
+                     AND i.commit_sha = j.commit_sha
+                     AND i.embedding_model = j.embedding_model
+                     AND i.chunking_version = j.chunking_version
+                    WHERE j.embedding_model = %s
+                      AND j.chunking_version = %s
+                      AND j.retry_count < %s
+                      AND (
+                          j.status = 'queued'
+                          OR j.status = 'failed'
+                          OR (
+                              j.status = 'running'
+                              AND j.claimed_at < NOW() - (%s * INTERVAL '1 second')
+                          )
+                      )
+                    ORDER BY
+                        CASE j.status
+                            WHEN 'queued' THEN 0
+                            WHEN 'failed' THEN 1
+                            ELSE 2
+                        END,
+                        j.updated_at ASC
+                    FOR UPDATE OF j SKIP LOCKED
+                    LIMIT 1
+                    """,
+                    (
+                        embedding_model,
+                        chunking_version,
+                        self.settings.INDEX_JOB_MAX_RETRIES,
+                        self.settings.INDEX_JOB_TIMEOUT_SECONDS,
+                    ),
+                ).fetchone()
+
+                if row is None:
+                    return None
+
+                conn.execute(
+                    """
+                    UPDATE repo_index_jobs
+                    SET status = 'running',
+                        claimed_by = %s,
+                        claimed_at = NOW(),
+                        updated_at = NOW()
+                    WHERE full_name = %s AND commit_sha = %s AND embedding_model = %s AND chunking_version = %s
+                    """,
+                    (worker_id, row["full_name"], row["commit_sha"], embedding_model, chunking_version),
+                )
+                conn.execute(
+                    """
+                    UPDATE repo_indexes
+                    SET index_state = 'running', updated_at = NOW()
+                    WHERE full_name = %s AND commit_sha = %s AND embedding_model = %s AND chunking_version = %s
+                    """,
+                    (row["full_name"], row["commit_sha"], embedding_model, chunking_version),
+                )
+
+        repository = RepoSearchResult(**_load_json(row["repo_json"], {}))
+        plan = RepoFetchPlan(
+            repository=repository,
+            selected_paths=_load_json(row["selected_paths_json"], []),
+            skipped_paths=_load_json(row["skipped_paths_json"], []),
+            estimated_chars=int(row["estimated_chars"] or 0),
+            rationale=_load_json(row["rationale_json"], []),
+        )
+        return ClaimedIndexJob(
+            plan=plan,
+            shallow_summary=_load_json(row["shallow_evidence_json"], {}),
+            retry_count=int(row["retry_count"] or 0),
+        )
+
+    def mark_index_job_completed(
+        self,
+        job: ClaimedIndexJob,
+        embedding_model: str,
+        chunking_version: str,
+        chunk_count: int,
+    ) -> None:
+        """Mark an indexing job as completed."""
+
+        repository = job.plan.repository
+        self.ensure_ready()
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
+            with conn.transaction():
+                conn.execute(
+                    """
+                    UPDATE repo_indexes
+                    SET index_state = 'completed',
+                        chunk_count = %s,
+                        indexed_at = NOW(),
+                        last_accessed_at = NOW(),
+                        updated_at = NOW()
+                    WHERE full_name = %s AND commit_sha = %s AND embedding_model = %s AND chunking_version = %s
+                    """,
+                    (chunk_count, repository.full_name, repository.commit_sha, embedding_model, chunking_version),
+                )
+                conn.execute(
+                    """
+                    UPDATE repo_index_jobs
+                    SET status = 'completed',
+                        claimed_by = NULL,
+                        claimed_at = NULL,
+                        last_error = NULL,
+                        updated_at = NOW()
+                    WHERE full_name = %s AND commit_sha = %s AND embedding_model = %s AND chunking_version = %s
+                    """,
+                    (repository.full_name, repository.commit_sha, embedding_model, chunking_version),
+                )
+
+    def mark_index_job_failed(
+        self,
+        job: ClaimedIndexJob,
+        embedding_model: str,
+        chunking_version: str,
+        error: str,
+    ) -> None:
+        """Record a failed indexing attempt while leaving the job retryable."""
+
+        repository = job.plan.repository
+        self.ensure_ready()
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
+            with conn.transaction():
+                conn.execute(
+                    """
+                    UPDATE repo_index_jobs
+                    SET status = 'failed',
+                        claimed_by = NULL,
+                        claimed_at = NULL,
+                        retry_count = retry_count + 1,
+                        last_error = %s,
+                        updated_at = NOW()
+                    WHERE full_name = %s AND commit_sha = %s AND embedding_model = %s AND chunking_version = %s
+                    """,
+                    (error[:2000], repository.full_name, repository.commit_sha, embedding_model, chunking_version),
+                )
+                conn.execute(
+                    """
+                    UPDATE repo_indexes
+                    SET index_state = 'failed', updated_at = NOW()
+                    WHERE full_name = %s AND commit_sha = %s AND embedding_model = %s AND chunking_version = %s
+                    """,
+                    (repository.full_name, repository.commit_sha, embedding_model, chunking_version),
+                )
+
+    def replace_repository_index(
+        self,
+        repository: RepoSearchResult,
+        chunks: list[Any],
+        embeddings: list[list[float]],
+        embedding_model: str,
+        chunking_version: str,
+    ) -> None:
+        """Replace all stored chunks for a repo commit in Postgres."""
+
+        self.ensure_ready()
+        if len(chunks) != len(embeddings):
+            raise ValueError("Each chunk must have a matching embedding vector.")
+
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
+            with conn.transaction():
+                conn.execute(
+                    """
+                    DELETE FROM corpus_chunks
+                    WHERE full_name = %s
+                      AND commit_sha = %s
+                      AND embedding_model = %s
+                      AND chunking_version = %s
+                    """,
+                    (repository.full_name, repository.commit_sha, embedding_model, chunking_version),
+                )
+
+                if chunks:
+                    rows = [
+                        (
+                            chunk.chunk_id,
+                            chunk.repo_full_name,
+                            chunk.commit_sha,
+                            embedding_model,
+                            chunking_version,
+                            chunk.path,
+                            chunk.chunk_role,
+                            chunk.language,
+                            chunk.symbol,
+                            chunk.heading,
+                            chunk.start_line,
+                            chunk.end_line,
+                            chunk.token_count,
+                            chunk.repo_score,
+                            chunk.content_hash,
+                            chunk.text,
+                            _as_vector(embedding),
+                        )
+                        for chunk, embedding in zip(chunks, embeddings)
+                    ]
+                    with conn.cursor() as cursor:
+                        cursor.executemany(
+                            """
+                            INSERT INTO corpus_chunks (
+                                chunk_id,
+                                full_name,
+                                commit_sha,
+                                embedding_model,
+                                chunking_version,
+                                path,
+                                chunk_role,
+                                language,
+                                symbol,
+                                heading,
+                                start_line,
+                                end_line,
+                                token_count,
+                                repo_score,
+                                content_hash,
+                                text,
+                                embedding
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            rows,
+                        )
+
+                conn.execute(
+                    """
+                    UPDATE repo_indexes
+                    SET repo_json = %s::jsonb,
+                        chunk_count = %s,
+                        updated_at = NOW()
+                    WHERE full_name = %s AND commit_sha = %s AND embedding_model = %s AND chunking_version = %s
+                    """,
+                    (
+                        json.dumps(repository.model_dump()),
+                        len(chunks),
+                        repository.full_name,
+                        repository.commit_sha,
+                        embedding_model,
+                        chunking_version,
+                    ),
+                )
 
     def dense_search(
         self,
@@ -406,179 +706,136 @@ class RAGStore:
         allowed_repos: dict[str, str],
         top_k: int,
     ) -> list[dict[str, Any]]:
-        """Dense retrieval over stored embeddings using FAISS."""
+        """Dense retrieval directly in Postgres using pgvector cosine distance."""
 
         self.ensure_ready()
         if not query_embedding or not allowed_repos:
             return []
 
-        allowed_names = list(allowed_repos.keys())
+        clause, params = _allowed_repo_clause(allowed_repos)
+        query = sql.SQL(
+            """
+            SELECT
+                chunk_id,
+                full_name,
+                commit_sha,
+                path,
+                chunk_role,
+                language,
+                start_line,
+                end_line,
+                repo_score,
+                text,
+                1 - (embedding <=> %s) AS dense_score
+            FROM corpus_chunks
+            WHERE embedding_model = %s
+              AND chunking_version = %s
+              AND ({allowed_clause})
+            ORDER BY embedding <=> %s
+            LIMIT %s
+            """
+        ).format(allowed_clause=clause)
 
-        # Use FAISS for fast vector search
-        if self.index is not None and faiss is not None and np is not None and self.index.ntotal > 0:
-            try:
-                # Normalize query embedding for cosine similarity
-                query_np = np.array([query_embedding], dtype=np.float32)
-                faiss.normalize_L2(query_np)
-                
-                # Search FAISS (get more candidates for filtering)
-                search_k = min(max(top_k * 4, top_k), self.index.ntotal)
-                scores, indices = self.index.search(query_np, search_k)
-                
-                # Filter and build results
-                results: list[dict[str, Any]] = []
-                for score, idx in zip(scores[0], indices[0]):
-                    if idx < 0 or idx >= len(self.chunks_metadata):
-                        continue
-                    
-                    metadata = self.chunks_metadata[idx]
-                    
-                    # Apply repo and commit filters
-                    if metadata["repo_full_name"] not in allowed_repos:
-                        continue
-                    if metadata["commit_sha"] != allowed_repos[metadata["repo_full_name"]]:
-                        continue
-                    
-                    # Get chunk text from SQLite
-                    with self._connect() as conn:
-                        row = conn.execute(
-                            "SELECT text FROM chunks WHERE chunk_id = ?",
-                            (metadata["chunk_id"],)
-                        ).fetchone()
-                        if not row:
-                            continue
-                        text = row["text"]
-                    
-                    results.append({
-                        "chunk_id": metadata["chunk_id"],
-                        "repo_full_name": metadata["repo_full_name"],
-                        "path": metadata["path"],
-                        "chunk_role": metadata["chunk_role"],
-                        "language": metadata["language"] or None,
-                        "start_line": metadata["start_line"] or None,
-                        "end_line": metadata["end_line"] or None,
-                        "repo_score": float(metadata["repo_score"]),
-                        "text": text,
-                        "dense_score": max(0.0, float(score)),  # Score already normalized [0,1]
-                    })
-                    
-                    if len(results) >= top_k * 2:
-                        break
-                
-                return results
-            except Exception as exc:
-                logger.warning(f"Dense search via FAISS failed, falling back to SQLite: {exc}")
-
-        placeholders = ",".join("?" for _ in allowed_names)
-        with self._connect() as conn:
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
             rows = conn.execute(
-                f"""
-                SELECT
-                    c.chunk_id, c.full_name, c.commit_sha, c.path, c.chunk_role, c.language, c.start_line, c.end_line,
-                    c.repo_score, c.text, e.embedding_json
-                FROM embeddings e
-                JOIN chunks c ON c.chunk_id = e.chunk_id
-                WHERE c.full_name IN ({placeholders})
-                """,
-                tuple(allowed_names),
+                query,
+                (
+                    _as_vector(query_embedding),
+                    self.settings.EMBEDDING_MODEL,
+                    self.settings.RAG_CHUNKING_VERSION,
+                    *params,
+                    _as_vector(query_embedding),
+                    max(top_k * 2, top_k),
+                ),
             ).fetchall()
 
-        scored: list[dict[str, Any]] = []
-        for row in rows:
-            if row["full_name"] not in allowed_repos:
-                continue
-            if row["commit_sha"] != allowed_repos[row["full_name"]]:
-                continue
-            dense_score = cosine_similarity(query_embedding, json.loads(row["embedding_json"]))
-            scored.append(
-                {
-                    "chunk_id": row["chunk_id"],
-                    "repo_full_name": row["full_name"],
-                    "path": row["path"],
-                    "chunk_role": row["chunk_role"],
-                    "language": row["language"],
-                    "start_line": row["start_line"],
-                    "end_line": row["end_line"],
-                    "repo_score": float(row["repo_score"]),
-                    "text": row["text"],
-                    "dense_score": dense_score,
-                }
-            )
-        scored.sort(key=lambda item: item["dense_score"], reverse=True)
-        return scored[: max(top_k * 2, top_k)]
+        return [
+            {
+                "chunk_id": row["chunk_id"],
+                "repo_full_name": row["full_name"],
+                "path": row["path"],
+                "chunk_role": row["chunk_role"],
+                "language": row["language"],
+                "start_line": row["start_line"],
+                "end_line": row["end_line"],
+                "repo_score": float(row["repo_score"]),
+                "text": row["text"],
+                "dense_score": max(0.0, float(row["dense_score"] or 0.0)),
+            }
+            for row in rows
+        ]
 
-    def lexical_search(self, query: str, allowed_repos: dict[str, str], top_k: int) -> list[dict[str, Any]]:
-        """Lexical retrieval over chunk metadata and text."""
+    def lexical_search(self, query_text: str, allowed_repos: dict[str, str], top_k: int) -> list[dict[str, Any]]:
+        """Lexical retrieval directly in Postgres using full-text search."""
 
         self.ensure_ready()
-        if not allowed_repos:
-            return []
-        allowed_names = list(allowed_repos.keys())
-        tokens = [token for token in re.findall(r"[A-Za-z0-9_]+", query.lower()) if len(token) > 2]
-        if not tokens:
+        if not query_text.strip() or not allowed_repos:
             return []
 
-        placeholders = ",".join("?" for _ in allowed_names)
-        if self._fts_enabled:
-            fts_query = " OR ".join(f'"{token}"' for token in tokens[:12])
-            with self._connect() as conn:
-                rows = conn.execute(
-                    f"""
-                    SELECT
-                        c.chunk_id, c.full_name, c.commit_sha, c.path, c.chunk_role, c.language, c.start_line, c.end_line,
-                        c.repo_score, c.text, bm25(chunk_fts) AS rank
-                    FROM chunk_fts
-                    JOIN chunks c ON c.chunk_id = chunk_fts.chunk_id
-                    WHERE chunk_fts MATCH ?
-                      AND c.full_name IN ({placeholders})
-                    ORDER BY rank
-                    LIMIT ?
-                    """,
-                    (fts_query, *allowed_names, max(top_k * 3, top_k)),
-                ).fetchall()
-        else:
-            like_query = f"%{'%'.join(tokens[:4])}%"
-            with self._connect() as conn:
-                rows = conn.execute(
-                    f"""
-                    SELECT
-                        chunk_id, full_name, commit_sha, path, chunk_role, language, start_line, end_line,
-                        repo_score, text, 1.0 AS rank
-                    FROM chunks
-                    WHERE full_name IN ({placeholders})
-                      AND (path LIKE ? OR text LIKE ?)
-                    LIMIT ?
-                    """,
-                    (*allowed_names, like_query, like_query, max(top_k * 3, top_k)),
-                ).fetchall()
-
-        results: list[dict[str, Any]] = []
-        max_rank = 1.0
-        if rows and self._fts_enabled:
-            max_rank = abs(float(rows[-1]["rank"])) or 1.0
-
-        for row in rows:
-            if row["full_name"] not in allowed_repos:
-                continue
-            if row["commit_sha"] != allowed_repos[row["full_name"]]:
-                continue
-            rank = abs(float(row["rank"])) if self._fts_enabled else 1.0
-            lexical_score = 1.0 if not self._fts_enabled else max(0.0, 1.0 - (rank / (max_rank + 1e-6)))
-            results.append(
-                {
-                    "chunk_id": row["chunk_id"],
-                    "repo_full_name": row["full_name"],
-                    "path": row["path"],
-                    "chunk_role": row["chunk_role"],
-                    "language": row["language"],
-                    "start_line": row["start_line"],
-                    "end_line": row["end_line"],
-                    "repo_score": float(row["repo_score"]),
-                    "text": row["text"],
-                    "lexical_score": lexical_score,
-                }
+        clause, params = _allowed_repo_clause(allowed_repos)
+        query = sql.SQL(
+            """
+            WITH search_query AS (
+                SELECT plainto_tsquery('simple', %s) AS q
             )
-        return results[: max(top_k * 2, top_k)]
+            SELECT
+                c.chunk_id,
+                c.full_name,
+                c.commit_sha,
+                c.path,
+                c.chunk_role,
+                c.language,
+                c.start_line,
+                c.end_line,
+                c.repo_score,
+                c.text,
+                ts_rank_cd(
+                    to_tsvector(
+                        'simple',
+                        coalesce(c.path, '') || ' ' || coalesce(c.symbol, '') || ' ' || coalesce(c.chunk_role, '') || ' ' || coalesce(c.text, '')
+                    ),
+                    search_query.q
+                ) AS lexical_score
+            FROM corpus_chunks c, search_query
+            WHERE c.embedding_model = %s
+              AND c.chunking_version = %s
+              AND ({allowed_clause})
+              AND search_query.q @@ to_tsvector(
+                    'simple',
+                    coalesce(c.path, '') || ' ' || coalesce(c.symbol, '') || ' ' || coalesce(c.chunk_role, '') || ' ' || coalesce(c.text, '')
+                )
+            ORDER BY lexical_score DESC
+            LIMIT %s
+            """
+        ).format(allowed_clause=clause)
+
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
+            rows = conn.execute(
+                query,
+                (
+                    query_text,
+                    self.settings.EMBEDDING_MODEL,
+                    self.settings.RAG_CHUNKING_VERSION,
+                    *params,
+                    max(top_k * 2, top_k),
+                ),
+            ).fetchall()
+
+        return [
+            {
+                "chunk_id": row["chunk_id"],
+                "repo_full_name": row["full_name"],
+                "path": row["path"],
+                "chunk_role": row["chunk_role"],
+                "language": row["language"],
+                "start_line": row["start_line"],
+                "end_line": row["end_line"],
+                "repo_score": float(row["repo_score"]),
+                "text": row["text"],
+                "lexical_score": max(0.0, float(row["lexical_score"] or 0.0)),
+            }
+            for row in rows
+        ]
 
 
 _store: RAGStore | None = None

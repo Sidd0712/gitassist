@@ -23,13 +23,20 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     store = get_rag_store()
     store.ensure_ready()
+    stats = store.get_stats()
     logger.info("%s starting up", settings.APP_NAME)
     logger.info("  LLM model: %s", settings.LLM_MODEL)
     logger.info("  Embedding model: %s", settings.EMBEDDING_MODEL)
-    logger.info("  Vector store: FAISS (%d vectors indexed)", store.index.ntotal if store.index else 0)
+    logger.info(
+        "  RAG store: %s (%d indexed repos, %d chunks)",
+        store.backend_name,
+        stats["completed_repos"],
+        stats["chunks"],
+    )
     logger.info("  Candidate repo limit: %d", settings.RAG_CANDIDATE_REPO_LIMIT)
     logger.info("  Deep index repo limit: %d", settings.RAG_DEEP_INDEX_REPO_LIMIT)
     yield
+    store.close()
     logger.info("%s shutting down", settings.APP_NAME)
 
 

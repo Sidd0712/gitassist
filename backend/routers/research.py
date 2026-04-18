@@ -84,27 +84,42 @@ async def research_idea(request: IdeaRequest) -> AnalysisResponse:
         ranked = await rank_repo_evidence(request.idea, keywords, evidence_items)
         selected = ranked[: settings.RAG_DEEP_INDEX_REPO_LIMIT]
         logger.info(
-            "Reranking completed in %.2fs; selected %d repos for deep indexing and %d for output",
+            "Reranking completed in %.2fs; selected %d repos for shared indexing consideration and %d for output",
             perf_counter() - ranking_started,
             len(selected),
             len(ranked),
         )
 
-        index_started = perf_counter()
         corpus_service = CorpusService()
+        index_started = perf_counter()
         indexed_repositories = []
+        queued_jobs = 0
         for evidence in selected:
             snapshot = await fetch_repo_snapshot(evidence.repository)
             plan = build_repo_fetch_plan(snapshot, evidence, keywords)
-            repository = await corpus_service.ensure_indexed(plan)
-            indexed_repositories.append(repository)
-        logger.info("Corpus indexing completed in %.2fs", perf_counter() - index_started)
+            cached_repository = corpus_service.load_indexed_repository(plan.repository)
+            if cached_repository is not None:
+                indexed_repositories.append(cached_repository)
+                continue
 
-        retrieval_started = perf_counter()
-        retrieval_plan = await plan_retrieval_queries(request.idea, keywords, indexed_repositories)
-        retrieval_service = RetrievalService()
-        section_hits = await retrieval_service.retrieve(retrieval_plan, indexed_repositories)
-        logger.info("Retrieval completed in %.2fs", perf_counter() - retrieval_started)
+            if corpus_service.enqueue_index_job(plan, evidence):
+                queued_jobs += 1
+        logger.info(
+            "Index staging completed in %.2fs; %d cached repos ready and %d jobs queued",
+            perf_counter() - index_started,
+            len(indexed_repositories),
+            queued_jobs,
+        )
+
+        section_hits = {}
+        if indexed_repositories:
+            retrieval_started = perf_counter()
+            retrieval_plan = await plan_retrieval_queries(request.idea, keywords, indexed_repositories)
+            retrieval_service = RetrievalService()
+            section_hits = await retrieval_service.retrieve(retrieval_plan, indexed_repositories)
+            logger.info("Retrieval completed in %.2fs", perf_counter() - retrieval_started)
+        else:
+            logger.info("Skipping deep retrieval because no indexed repos were available yet; using shallow repo evidence only")
 
         generation_started = perf_counter()
         analysis = await generate_analysis(

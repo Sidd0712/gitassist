@@ -3,13 +3,14 @@ import re
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from models.schemas import RepoSearchResult, RepoSnapshot, ShallowRepoEvidence
+from models.schemas import AnalysisResponse, ExtractedKeywords, IdeaRequest, RepoFetchPlan, RepoSearchResult, RepoSnapshot, ShallowRepoEvidence
+from routers.research import research_idea
 from services.github_service import build_repo_fetch_plan, build_search_queries
 from services.llm_service import build_clarification_questions, extract_keywords, generate_analysis
 from services.rag.ranking_service import rank_repo_evidence
@@ -637,6 +638,7 @@ class RankingAndGenerationTests(HermeticAsyncTestCase):
         self.assertEqual("end_to_end", plan.repository.reference_type)
         self.assertGreater(plan.repository.fit_score, 0.8)
         self.assertIn("ingredient inventory", plan.repository.fit_summary)
+        self.assertEqual("abc123", plan.repository.commit_sha)
 
     async def test_food_app_ranking_penalizes_unrequested_ai_references(self):
         keywords = await extract_keywords(
@@ -752,6 +754,87 @@ class RankingAndGenerationTests(HermeticAsyncTestCase):
         self.assertIn("example/travel-chat-a", full_names)
         self.assertIn("example/travel-python", full_names)
         self.assertNotIn("example/travel-chat-b", full_names)
+
+
+class ResearchPipelineOrchestrationTests(HermeticAsyncTestCase):
+    async def test_research_request_enqueues_background_indexing_without_blocking(self):
+        keywords = ExtractedKeywords(
+            summary="Collaborative whiteboard for shared online drawing sessions.",
+            core_intent="Build a realtime shared canvas experience for multiple users.",
+            product_type="collaborative whiteboard",
+            capabilities=["realtime collaboration", "canvas rendering", "presence"],
+            primary_capabilities=["realtime collaboration", "canvas rendering", "presence"],
+            keywords=["whiteboard", "canvas", "realtime"],
+        )
+        repository = RepoSearchResult(
+            full_name="example/collab-board",
+            description="Collaborative whiteboard",
+            html_url="https://github.com/example/collab-board",
+            stars=120,
+            language="TypeScript",
+            topics=["whiteboard", "canvas", "websocket"],
+        )
+        shallow = ShallowRepoEvidence(
+            repository=repository,
+            readme_path="README.md",
+            readme="Collaborative whiteboard with realtime collaboration and canvas rendering.",
+            highlighted_paths=["README.md", "src/socket/server.ts"],
+        )
+        snapshot = RepoSnapshot(
+            **repository.model_dump(exclude={"commit_sha"}),
+            commit_sha="commit-123",
+            tree=[],
+        )
+        fetch_plan = RepoFetchPlan(
+            repository=RepoSearchResult(**{**repository.model_dump(), "commit_sha": "commit-123"}),
+            selected_paths=["README.md", "src/socket/server.ts"],
+            skipped_paths=[],
+            estimated_chars=500,
+            rationale=["Prioritized README and realtime code paths."],
+        )
+        generated_analysis = AnalysisResponse(
+            idea_summary=keywords.summary,
+            keywords=keywords,
+            repositories=[repository],
+            repo_descriptions=["example/collab-board is useful because it demonstrates realtime collaboration."],
+            learning_path=[],
+            architecture_diagram="graph TD; User-->App;",
+            tech_stack=[],
+            status="complete",
+        )
+
+        class FakeCorpusService:
+            queued: list[str] = []
+
+            def __init__(self) -> None:
+                self.queued = []
+                type(self).queued = self.queued
+
+            def load_indexed_repository(self, repo: RepoSearchResult) -> RepoSearchResult | None:
+                return None
+
+            def enqueue_index_job(self, plan: RepoFetchPlan, shallow_evidence: ShallowRepoEvidence) -> bool:
+                self.queued.append(f"{plan.repository.full_name}@{plan.repository.commit_sha}")
+                return True
+
+        with (
+            patch("routers.research.extract_keywords", AsyncMock(return_value=keywords)),
+            patch("routers.research.search_repo_candidates", AsyncMock(return_value=[repository])),
+            patch("routers.research.fetch_shallow_repo_evidence_batch", AsyncMock(return_value=[shallow])),
+            patch("routers.research.rank_repo_evidence", AsyncMock(return_value=[shallow])),
+            patch("routers.research.fetch_repo_snapshot", AsyncMock(return_value=snapshot)),
+            patch("routers.research.build_repo_fetch_plan", return_value=fetch_plan),
+            patch("routers.research.CorpusService", FakeCorpusService),
+            patch("routers.research.plan_retrieval_queries", AsyncMock()) as plan_mock,
+            patch("routers.research.generate_analysis", AsyncMock(return_value=generated_analysis)) as generate_mock,
+        ):
+            response = await research_idea(IdeaRequest(idea="an app where friends can draw together online"))
+
+        self.assertEqual("complete", response.status)
+        self.assertEqual(["example/collab-board@commit-123"], FakeCorpusService.queued)
+        plan_mock.assert_not_awaited()
+        generate_mock.assert_awaited_once()
+        self.assertEqual({}, generate_mock.await_args.args[3])
 
 
 if __name__ == "__main__":
