@@ -6,8 +6,6 @@ httpx
 groq
 python-dotenv
 cachetools
-sentence-transformers
-langchain-huggingface
 numpy
 psycopg[binary]
 psycopg-pool

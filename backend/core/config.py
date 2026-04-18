@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     GROQ_API_KEY: str = ""  # Groq API key (get from console.groq.com)
     LLM_PROVIDER: str = "groq"
     LLM_MODEL: str = "llama-3.3-70b-versatile"  # Groq's latest 70B model (3.1 was decommissioned)
-    EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"  # Lightweight free embeddings
+    EMBEDDING_MODEL: str = "hash-embedding-384-v1"  # Low-memory deterministic embeddings for web/worker use
     LLM_TIMEOUT_SECONDS: int = 60
     LLM_MAX_RETRIES: int = 3
 

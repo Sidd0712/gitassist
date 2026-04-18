@@ -1,69 +1,55 @@
-"""Embedding service using local sentence-transformers (not HuggingFace API)."""
+"""Lightweight deterministic embeddings for low-memory deployments."""
 
 from __future__ import annotations
 
+import hashlib
 import logging
-from threading import Lock
-
-from langchain_huggingface import HuggingFaceEmbeddings
+import math
+import re
 
 from core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-_shared_client: HuggingFaceEmbeddings | None = None
-_client_lock = Lock()
+TOKEN_PATTERN = re.compile(r"[a-z0-9_]+")
 
 
 class EmbeddingService:
-    """Generate embeddings for repo chunks and retrieval queries."""
+    """Generate compact hashed embeddings without loading Torch models."""
 
     def __init__(self) -> None:
         self.settings = get_settings()
-        self._client = self._get_or_create_client()
+        self.dimension = self.settings.PGVECTOR_DIMENSION
 
     @property
     def embedding_model_name(self) -> str:
         return self.settings.EMBEDDING_MODEL
 
-    def _get_or_create_client(self) -> HuggingFaceEmbeddings:
-        """Reuse one embedding model instance per process to avoid duplicate memory pressure."""
-
-        global _shared_client
-
-        if _shared_client is not None:
-            return _shared_client
-
-        with _client_lock:
-            if _shared_client is not None:
-                return _shared_client
-
-            try:
-                logger.info("Initializing local sentence-transformers model: %s", self.settings.EMBEDDING_MODEL)
-                _shared_client = HuggingFaceEmbeddings(model_name=self.settings.EMBEDDING_MODEL)
-                return _shared_client
-            except Exception as exc:
-                logger.error("Failed to initialize sentence-transformers embeddings: %s", exc)
-                raise
-
     async def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        """Embed multiple texts using local sentence-transformers."""
+        """Embed multiple texts using deterministic hashing."""
 
         if not texts:
             return []
-        try:
-            # sentence-transformers embeddings are sync
-            return self._client.embed_documents(texts)
-        except Exception as exc:
-            logger.error("sentence-transformers embeddings failed: %s", exc)
-            raise
+        return [self._embed_text(text) for text in texts]
 
     async def embed_query(self, text: str) -> list[float]:
-        """Embed a single query using local sentence-transformers."""
+        """Embed one query using the same hashing space as documents."""
 
-        try:
-            # sentence-transformers embeddings are sync
-            return self._client.embed_query(text)
-        except Exception as exc:
-            logger.error("sentence-transformers query embedding failed: %s", exc)
-            raise
+        return self._embed_text(text)
+
+    def _embed_text(self, text: str) -> list[float]:
+        vector = [0.0] * self.dimension
+        token_count = 0
+
+        for token in TOKEN_PATTERN.findall((text or "").lower()):
+            token_count += 1
+            bucket = int(hashlib.blake2b(token.encode("utf-8"), digest_size=8).hexdigest(), 16) % self.dimension
+            vector[bucket] += 1.0
+
+        if token_count == 0:
+            return vector
+
+        norm = math.sqrt(sum(value * value for value in vector))
+        if norm == 0.0:
+            return vector
+        return [round(value / norm, 8) for value in vector]
