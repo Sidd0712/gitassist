@@ -201,6 +201,13 @@ class RetrievalService:
     def _role_prior(self, chunk_role: str, preferred_roles: list[str], section: str, path: str) -> float:
         role_prior = 1.0 if chunk_role in preferred_roles else 0.25
         lowered_path = path.lower()
+        if section == "chat_answer":
+            if any(token in lowered_path for token in ("readme", "docs", "guide", "tutorial", "example")):
+                role_prior = max(role_prior, 1.0)
+            if any(token in lowered_path for token in ("router", "route", "service", "controller", "app", "main", "server")):
+                role_prior = max(role_prior, 0.95)
+            if any(token in lowered_path for token in ("package", "requirements", "pyproject", "docker", "compose", ".env", "config")):
+                role_prior = max(role_prior, 0.9)
         if section == "architecture_diagram" and any(
             token in lowered_path for token in ("router", "route", "service", "controller", "app", "main", "server")
         ):

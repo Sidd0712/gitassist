@@ -1,5 +1,5 @@
 import axios from 'axios';
-import type { AnalysisResponse } from '../types';
+import type { AnalysisResponse, RepoChatRequest, RepoChatResponse } from '../types';
 
 const api = axios.create({
   baseURL: import.meta.env.VITE_API_URL,
@@ -20,5 +20,10 @@ export async function researchIdea(
 
 export async function healthCheck(): Promise<{ status: string }> {
   const { data } = await api.get('/health');
+  return data;
+}
+
+export async function chatAboutRepos(payload: RepoChatRequest): Promise<RepoChatResponse> {
+  const { data } = await api.post<RepoChatResponse>('/research/chat', payload);
   return data;
 }

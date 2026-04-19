@@ -230,6 +230,56 @@ Return ONLY valid JSON (no markdown):
         logger.info("Retrieval plan generated for %d sections", len(plan.get("queries", [])))
         return plan
 
+    async def answer_repo_chat(
+        self,
+        question: str,
+        idea_summary: str,
+        messages: list[dict],
+        repositories: list[dict],
+        evidence: dict | None = None,
+    ) -> dict:
+        """Answer a repo-scoped chat question using only retrieved evidence."""
+
+        history = "\n".join(
+            f"{message.get('role', 'user')}: {message.get('content', '')[:600]}"
+            for message in messages[-6:]
+            if message.get("content")
+        )
+        repo_summary = ", ".join(repo.get("full_name", "") for repo in repositories[:6]) if repositories else "no repos"
+
+        prompt = f"""You are answering questions about indexed GitHub repositories for a product idea.
+
+Rules:
+- Only answer using the provided evidence and repo metadata.
+- If the evidence is insufficient, say that clearly and do not invent implementation details.
+- Prefer concrete repo/file references when explaining where the answer comes from.
+- Keep the answer concise but useful.
+- Suggest 2-3 brief follow-up questions the user could ask next.
+
+Idea Summary: {idea_summary or "Not provided"}
+Scoped Repositories: {repo_summary}
+Recent Conversation:
+{history or "No prior chat history."}
+
+User Question: {question}
+
+Retrieved Evidence:
+{self._format_evidence(evidence)}
+
+Return ONLY valid JSON (no markdown):
+{{
+  "answer": "grounded answer",
+  "follow_up_suggestions": ["follow-up 1", "follow-up 2", "follow-up 3"]
+}}"""
+
+        result = await self._call_json_api(
+            prompt,
+            temperature=0.2,
+            max_tokens=900,
+            timeout_seconds=self.settings.LLM_GENERATION_TIMEOUT_SECONDS,
+        )
+        return result if isinstance(result, dict) else {}
+
     async def generate_repo_descriptions(
         self,
         idea: str,

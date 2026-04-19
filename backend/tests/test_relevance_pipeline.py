@@ -7,17 +7,31 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from fastapi import HTTPException
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from models.schemas import AnalysisResponse, ExtractedKeywords, IdeaRequest, RepoFetchPlan, RepoSearchResult, RepoSnapshot, RetrievalPlan, ShallowRepoEvidence
-from routers.research import research_idea
+from models.schemas import (
+    AnalysisResponse,
+    ExtractedKeywords,
+    IdeaRequest,
+    RepoChatRequest,
+    RepoFetchPlan,
+    RepoSearchResult,
+    RepoSnapshot,
+    RetrievalHit,
+    RetrievalPlan,
+    ShallowRepoEvidence,
+)
+from routers.research import chat_about_repositories, research_idea
 import services.github_service as github_service_module
 from services.github_service import build_repo_fetch_plan, build_search_queries, fetch_repo_snapshot, fetch_shallow_repo_evidence
 from services.llm_service import build_clarification_questions, extract_keywords, generate_analysis, plan_retrieval_queries
 from services.pipeline_cache_service import clear_memory_caches
 from services.rag.ranking_service import rank_repo_evidence
+from services.rag.retrieval_service import RetrievalService
 
 
 class FakeEmbeddingService:
@@ -310,6 +324,33 @@ class FakeLLMClient:
 
     async def plan_retrieval_queries(self, idea: str, keywords: dict, repositories: list[dict]) -> dict:
         return {"queries": []}
+
+    async def answer_repo_chat(
+        self,
+        question: str,
+        idea_summary: str,
+        messages: list[dict],
+        repositories: list[dict],
+        evidence: dict | None = None,
+    ) -> dict:
+        hits = (evidence or {}).get("hits", [])
+        if not hits:
+            return {
+                "answer": "I do not have enough indexed evidence in the current repo scope to answer that yet.",
+                "follow_up_suggestions": ["Ask about a specific file or repository."],
+            }
+
+        first_hit = hits[0]
+        return {
+            "answer": (
+                f"Based on {first_hit.get('repo')} and {first_hit.get('path')}, "
+                f"the indexed repos suggest: {question[:80]}"
+            ),
+            "follow_up_suggestions": [
+                "Which file should I inspect first?",
+                "Can you summarize the architecture?",
+            ],
+        }
 
     async def generate_repo_descriptions(self, idea: str, keywords: dict, repositories: list[dict], evidence: dict) -> list[str]:
         primary = ", ".join(keywords.get("primary_capabilities", [])[:2]) or "the core workflow"
@@ -1314,6 +1355,165 @@ class ResearchPipelineOrchestrationTests(HermeticAsyncTestCase):
         self.assertEqual("end_to_end", routed_repo.reference_type)
         self.assertEqual(0.88, routed_repo.fit_score)
         self.assertIn("realtime collaboration", routed_repo.covered_primary)
+
+
+class RepoChatRouteTests(HermeticAsyncTestCase):
+    async def test_repo_chat_returns_grounded_answer_with_citations(self):
+        indexed_repo = RepoSearchResult(
+            full_name="example/collab-board",
+            description="Collaborative whiteboard",
+            html_url="https://github.com/example/collab-board",
+            stars=120,
+            language="TypeScript",
+            commit_sha="commit-123",
+            relevance_score=0.92,
+        )
+        hits = [
+            RetrievalHit(
+                chunk_id="chunk-1",
+                repo_full_name="example/collab-board",
+                path="README.md",
+                chunk_role="documentation",
+                start_line=10,
+                end_line=24,
+                score=0.88,
+                dense_score=0.7,
+                lexical_score=0.6,
+                repo_prior=1.0,
+                role_prior=1.0,
+                reason="strong semantic match",
+                text="Architecture overview and realtime collaboration flow.",
+            )
+        ]
+
+        class FakeCorpusService:
+            def load_indexed_repository(self, repo: RepoSearchResult) -> RepoSearchResult | None:
+                if repo.full_name == indexed_repo.full_name and repo.commit_sha == indexed_repo.commit_sha:
+                    return indexed_repo
+                return None
+
+        class FakeRetrievalService:
+            async def retrieve(self, plan, repositories) -> dict:
+                return {"chat_answer": hits}
+
+        with (
+            patch("routers.research.CorpusService", return_value=FakeCorpusService()),
+            patch("routers.research.RetrievalService", return_value=FakeRetrievalService()),
+        ):
+            response = await chat_about_repositories(
+                RepoChatRequest(
+                    question="How is realtime sync handled?",
+                    idea_summary="Collaborative whiteboard",
+                    scope_repositories=[{"full_name": indexed_repo.full_name, "commit_sha": indexed_repo.commit_sha}],
+                    messages=[],
+                )
+            )
+
+        self.assertIn("example/collab-board", response.answer)
+        self.assertEqual(1, len(response.citations))
+        self.assertEqual("README.md", response.citations[0].path)
+        self.assertEqual(1, response.scoped_repo_count)
+        self.assertEqual(1, len(response.evidence_hits))
+
+    async def test_repo_chat_only_searches_repositories_in_request_scope(self):
+        scoped_repo = RepoSearchResult(
+            full_name="example/scoped",
+            description="Scoped repo",
+            html_url="https://github.com/example/scoped",
+            commit_sha="commit-scoped",
+            relevance_score=0.8,
+        )
+
+        class FakeCorpusService:
+            def load_indexed_repository(self, repo: RepoSearchResult) -> RepoSearchResult | None:
+                if repo.full_name == scoped_repo.full_name and repo.commit_sha == scoped_repo.commit_sha:
+                    return scoped_repo
+                return None
+
+        class FakeRetrievalService:
+            async def retrieve(self, plan, repositories) -> dict:
+                self.seen_repositories = repositories
+                return {"chat_answer": []}
+
+        retrieval_service = FakeRetrievalService()
+        with (
+            patch("routers.research.CorpusService", return_value=FakeCorpusService()),
+            patch("routers.research.RetrievalService", return_value=retrieval_service),
+        ):
+            await chat_about_repositories(
+                RepoChatRequest(
+                    question="Which files matter most?",
+                    idea_summary="Collaborative whiteboard",
+                    scope_repositories=[{"full_name": scoped_repo.full_name, "commit_sha": scoped_repo.commit_sha}],
+                    messages=[],
+                )
+            )
+
+        self.assertEqual(["example/scoped"], [repo.full_name for repo in retrieval_service.seen_repositories])
+
+    async def test_repo_chat_returns_clear_error_when_scope_has_no_indexed_repositories(self):
+        class FakeCorpusService:
+            def load_indexed_repository(self, repo: RepoSearchResult) -> RepoSearchResult | None:
+                return None
+
+        with patch("routers.research.CorpusService", return_value=FakeCorpusService()):
+            with self.assertRaises(HTTPException) as ctx:
+                await chat_about_repositories(
+                    RepoChatRequest(
+                        question="What architecture does this use?",
+                        idea_summary="Collaborative whiteboard",
+                        scope_repositories=[{"full_name": "example/missing", "commit_sha": "missing"}],
+                        messages=[],
+                    )
+                )
+
+        self.assertEqual(409, ctx.exception.status_code)
+        self.assertIn("No indexed repositories", ctx.exception.detail)
+
+    async def test_repo_chat_returns_uncertainty_when_no_evidence_is_found(self):
+        indexed_repo = RepoSearchResult(
+            full_name="example/collab-board",
+            description="Collaborative whiteboard",
+            html_url="https://github.com/example/collab-board",
+            commit_sha="commit-123",
+            relevance_score=0.92,
+        )
+
+        class FakeCorpusService:
+            def load_indexed_repository(self, repo: RepoSearchResult) -> RepoSearchResult | None:
+                return indexed_repo
+
+        class FakeRetrievalService:
+            async def retrieve(self, plan, repositories) -> dict:
+                return {"chat_answer": []}
+
+        with (
+            patch("routers.research.CorpusService", return_value=FakeCorpusService()),
+            patch("routers.research.RetrievalService", return_value=FakeRetrievalService()),
+        ):
+            response = await chat_about_repositories(
+                RepoChatRequest(
+                    question="What database migration strategy is used?",
+                    idea_summary="Collaborative whiteboard",
+                    scope_repositories=[{"full_name": indexed_repo.full_name, "commit_sha": indexed_repo.commit_sha}],
+                    messages=[],
+                )
+            )
+
+        self.assertIn("do not have enough indexed evidence", response.answer.lower())
+        self.assertEqual([], response.citations)
+        self.assertEqual([], response.evidence_hits)
+
+    def test_chat_answer_role_prior_favors_docs_config_and_entrypoints(self):
+        retrieval_service = RetrievalService.__new__(RetrievalService)
+
+        documentation_score = retrieval_service._role_prior("documentation", ["documentation"], "chat_answer", "README.md")
+        config_score = retrieval_service._role_prior("config", ["config"], "chat_answer", "requirements.txt")
+        entrypoint_score = retrieval_service._role_prior("entrypoint", ["source"], "chat_answer", "src/server/main.py")
+
+        self.assertGreaterEqual(documentation_score, 1.0)
+        self.assertGreaterEqual(config_score, 1.0)
+        self.assertGreaterEqual(entrypoint_score, 0.95)
 
 
 if __name__ == "__main__":

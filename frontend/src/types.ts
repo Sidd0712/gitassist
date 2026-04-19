@@ -78,6 +78,49 @@ export interface Citation {
   reason: string;
 }
 
+export interface RepoChatScopeRepository {
+  full_name: string;
+  commit_sha: string;
+}
+
+export interface RepoChatRequest {
+  question: string;
+  idea_summary: string;
+  scope_repositories: RepoChatScopeRepository[];
+  messages: Array<{
+    role: 'user' | 'assistant';
+    content: string;
+  }>;
+}
+
+export interface RepoChatEvidenceHit {
+  repo_full_name: string;
+  path: string;
+  start_line: number | null;
+  end_line: number | null;
+  reason: string;
+  snippet: string;
+  score: number;
+}
+
+export interface RepoChatResponse {
+  answer: string;
+  citations: Citation[];
+  evidence_hits: RepoChatEvidenceHit[];
+  follow_up_suggestions: string[];
+  scoped_repo_count: number;
+}
+
+export interface RepoChatMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  citations?: Citation[];
+  evidence_hits?: RepoChatEvidenceHit[];
+  follow_up_suggestions?: string[];
+  isIntro?: boolean;
+}
+
 export interface AnalysisEvidence {
   repo_descriptions: Citation[];
   learning_path: Citation[];

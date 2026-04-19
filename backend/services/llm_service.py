@@ -7,6 +7,7 @@ import logging
 
 from models.schemas import (
     AnalysisResponse,
+    ChatMessage,
     ClarificationQuestion,
     ExtractedKeywords,
     LearningStep,
@@ -198,6 +199,121 @@ async def plan_retrieval_queries(
     return _retrieval_plan_from_dict(plan_dict, keywords, idea)
 
 
+def build_repo_chat_retrieval_query(
+    question: str,
+    idea_summary: str,
+    messages: list[ChatMessage],
+) -> RetrievalQuery:
+    """Build a deterministic retrieval query for repo-scoped chat."""
+
+    recent_context: list[str] = []
+    for message in messages[-4:]:
+        role = "User" if message.role == "user" else "Assistant"
+        recent_context.append(f"{role}: {message.content.strip()[:240]}")
+
+    query_parts: list[str] = []
+    if idea_summary.strip():
+        query_parts.append(f"Idea: {idea_summary.strip()}")
+    if recent_context:
+        query_parts.append("Recent context:\n" + "\n".join(recent_context))
+    query_parts.append(f"Question: {question.strip()}")
+
+    return RetrievalQuery(
+        section="chat_answer",
+        query="\n".join(query_parts),
+        preferred_roles=_chat_preferred_roles(question),
+        top_k=6,
+        weights=RetrievalWeights(dense_weight=0.45, lexical_weight=0.25, repo_weight=0.1, role_weight=0.2),
+    )
+
+
+async def answer_repo_chat(
+    question: str,
+    idea_summary: str,
+    messages: list[ChatMessage],
+    repositories: list[RepoSearchResult],
+    hits: list[RetrievalHit],
+) -> dict[str, object]:
+    """Generate a grounded chat answer over the indexed repo scope."""
+
+    if not hits:
+        return {
+            "answer": (
+                "I do not have enough indexed evidence in the current repo scope to answer that yet. "
+                "Try asking about a specific repository, file, architecture area, or dependency."
+            ),
+            "follow_up_suggestions": [
+                "Which repo is closest to the core architecture?",
+                "Show me the most relevant files for this feature.",
+                "What dependencies define the stack in these repos?",
+            ],
+        }
+
+    llm = get_llm_client()
+    repo_dicts = [
+        {
+            "full_name": repo.full_name,
+            "description": repo.description or "",
+            "fit_summary": repo.fit_summary,
+            "reference_type": repo.reference_type,
+        }
+        for repo in repositories[:6]
+    ]
+    evidence = {
+        "repositories": repo_dicts,
+        "hits": [
+            {
+                "repo": hit.repo_full_name,
+                "path": hit.path,
+                "lines": [hit.start_line, hit.end_line],
+                "reason": hit.reason,
+                "snippet": _truncate_text(hit.text, 420),
+            }
+            for hit in hits[:6]
+        ],
+    }
+
+    try:
+        result = await llm.answer_repo_chat(
+            question,
+            idea_summary,
+            [message.model_dump() for message in messages],
+            repo_dicts,
+            evidence,
+        )
+    except Exception as exc:
+        logger.warning("Repo chat generation failed, falling back to a conservative answer: %s", exc)
+        first_hit = hits[0]
+        return {
+            "answer": (
+                f"I found relevant indexed evidence in {first_hit.repo_full_name} ({first_hit.path}), "
+                "but I could not complete a full grounded answer right now."
+            ),
+            "follow_up_suggestions": [
+                "Summarize the architecture from the top retrieved files.",
+                "Which files should I inspect first?",
+            ],
+        }
+
+    answer = str(result.get("answer", "")).strip()
+    if not answer:
+        answer = (
+            "I found relevant indexed evidence, but the answer was not confident enough to return cleanly. "
+            "Please ask a narrower repo or file-specific question."
+        )
+
+    follow_up_suggestions = [
+        suggestion.strip()
+        for suggestion in result.get("follow_up_suggestions", [])
+        if isinstance(suggestion, str) and suggestion.strip()
+    ][:3]
+
+    return {
+        "answer": answer,
+        "follow_up_suggestions": follow_up_suggestions,
+    }
+
+
 async def generate_analysis(
     idea: str,
     keywords: ExtractedKeywords,
@@ -384,7 +500,7 @@ def _normalize_retrieval_weights(raw_weights: object) -> RetrievalWeights:
 
 def _retrieval_plan_from_dict(plan_dict: dict, keywords: ExtractedKeywords, idea: str) -> RetrievalPlan:
     queries: list[RetrievalQuery] = []
-    allowed_sections = {"repo_descriptions", "learning_path", "architecture_diagram", "tech_stack"}
+    allowed_sections = {"repo_descriptions", "learning_path", "architecture_diagram", "tech_stack", "chat_answer"}
     for raw_query in plan_dict.get("queries", []):
         section = raw_query.get("section", "repo_descriptions")
         if section not in allowed_sections:
@@ -450,3 +566,15 @@ def _truncate_text(text: str, limit: int) -> str:
     if len(collapsed) <= limit:
         return collapsed
     return collapsed[: limit - 3].rstrip() + "..."
+
+
+def _chat_preferred_roles(question: str) -> list[str]:
+    lowered = question.lower()
+
+    if any(token in lowered for token in ("dependency", "dependencies", "package", "packages", "requirements", "env", "config")):
+        return ["config", "documentation", "entrypoint", "source"]
+    if any(token in lowered for token in ("architecture", "flow", "service", "router", "api", "component")):
+        return ["entrypoint", "source", "config", "documentation"]
+    if any(token in lowered for token in ("setup", "install", "run", "usage", "example", "examples", "how do i")):
+        return ["documentation", "config", "entrypoint", "example"]
+    return ["documentation", "entrypoint", "source", "config"]

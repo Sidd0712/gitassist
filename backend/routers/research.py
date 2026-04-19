@@ -9,15 +9,32 @@ from time import perf_counter
 from fastapi import APIRouter, HTTPException
 
 from core.config import get_settings
-from models.schemas import AnalysisResponse, IdeaRequest, RepoSearchResult, RepoSnapshot
+from models.schemas import (
+    AnalysisResponse,
+    IdeaRequest,
+    RepoChatEvidenceHit,
+    RepoChatRequest,
+    RepoChatResponse,
+    RepoSearchResult,
+    RepoSnapshot,
+    RetrievalPlan,
+)
 from services.github_service import (
     build_repo_fetch_plan,
     fetch_shallow_repo_evidence_batch,
     fetch_repo_snapshot,
     search_repo_candidates,
 )
-from services.llm_service import build_clarification_questions, extract_keywords, generate_analysis, plan_retrieval_queries
+from services.llm_service import (
+    answer_repo_chat,
+    build_clarification_questions,
+    build_repo_chat_retrieval_query,
+    extract_keywords,
+    generate_analysis,
+    plan_retrieval_queries,
+)
 from services.pipeline_budget import RequestBudget
+from services.rag.citation_service import citations_from_hits
 from services.rag.corpus_service import CorpusService
 from services.rag.ranking_service import rank_repo_evidence
 from services.rag.retrieval_service import RetrievalService
@@ -178,6 +195,54 @@ async def research_idea(request: IdeaRequest) -> AnalysisResponse:
         raise HTTPException(status_code=500, detail=f"Research pipeline error: {exc}") from exc
 
 
+@router.post("/research/chat", response_model=RepoChatResponse)
+async def chat_about_repositories(request: RepoChatRequest) -> RepoChatResponse:
+    """Answer a grounded chat question using only the indexed repositories in scope."""
+
+    scoped_repositories = _load_scoped_repositories(request)
+    retrieval_query = build_repo_chat_retrieval_query(
+        request.question,
+        request.idea_summary,
+        request.messages,
+    )
+    retrieval_service = RetrievalService()
+    section_hits = await retrieval_service.retrieve(
+        plan=_retrieval_query_to_plan(retrieval_query),
+        repositories=scoped_repositories,
+    )
+    hits = section_hits.get("chat_answer", [])
+    response_payload = await answer_repo_chat(
+        request.question,
+        request.idea_summary,
+        request.messages,
+        scoped_repositories,
+        hits,
+    )
+
+    return RepoChatResponse(
+        answer=str(response_payload.get("answer", "")).strip(),
+        citations=citations_from_hits(hits, limit=6),
+        evidence_hits=[
+            RepoChatEvidenceHit(
+                repo_full_name=hit.repo_full_name,
+                path=hit.path,
+                start_line=hit.start_line,
+                end_line=hit.end_line,
+                reason=hit.reason,
+                snippet=_truncate_hit_text(hit.text),
+                score=round(hit.score, 5),
+            )
+            for hit in hits[:6]
+        ],
+        follow_up_suggestions=[
+            suggestion
+            for suggestion in response_payload.get("follow_up_suggestions", [])
+            if isinstance(suggestion, str) and suggestion.strip()
+        ][:3],
+        scoped_repo_count=len(scoped_repositories),
+    )
+
+
 async def _fetch_selected_snapshots(
     selected: list[RepoSearchResult],
 ) -> list[tuple[RepoSearchResult, RepoSnapshot]]:
@@ -211,6 +276,35 @@ async def _index_selected_plans(corpus_service: CorpusService, plans) -> list[Re
 
     results = await asyncio.gather(*(run(plan) for plan in plans))
     return [repository for repository in results if repository is not None]
+
+
+def _load_scoped_repositories(request: RepoChatRequest) -> list[RepoSearchResult]:
+    if not request.scope_repositories:
+        raise HTTPException(status_code=400, detail="At least one scoped repository is required for repo chat.")
+
+    corpus_service = CorpusService()
+    scoped_repositories: list[RepoSearchResult] = []
+    for scoped_repo in request.scope_repositories:
+        repository = RepoSearchResult(
+            full_name=scoped_repo.full_name,
+            commit_sha=scoped_repo.commit_sha,
+            html_url=f"https://github.com/{scoped_repo.full_name}",
+        )
+        indexed = corpus_service.load_indexed_repository(repository)
+        if indexed is not None:
+            scoped_repositories.append(indexed)
+
+    if not scoped_repositories:
+        raise HTTPException(
+            status_code=409,
+            detail="No indexed repositories were available for the current repo chat scope.",
+        )
+
+    return scoped_repositories
+
+
+def _retrieval_query_to_plan(query) -> RetrievalPlan:
+    return RetrievalPlan(queries=[query])
 
 
 def _merge_ranked_repository_metrics(repository: RepoSearchResult, ranked_repository: RepoSearchResult) -> RepoSearchResult:
@@ -249,6 +343,13 @@ def _apply_baseline_fit_metrics(repository: RepoSearchResult) -> None:
             )
         else:
             repository.fit_summary = "Selected from GitHub candidate search based on metadata and query relevance."
+
+
+def _truncate_hit_text(text: str, limit: int = 280) -> str:
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[: limit - 3].rstrip() + "..."
 
 
 @router.get("/health")

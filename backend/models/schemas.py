@@ -33,6 +33,29 @@ class IdeaRequest(BaseModel):
     clarification_answers: dict[str, str] = Field(default_factory=dict)
 
 
+class RepoChatScopeRepository(BaseModel):
+    """A repository commit that the chat request is allowed to search."""
+
+    full_name: str
+    commit_sha: str = Field(..., min_length=1, max_length=200)
+
+
+class ChatMessage(BaseModel):
+    """A single chat turn exchanged in the repo chat panel."""
+
+    role: Literal["user", "assistant"]
+    content: str = Field(..., min_length=1, max_length=8000)
+
+
+class RepoChatRequest(BaseModel):
+    """A stateless repo chat request scoped to indexed repositories."""
+
+    question: str = Field(..., min_length=2, max_length=3000)
+    idea_summary: str = Field("", max_length=1000)
+    scope_repositories: list[RepoChatScopeRepository] = Field(default_factory=list)
+    messages: list[ChatMessage] = Field(default_factory=list)
+
+
 class ExtractedKeywords(BaseModel):
     """Structured technical intent extracted from the user's idea."""
 
@@ -146,7 +169,7 @@ class RetrievalWeights(BaseModel):
 class RetrievalQuery(BaseModel):
     """A query targeted at a specific analysis section."""
 
-    section: Literal["repo_descriptions", "learning_path", "architecture_diagram", "tech_stack"]
+    section: Literal["repo_descriptions", "learning_path", "architecture_diagram", "tech_stack", "chat_answer"]
     query: str
     preferred_roles: list[str] = Field(default_factory=list)
     top_k: int = 8
@@ -207,6 +230,18 @@ class Citation(BaseModel):
     reason: str = ""
 
 
+class RepoChatEvidenceHit(BaseModel):
+    """A compact retrieval hit returned for chat evidence inspection."""
+
+    repo_full_name: str
+    path: str
+    start_line: int | None = None
+    end_line: int | None = None
+    reason: str = ""
+    snippet: str = ""
+    score: float = 0.0
+
+
 class AnalysisEvidence(BaseModel):
     """Citations grouped by output section."""
 
@@ -253,3 +288,13 @@ class AnalysisResponse(BaseModel):
     evidence: AnalysisEvidence | None = None
     status: Literal["needs_clarification", "complete", "error"] = "complete"
     error: str | None = None
+
+
+class RepoChatResponse(BaseModel):
+    """The grounded chat answer returned for the repo chat panel."""
+
+    answer: str
+    citations: list[Citation] = Field(default_factory=list)
+    evidence_hits: list[RepoChatEvidenceHit] = Field(default_factory=list)
+    follow_up_suggestions: list[str] = Field(default_factory=list)
+    scoped_repo_count: int = 0
