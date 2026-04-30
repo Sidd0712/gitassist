@@ -1,55 +1,180 @@
-"""Lightweight deterministic embeddings for low-memory deployments."""
-
 from __future__ import annotations
 
-import hashlib
+import asyncio
 import logging
-import math
-import re
+import threading
+
+from sentence_transformers import SentenceTransformer
 
 from core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-TOKEN_PATTERN = re.compile(r"[a-z0-9_]+")
+# ---------------------------------------------------------------------------
+# The model name to store in settings.EMBEDDING_MODEL (update your .env):
+#   EMBEDDING_MODEL=all-MiniLM-L6-v2
+#   PGVECTOR_DIMENSION=384
+# ---------------------------------------------------------------------------
+_EXPECTED_DIM = 384
 
 
 class EmbeddingService:
-    """Generate compact hashed embeddings without loading Torch models."""
+    """
+    Semantic embedding service — drop-in replacement for the hashing service.
+
+    Public interface is identical to the original:
+        service = EmbeddingService()
+        vectors = await service.embed_documents(["code snippet", "another"])
+        query_vec = await service.embed_query("find authentication logic")
+    """
 
     def __init__(self) -> None:
         self.settings = get_settings()
+
+        # Sanity check: if someone forgot to update .env, warn them loudly
+        # rather than silently storing wrong-dimension vectors into pgvector
+        # (which would cause a cryptic DB error later).
+        if self.settings.PGVECTOR_DIMENSION != _EXPECTED_DIM:
+            logger.warning(
+                "PGVECTOR_DIMENSION is set to %d but all-MiniLM-L6-v2 outputs %d. "
+                "Update your .env: PGVECTOR_DIMENSION=384",
+                self.settings.PGVECTOR_DIMENSION,
+                _EXPECTED_DIM,
+            )
+
+        # We still honour the settings value so the rest of the app
+        # (e.g. RAGStore column creation) stays consistent.
         self.dimension = self.settings.PGVECTOR_DIMENSION
+
+        # Model is loaded lazily on first use (see _get_model).
+        self._model: SentenceTransformer | None = None
+
+        # Thread lock: prevents two concurrent requests from both trying to
+        # load the model at the same millisecond, which would double RAM usage.
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Public property — same as original
+    # ------------------------------------------------------------------
 
     @property
     def embedding_model_name(self) -> str:
+        """Returns the model identifier from settings. Set EMBEDDING_MODEL=all-MiniLM-L6-v2"""
         return self.settings.EMBEDDING_MODEL
 
-    async def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        """Embed multiple texts using deterministic hashing."""
+    # ------------------------------------------------------------------
+    # Public async API — identical signatures to original
+    # ------------------------------------------------------------------
 
+    async def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """
+        Embed a list of document texts (code chunks, READMEs, etc).
+
+        Why async + asyncio.to_thread:
+          The original was async but did CPU work inline, which blocks the
+          event loop. We offload the model's matrix operations to a thread
+          so FastAPI can keep serving other requests during indexing.
+
+        Args:
+            texts: List of strings to embed (e.g. code chunks from ChunkingService)
+
+        Returns:
+            List of vectors in the same order. Each vector is list[float] length 384.
+        """
         if not texts:
             return []
-        return [self._embed_text(text) for text in texts]
+
+        # asyncio.to_thread runs _embed_batch in a threadpool executor.
+        # This keeps the async event loop unblocked while the model runs.
+        return await asyncio.to_thread(self._embed_batch, texts)
 
     async def embed_query(self, text: str) -> list[float]:
-        """Embed one query using the same hashing space as documents."""
+        """
+        Embed a single query string (used by RetrievalService before vector search).
 
-        return self._embed_text(text)
+        Uses the exact same embedding space as embed_documents, so query vectors
+        and document vectors are directly comparable via cosine similarity.
 
-    def _embed_text(self, text: str) -> list[float]:
-        vector = [0.0] * self.dimension
-        token_count = 0
+        Args:
+            text: The query string (e.g. "find routing and middleware setup")
 
-        for token in TOKEN_PATTERN.findall((text or "").lower()):
-            token_count += 1
-            bucket = int(hashlib.blake2b(token.encode("utf-8"), digest_size=8).hexdigest(), 16) % self.dimension
-            vector[bucket] += 1.0
+        Returns:
+            Single vector: list[float] of length 384
+        """
+        if not text or not text.strip():
+            logger.warning("embed_query() called with empty text — returning zero vector")
+            return [0.0] * self.dimension
 
-        if token_count == 0:
-            return vector
+        results = await asyncio.to_thread(self._embed_batch, [text.strip()])
+        return results[0]
 
-        norm = math.sqrt(sum(value * value for value in vector))
-        if norm == 0.0:
-            return vector
-        return [round(value / norm, 8) for value in vector]
+    # ------------------------------------------------------------------
+    # Private: lazy model loader
+    # ------------------------------------------------------------------
+
+    def _get_model(self) -> SentenceTransformer:
+        """
+        Loads the model on first call, then reuses the same instance forever.
+
+        Thread-safe via double-checked locking:
+          - First check (outside lock): fast path for when model is already loaded
+          - Second check (inside lock): guards against two threads both seeing
+            _model=None and both trying to load it simultaneously
+        """
+        if self._model is None:
+            with self._lock:
+                if self._model is None:  # re-check after acquiring lock
+                    logger.info(
+                        "Loading sentence-transformer model '%s' — one-time cost ~2-5s...",
+                        self.embedding_model_name,
+                    )
+                    # device="cpu" is explicit for Render (no GPU available).
+                    # The model name comes from settings so you can swap models
+                    # just by changing EMBEDDING_MODEL in .env without touching code.
+                    self._model = SentenceTransformer(
+                        self.embedding_model_name,
+                        device="cpu",
+                    )
+                    logger.info("Model loaded. Output dimension: %d", _EXPECTED_DIM)
+
+        return self._model
+
+    # ------------------------------------------------------------------
+    # Private: actual embedding logic
+    # ------------------------------------------------------------------
+
+    def _embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """
+        Runs the model on a list of texts and returns normalized vectors.
+
+        Why batch instead of one-by-one:
+          Neural networks process matrices, not individual rows.
+          Encoding 32 texts at once is ~10x faster than 32 separate .encode() calls.
+          This matters during repo indexing where a single repo can have 200+ chunks.
+
+        normalize_embeddings=True:
+          Forces all vectors to unit length (magnitude = 1.0).
+          This makes cosine similarity equivalent to a dot product, which is
+          faster to compute and is what pgvector optimises for.
+          Without this, longer documents score artificially higher just because
+          they contain more tokens.
+        """
+        model = self._get_model()
+
+        # Sanitise inputs — empty strings produce degenerate vectors
+        cleaned = [t.strip() if t and t.strip() else " " for t in texts]
+
+        # batch_size=32 is safe for Render's 512MB RAM limit.
+        # If you upgrade to a higher-memory tier, you can raise this to 64
+        # for faster bulk indexing.
+        vectors = model.encode(
+            cleaned,
+            batch_size=32,
+            normalize_embeddings=True,  # unit vectors for cosine similarity
+            show_progress_bar=False,    # suppress tqdm noise in server logs
+        )
+
+        # vectors is a 2D numpy array shape (len(texts), 384).
+        # .tolist() converts each row to a plain Python list[float],
+        # which is what psycopg and your RAGStore expect.
+        return [v.tolist() for v in vectors]

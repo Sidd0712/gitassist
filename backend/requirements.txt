@@ -10,3 +10,4 @@ numpy
 psycopg[binary]
 psycopg-pool
 pgvector
+sentence-transformers
