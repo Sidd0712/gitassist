@@ -38,10 +38,6 @@ async def lifespan(app: FastAPI):
     logger.info("  Candidate repo limit: %d", settings.RAG_CANDIDATE_REPO_LIMIT)
     logger.info("  Deep index repo limit: %d", settings.RAG_DEEP_INDEX_REPO_LIMIT)
     logger.info("  Inline bootstrap repo limit: %d", settings.RAG_INLINE_BOOTSTRAP_REPO_LIMIT)
-    from services.rag.embedding_service import EmbeddingService
-    _embedding_service = EmbeddingService()
-    await asyncio.to_thread(_embedding_service._get_model)
-    logger.info("Embedding model pre-warmed and ready")
     yield
     await close_github_client()
     store.close()
