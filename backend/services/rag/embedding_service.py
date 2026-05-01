@@ -27,13 +27,24 @@ class EmbeddingService:
         vectors = await service.embed_documents(["code snippet", "another"])
         query_vec = await service.embed_query("find authentication logic")
     """
+    _instance = None  # class-level variable, shared across all instantiations
+
+    def __new__(cls, *args, **kwargs):
+        # __new__ runs before __init__ every time someone calls EmbeddingService()
+        # If an instance already exists, return that same one instead of creating new
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
 
     def __init__(self) -> None:
+        if hasattr(self, '_initialized'):
+            return
+            
         self.settings = get_settings()
+        self._model: SentenceTransformer | None = None
+        self._lock = threading.Lock()
+        self._initialized = True
 
-        # Sanity check: if someone forgot to update .env, warn them loudly
-        # rather than silently storing wrong-dimension vectors into pgvector
-        # (which would cause a cryptic DB error later).
         if self.settings.PGVECTOR_DIMENSION != _EXPECTED_DIM:
             logger.warning(
                 "PGVECTOR_DIMENSION is set to %d but all-MiniLM-L6-v2 outputs %d. "
@@ -42,16 +53,7 @@ class EmbeddingService:
                 _EXPECTED_DIM,
             )
 
-        # We still honour the settings value so the rest of the app
-        # (e.g. RAGStore column creation) stays consistent.
         self.dimension = self.settings.PGVECTOR_DIMENSION
-
-        # Model is loaded lazily on first use (see _get_model).
-        self._model: SentenceTransformer | None = None
-
-        # Thread lock: prevents two concurrent requests from both trying to
-        # load the model at the same millisecond, which would double RAM usage.
-        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public property — same as original
