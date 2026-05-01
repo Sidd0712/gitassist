@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     # Cohere
     COHERE_API_KEY: str = ""
     EMBEDDING_MODEL: str = "embed-english-light-v3.0"
-    PGVECTOR_DIMENSION: int = 1024
+    PGVECTOR_DIMENSION: int = 384
 
     # Cache
     GITHUB_CACHE_TTL: int = 3600  # seconds
@@ -51,13 +51,13 @@ class Settings(BaseSettings):
     RAG_SEARCH_PER_QUERY: int = 10
     RAG_DEEP_INDEX_REPO_LIMIT: int = 5
     RAG_INLINE_BOOTSTRAP_REPO_LIMIT: int = 5
-    RAG_MAX_FILES_PER_REPO: int = 40
+    RAG_MAX_FILES_PER_REPO: int = 20
     RAG_MAX_CHARS_PER_REPO: int = 150_000
     RAG_MAX_FILE_SIZE: int = 80_000
     RAG_ARCHIVE_MAX_BYTES: int = 25_000_000
     RAG_ARCHIVE_MAX_EXTRACTED_BYTES: int = 20_000_000
     RAG_ARCHIVE_MAX_FILES: int = 400
-    RAG_CHUNK_TOKENS: int = 400
+    RAG_CHUNK_TOKENS: int = 300
     RAG_CHUNK_OVERLAP: int = 60
     RAG_SECTION_TOP_K: int = 8
     RAG_SECTION_CONTEXT_CHARS: int = 14_000
@@ -72,7 +72,7 @@ class Settings(BaseSettings):
     INDEX_JOB_TIMEOUT_SECONDS: int = 900
     INDEX_JOB_MAX_RETRIES: int = 3
     INDEXER_POLL_INTERVAL_SECONDS: int = 5
-    INDEXER_MAX_CONCURRENCY: int = 2
+    INDEXER_MAX_CONCURRENCY: int = 3
     RAG_DB_POOL_MIN_SIZE: int = 1
     RAG_DB_POOL_MAX_SIZE: int = 4
     PIPELINE_REQUEST_BUDGET_SECONDS: int = 110

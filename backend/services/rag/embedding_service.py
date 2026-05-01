@@ -9,20 +9,11 @@ from core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Update your .env (local) and Render environment variables:
-#   EMBEDDING_MODEL=embed-english-light-v3.0
-#   PGVECTOR_DIMENSION=1024
-#   COHERE_API_KEY=your_key_here
-#
-# Get a free key (no credit card) at: https://dashboard.cohere.com
-# ---------------------------------------------------------------------------
-_EXPECTED_DIM = 1024
-
 # Cohere's batch limit per API call.
 # embed-english-light-v3.0 supports up to 96 texts per call.
 # We use 50 to stay safely under and keep individual payloads small.
 _BATCH_SIZE = 50
+_EXPECTED_DIM = 384
 
 
 class EmbeddingService:
@@ -63,29 +54,13 @@ class EmbeddingService:
         # singleton), so we use a flag to make sure the real setup only runs once.
         if hasattr(self, '_initialized'):
             return
-
-        self.settings = get_settings()
-        self.dimension = self.settings.PGVECTOR_DIMENSION
-
-        if self.dimension != _EXPECTED_DIM:
-            logger.warning(
-                "PGVECTOR_DIMENSION is set to %d but embed-english-light-v3.0 outputs %d. "
-                "Update your .env: PGVECTOR_DIMENSION=1024",
-                self.dimension,
-                _EXPECTED_DIM,
-            )
-
+        
         # AsyncClient is used throughout — Cohere's async client is non-blocking,
         # so embed calls don't hold up the FastAPI event loop while waiting for
         # the HTTP response from Cohere's servers.
         self._client = cohere.AsyncClientV2(api_key=self.settings.COHERE_API_KEY)
 
         self._initialized = True
-        logger.info(
-            "EmbeddingService ready — using Cohere model '%s' (%d dims)",
-            self.embedding_model_name,
-            _EXPECTED_DIM,
-        )
 
     # ------------------------------------------------------------------
     # Public property — same as original
@@ -114,7 +89,7 @@ class EmbeddingService:
             texts: List of strings to embed (e.g. code chunks from ChunkingService)
 
         Returns:
-            List of float vectors in the same order. Each vector is length 1024.
+            List of float vectors in the same order. Each vector is length 384.
         """
         if not texts:
             return []
@@ -134,7 +109,7 @@ class EmbeddingService:
             text: The query string (e.g. "find routing and middleware setup")
 
         Returns:
-            Single vector: list[float] of length 1024
+            Single vector: list[float] of length 384
         """
         if not text or not text.strip():
             logger.warning("embed_query() called with empty text — returning zero vector")
