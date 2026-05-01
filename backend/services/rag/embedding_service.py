@@ -55,6 +55,8 @@ class EmbeddingService:
         if hasattr(self, '_initialized'):
             return
         
+        self.settings = get_settings()
+        
         # AsyncClient is used throughout — Cohere's async client is non-blocking,
         # so embed calls don't hold up the FastAPI event loop while waiting for
         # the HTTP response from Cohere's servers.
