@@ -544,21 +544,17 @@ Return ONLY a JSON array of search query strings:
     async def evaluate_repository_quality(self, repo_name: str, description: str, readme: str, topics: list[str]) -> dict:
         """Evaluate repository quality and relevance using AI."""
 
-        prompt = f"""Evaluate this GitHub repository's quality and purpose.
+        prompt = f"""You are a JSON API. Return ONLY a JSON object.
 
+Evaluate this GitHub repository:
 Repository: {repo_name}
-Description: {description}
+Description: {description[:300]}
 Topics: {', '.join(topics)}
-README preview: {readme[:800]}
+README: {readme[:600]}
 
-Return JSON with:
-{{
-  "quality_score": 0.0-1.0,
-  "is_template_or_tutorial": true/false,
-  "is_production_quality": true/false,
-  "primary_purpose": "description",
-  "reasoning": "why this score"
-}}"""
+{{"quality_score": 0.0, "is_template_or_tutorial": false, "is_production_quality": false, "primary_purpose": "one phrase", "reasoning": "one sentence max"}}
+
+Replace values and return the object:"""
 
         result = await self._call_json_api(
             prompt,
@@ -590,20 +586,16 @@ Return top {max_files} as JSON array:
     async def evaluate_capability_match(self, capability: str, repo_text: str, keywords_context: dict) -> float:
         """Score how well a repository supports a capability using AI."""
 
-        prompt = f"""Does this repository support the capability: {capability}?
+        prompt = f"""You are a JSON API. Return ONLY a JSON object.
 
-Repository text:
-{repo_text[:2000]}
+Does this repository support the capability: {capability}
 
+Repository text: {repo_text[:2000]}
 Project keywords: {keywords_context.get('keywords', [])}
-Domain terms: {keywords_context.get('domain_terms', [])}
 
-Return JSON:
-{{
-  "match_score": 0.0-1.0,
-  "confidence": "high|medium|low",
-  "evidence": "brief explanation"
-}}"""
+{{"match_score": 0.0, "confidence": "high", "evidence": "one sentence max"}}
+
+Replace values and return the object:"""
 
         result = await self._call_json_api(
             prompt,
@@ -618,31 +610,23 @@ Return JSON:
     async def calculate_ranking_weights(self, idea: str, repositories_count: int) -> dict:
         """Determine optimal repository ranking weights using AI."""
 
-        prompt = f"""For ranking {repositories_count} repositories for this idea:
-{idea}
+        prompt = f"""You are a JSON API. Return ONLY a JSON object, no explanation, no prose, no markdown.
 
-Determine importance weights for:
-- readme_semantic_score
-- metadata_semantic_score
-- capability_coverage
-- documentation_quality
-- query_diversity
-- star_quality
+    Task: assign ranking weights for {repositories_count} repositories matching this idea: {idea}
 
-Return JSON with weights 0.0-1.0 that sum to 1.0:
-{{
-  "readme_semantic": 0.0-1.0,
-  "metadata_semantic": 0.0-1.0,
-  "capability_coverage": 0.0-1.0,
-  "doc_quality": 0.0-1.0,
-  "query_diversity": 0.0-1.0,
-  "star_quality": 0.0-1.0
-}}"""
+    Rules:
+    - All 6 values must be floats between 0.0 and 1.0
+    - Values must sum to exactly 1.0
+    - Return nothing except the JSON object
+
+    {{"readme_semantic": 0.0, "metadata_semantic": 0.0, "capability_coverage": 0.0, "doc_quality": 0.0, "query_diversity": 0.0, "star_quality": 0.0}}
+
+    Replace the 0.0 values with your weights and return the object:"""
 
         result = await self._call_json_api(
             prompt,
-            temperature=0.3,
-            max_tokens=350,
+            temperature=0.1,
+            max_tokens=120,
             timeout_seconds=self.settings.LLM_AUX_TIMEOUT_SECONDS,
         )
         return result if isinstance(result, dict) else {}
@@ -650,22 +634,18 @@ Return JSON with weights 0.0-1.0 that sum to 1.0:
     async def determine_retrieval_weights(self, query_type: str, context: str) -> dict:
         """Calculate optimal retrieval scoring weights using AI."""
 
-        prompt = f"""For a {query_type} retrieval query in this context:
-{context}
+        prompt = f"""You are a JSON API. Return ONLY a JSON object, no explanation, no prose, no markdown.
 
-Determine optimal weights for combining these signals:
-- dense_score (semantic similarity via embeddings)
-- lexical_score (keyword/BM25 matching)
-- repo_prior (repository quality/relevance)
-- role_prior (chunk type relevance)
+Task: assign retrieval weights for a {query_type} query in this context: {context[:200]}
 
-Return JSON with weights that sum to 1.0:
-{{
-  "dense_weight": 0.0-1.0,
-  "lexical_weight": 0.0-1.0,
-  "repo_weight": 0.0-1.0,
-  "role_weight": 0.0-1.0
-}}"""
+Rules:
+- All 4 values must be floats between 0.0 and 1.0
+- Values must sum to exactly 1.0
+- Return nothing except the JSON object
+
+{{"dense_weight": 0.0, "lexical_weight": 0.0, "repo_weight": 0.0, "role_weight": 0.0}}
+
+Replace the 0.0 values with your weights and return the object:"""
 
         result = await self._call_json_api(
             prompt,
@@ -678,20 +658,15 @@ Return JSON with weights that sum to 1.0:
     async def assess_document_quality(self, text: str) -> float:
         """Evaluate documentation quality using AI."""
 
-        prompt = f"""Rate this documentation's quality:
+        prompt = f"""You are a JSON API. Return ONLY a JSON object.
+
+Rate this documentation's quality as a float from 0.0 (useless) to 1.0 (excellent):
 
 {text[:1500]}
 
-Consider:
-- Completeness
-- Clarity
-- Usefulness for learning
-- Examples and code samples
+{{"quality_score": 0.0}}
 
-Return JSON:
-{{
-  "quality_score": 0.0-1.0
-}}"""
+Replace 0.0 with your score:"""
 
         result = await self._call_json_api(
             prompt,
