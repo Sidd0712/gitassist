@@ -28,7 +28,6 @@ class Settings(BaseSettings):
     GROQ_API_KEY: str = ""  # Groq API key (get from console.groq.com)
     LLM_PROVIDER: str = "groq"
     LLM_MODEL: str = "llama-3.3-70b-versatile"  # Groq's latest 70B model (3.1 was decommissioned)
-    EMBEDDING_MODEL: str = "hash-embedding-384-v1"  # Low-memory deterministic embeddings for web/worker use
     LLM_TIMEOUT_SECONDS: int = 60
     LLM_MAX_RETRIES: int = 3
     LLM_AUX_TIMEOUT_SECONDS: int = 20
@@ -69,7 +68,6 @@ class Settings(BaseSettings):
     RAG_CHUNKING_VERSION: str = "v1"
     RAG_STORE_BACKEND: str = "postgres"
     DATABASE_URL: str = ""
-    PGVECTOR_DIMENSION: int = 384
     INDEXING_MODE: str = "inline"
     INDEX_JOB_TIMEOUT_SECONDS: int = 900
     INDEX_JOB_MAX_RETRIES: int = 3
