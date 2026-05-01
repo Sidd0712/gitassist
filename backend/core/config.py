@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     LLM_AUX_TIMEOUT_SECONDS: int = 20
     LLM_GENERATION_TIMEOUT_SECONDS: int = 35
 
+    # Cohere
+    COHERE_API_KEY: str = ""
+    EMBEDDING_MODEL: str = "embed-english-light-v3.0"
+    PGVECTOR_DIMENSION: int = 1024
+
     # Cache
     GITHUB_CACHE_TTL: int = 3600  # seconds
     CACHE_LLM_TTL_SECONDS: int = 3600

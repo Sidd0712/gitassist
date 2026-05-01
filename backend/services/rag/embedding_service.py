@@ -2,58 +2,90 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import threading
 
-from sentence_transformers import SentenceTransformer
+import cohere
 
 from core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# The model name to store in settings.EMBEDDING_MODEL (update your .env):
-#   EMBEDDING_MODEL=all-MiniLM-L6-v2
-#   PGVECTOR_DIMENSION=384
+# Update your .env (local) and Render environment variables:
+#   EMBEDDING_MODEL=embed-english-light-v3.0
+#   PGVECTOR_DIMENSION=1024
+#   COHERE_API_KEY=your_key_here
+#
+# Get a free key (no credit card) at: https://dashboard.cohere.com
 # ---------------------------------------------------------------------------
-_EXPECTED_DIM = 384
+_EXPECTED_DIM = 1024
+
+# Cohere's batch limit per API call.
+# embed-english-light-v3.0 supports up to 96 texts per call.
+# We use 50 to stay safely under and keep individual payloads small.
+_BATCH_SIZE = 50
 
 
 class EmbeddingService:
     """
-    Semantic embedding service — drop-in replacement for the hashing service.
+    Cohere-backed semantic embedding service.
 
-    Public interface is identical to the original:
+    Drop-in replacement for both the original hashing service and the
+    local MiniLM service — public interface is identical:
+
         service = EmbeddingService()
         vectors = await service.embed_documents(["code snippet", "another"])
         query_vec = await service.embed_query("find authentication logic")
+
+    Why Cohere instead of a local model:
+      Running a local model (MiniLM, etc.) on Render's free tier requires
+      ~120MB+ of RAM just for the model weights. Combined with FastAPI,
+      Postgres connections, and active requests, this pushes the 512MB
+      limit and causes OOM crashes. Cohere handles all computation on
+      their servers — your Render instance stays lean (~300MB total).
+
+    Free tier: 1000 API calls/month. At ~15-35 calls per research request
+    and monthly resets, this covers roughly 30-65 full requests/month for free.
+    After that, cost is ~$0.10/1M tokens — negligible at this scale.
     """
-    _instance = None  # class-level variable, shared across all instantiations
+
+    _instance = None  # class-level, shared across all instantiations
 
     def __new__(cls, *args, **kwargs):
-        # __new__ runs before __init__ every time someone calls EmbeddingService()
-        # If an instance already exists, return that same one instead of creating new
+        # Singleton pattern — __new__ runs before __init__ on every EmbeddingService()
+        # call. Returning the existing instance means the Cohere client is only
+        # created once, no matter how many files import and instantiate this class.
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
 
     def __init__(self) -> None:
+        # Guard: __init__ runs every time EmbeddingService() is called (even on the
+        # singleton), so we use a flag to make sure the real setup only runs once.
         if hasattr(self, '_initialized'):
             return
-            
-        self.settings = get_settings()
-        self._model: SentenceTransformer | None = None
-        self._lock = threading.Lock()
-        self._initialized = True
 
-        if self.settings.PGVECTOR_DIMENSION != _EXPECTED_DIM:
+        self.settings = get_settings()
+        self.dimension = self.settings.PGVECTOR_DIMENSION
+
+        if self.dimension != _EXPECTED_DIM:
             logger.warning(
-                "PGVECTOR_DIMENSION is set to %d but all-MiniLM-L6-v2 outputs %d. "
-                "Update your .env: PGVECTOR_DIMENSION=384",
-                self.settings.PGVECTOR_DIMENSION,
+                "PGVECTOR_DIMENSION is set to %d but embed-english-light-v3.0 outputs %d. "
+                "Update your .env: PGVECTOR_DIMENSION=1024",
+                self.dimension,
                 _EXPECTED_DIM,
             )
 
-        self.dimension = self.settings.PGVECTOR_DIMENSION
+        # AsyncClient is used throughout — Cohere's async client is non-blocking,
+        # so embed calls don't hold up the FastAPI event loop while waiting for
+        # the HTTP response from Cohere's servers.
+        self._client = cohere.AsyncClientV2(api_key=self.settings.COHERE_API_KEY)
+
+        self._initialized = True
+        logger.info(
+            "EmbeddingService ready — using Cohere model '%s' (%d dims)",
+            self.embedding_model_name,
+            _EXPECTED_DIM,
+        )
 
     # ------------------------------------------------------------------
     # Public property — same as original
@@ -61,122 +93,130 @@ class EmbeddingService:
 
     @property
     def embedding_model_name(self) -> str:
-        """Returns the model identifier from settings. Set EMBEDDING_MODEL=all-MiniLM-L6-v2"""
+        """Returns the model identifier from settings.
+        Set EMBEDDING_MODEL=embed-english-light-v3.0 in your .env."""
         return self.settings.EMBEDDING_MODEL
 
     # ------------------------------------------------------------------
-    # Public async API — identical signatures to original
+    # Public async API — identical signatures to the original service
     # ------------------------------------------------------------------
 
     async def embed_documents(self, texts: list[str]) -> list[list[float]]:
         """
         Embed a list of document texts (code chunks, READMEs, etc).
 
-        Why async + asyncio.to_thread:
-          The original was async but did CPU work inline, which blocks the
-          event loop. We offload the model's matrix operations to a thread
-          so FastAPI can keep serving other requests during indexing.
+        Uses input_type="search_document" — this is Cohere-specific context
+        that tells the model these are passages being stored for later retrieval,
+        not a query. Using the correct input_type measurably improves the quality
+        of semantic similarity comparisons at search time.
 
         Args:
             texts: List of strings to embed (e.g. code chunks from ChunkingService)
 
         Returns:
-            List of vectors in the same order. Each vector is list[float] length 384.
+            List of float vectors in the same order. Each vector is length 1024.
         """
         if not texts:
             return []
 
-        # asyncio.to_thread runs _embed_batch in a threadpool executor.
-        # This keeps the async event loop unblocked while the model runs.
-        return await asyncio.to_thread(self._embed_batch, texts)
+        return await self._embed_batched(texts, input_type="search_document")
 
     async def embed_query(self, text: str) -> list[float]:
         """
         Embed a single query string (used by RetrievalService before vector search).
 
-        Uses the exact same embedding space as embed_documents, so query vectors
-        and document vectors are directly comparable via cosine similarity.
+        Uses input_type="search_query" — the counterpart to "search_document".
+        Cohere trains the model so that query vectors and document vectors are
+        comparable even though they use different input_type tags. This asymmetric
+        encoding is what makes retrieval quality better than symmetric models.
 
         Args:
             text: The query string (e.g. "find routing and middleware setup")
 
         Returns:
-            Single vector: list[float] of length 384
+            Single vector: list[float] of length 1024
         """
         if not text or not text.strip():
             logger.warning("embed_query() called with empty text — returning zero vector")
             return [0.0] * self.dimension
 
-        results = await asyncio.to_thread(self._embed_batch, [text.strip()])
+        results = await self._embed_batched([text.strip()], input_type="search_query")
         return results[0]
 
     # ------------------------------------------------------------------
-    # Private: lazy model loader
+    # Private: batching logic
     # ------------------------------------------------------------------
 
-    def _get_model(self) -> SentenceTransformer:
+    async def _embed_batched(
+        self, texts: list[str], input_type: str
+    ) -> list[list[float]]:
         """
-        Loads the model on first call, then reuses the same instance forever.
+        Splits texts into batches and embeds them, then reassembles in order.
 
-        Thread-safe via double-checked locking:
-          - First check (outside lock): fast path for when model is already loaded
-          - Second check (inside lock): guards against two threads both seeing
-            _model=None and both trying to load it simultaneously
+        Why batch at all:
+          Cohere's API accepts up to 96 texts per call. During repo indexing
+          a single file can produce 200+ chunks. Batching into groups of 50
+          means we make ceil(200/50) = 4 API calls instead of 200 — dramatically
+          fewer network round trips and less chance of hitting rate limits.
+
+        Why gather instead of sequential awaits:
+          asyncio.gather fires all batch calls concurrently rather than waiting
+          for each one to finish before starting the next. For 4 batches this
+          can cut total latency by ~3x since Cohere processes them in parallel.
+
+        Args:
+            texts:      The full list of strings to embed.
+            input_type: "search_document" for chunks, "search_query" for queries.
+
+        Returns:
+            Flat list of vectors in the same order as the input texts.
         """
-        if self._model is None:
-            with self._lock:
-                if self._model is None:  # re-check after acquiring lock
-                    logger.info(
-                        "Loading sentence-transformer model '%s' — one-time cost ~2-5s...",
-                        self.embedding_model_name,
-                    )
-                    # device="cpu" is explicit for Render (no GPU available).
-                    # The model name comes from settings so you can swap models
-                    # just by changing EMBEDDING_MODEL in .env without touching code.
-                    self._model = SentenceTransformer(
-                        self.embedding_model_name,
-                        device="cpu",
-                    )
-                    logger.info("Model loaded. Output dimension: %d", _EXPECTED_DIM)
-
-        return self._model
-
-    # ------------------------------------------------------------------
-    # Private: actual embedding logic
-    # ------------------------------------------------------------------
-
-    def _embed_batch(self, texts: list[str]) -> list[list[float]]:
-        """
-        Runs the model on a list of texts and returns normalized vectors.
-
-        Why batch instead of one-by-one:
-          Neural networks process matrices, not individual rows.
-          Encoding 32 texts at once is ~10x faster than 32 separate .encode() calls.
-          This matters during repo indexing where a single repo can have 200+ chunks.
-
-        normalize_embeddings=True:
-          Forces all vectors to unit length (magnitude = 1.0).
-          This makes cosine similarity equivalent to a dot product, which is
-          faster to compute and is what pgvector optimises for.
-          Without this, longer documents score artificially higher just because
-          they contain more tokens.
-        """
-        model = self._get_model()
-
-        # Sanitise inputs — empty strings produce degenerate vectors
+        # Sanitise: replace empty strings with a single space.
+        # Cohere rejects empty strings with a 400 error.
         cleaned = [t.strip() if t and t.strip() else " " for t in texts]
 
-        # batch_size=32 is safe for Render's 512MB RAM limit.
-        # If you upgrade to a higher-memory tier, you can raise this to 64
-        # for faster bulk indexing.
-        vectors = model.encode(
-            cleaned,
-            batch_size=32,
-            normalize_embeddings=True,  # unit vectors for cosine similarity
-            show_progress_bar=False,    # suppress tqdm noise in server logs
+        # Split into batches of _BATCH_SIZE
+        batches = [
+            cleaned[i : i + _BATCH_SIZE]
+            for i in range(0, len(cleaned), _BATCH_SIZE)
+        ]
+
+        # Fire all batch API calls concurrently
+        batch_results = await asyncio.gather(
+            *[self._call_cohere(batch, input_type) for batch in batches]
         )
 
-        # vectors is a 2D numpy array shape (len(texts), 384).
-        # .tolist() converts each row to a plain Python list[float],
-        # which is what psycopg and your RAGStore expect.
-        return [v.tolist() for v in vectors]
+        # Flatten: batch_results is list[list[list[float]]], we want list[list[float]]
+        return [vec for batch in batch_results for vec in batch]
+
+    async def _call_cohere(
+        self, texts: list[str], input_type: str
+    ) -> list[list[float]]:
+        """
+        Makes a single Cohere embed API call and returns the float vectors.
+
+        embedding_types=["float"]:
+          Cohere v2 can return embeddings in multiple formats (float, int8, binary).
+          We explicitly request float — the same type pgvector expects — to avoid
+          any format mismatch. Without this, the API may return a default that
+          needs extra conversion.
+
+        Args:
+            texts:      A single batch (≤50 strings) to embed.
+            input_type: "search_document" or "search_query".
+
+        Returns:
+            List of float vectors, one per input text.
+        """
+        response = await self._client.embed(
+            texts=texts,
+            model=self.embedding_model_name,  # from settings: embed-english-light-v3.0
+            input_type=input_type,            # "search_document" or "search_query"
+            embedding_types=["float"],        # we only need float vectors for pgvector
+        )
+
+        # response.embeddings.float_ is a list of lists (one per input text).
+        # We convert each inner list to a plain Python list[float] — psycopg
+        # and pgvector both expect standard Python types, not numpy arrays or
+        # Cohere wrapper objects.
+        return [list(embedding) for embedding in response.embeddings.float_]
