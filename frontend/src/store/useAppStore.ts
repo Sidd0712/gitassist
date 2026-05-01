@@ -3,6 +3,29 @@ import { chatAboutRepos, researchIdea } from '../services/api';
 import type { AnalysisResponse, RepoChatMessage, RepoChatScopeRepository } from '../types';
 
 type AppView = 'home' | 'loading' | 'clarify' | 'results';
+type StepStatus = 'pending' | 'current' | 'complete';
+
+export interface ProgressStep {
+  message: string;
+  status: StepStatus;
+}
+
+/** Canonical ordered list — must match backend _PROGRESS_* constants exactly. */
+export const PROGRESS_STEPS: readonly string[] = [
+  'Extracting intent from your idea...',
+  'Searching GitHub for relevant repositories...',
+  'Analysing top candidates...',
+  'Indexing real-world code (this takes a moment)...',
+  'Retrieving relevant code sections...',
+  'Generating your research report...',
+] as const;
+
+function initialProgressSteps(): ProgressStep[] {
+  return PROGRESS_STEPS.map((message, i) => ({
+    message,
+    status: i === 0 ? 'current' : 'pending',
+  }));
+}
 
 interface AppState {
   view: AppView;
@@ -10,6 +33,9 @@ interface AppState {
   result: AnalysisResponse | null;
   error: string | null;
   clarificationAnswers: Record<string, string>;
+  progressSteps: ProgressStep[];
+  activeResearchController: AbortController | null;
+  activeResearchRequestId: number | null;
   chatMessages: RepoChatMessage[];
   chatPending: boolean;
   chatError: string | null;
@@ -31,6 +57,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   result: null,
   error: null,
   clarificationAnswers: {},
+  progressSteps: initialProgressSteps(),
+  activeResearchController: null,
+  activeResearchRequestId: null,
   chatMessages: [],
   chatPending: false,
   chatError: null,
@@ -39,70 +68,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   setIdea: (idea) => set({ idea }),
   setClarificationAnswer: (key, value) =>
     set((state) => ({
-      clarificationAnswers: {
-        ...state.clarificationAnswers,
-        [key]: value,
-      },
+      clarificationAnswers: { ...state.clarificationAnswers, [key]: value },
     })),
 
-  submitIdea: async () => {
-    const { idea } = get();
-    if (!idea.trim()) return;
-
-    set({
-      view: 'loading',
-      error: null,
-      result: null,
-      clarificationAnswers: {},
-      chatMessages: [],
-      chatPending: false,
-      chatError: null,
-      isChatOpen: false,
-    });
-
-    try {
-      const result = await researchIdea(idea);
-      if (result.status === 'error') {
-        set({ view: 'results', result, error: result.error });
-        get().resetChatSession();
-      } else if (result.status === 'needs_clarification') {
-        const clarificationAnswers = Object.fromEntries(
-          result.clarification_questions.map((question) => [question.key, '']),
-        );
-        set({ view: 'clarify', result, error: null, clarificationAnswers });
-        get().resetChatSession();
-      } else {
-        set({ view: 'results', result, error: null });
-        get().resetChatSession();
-      }
-    } catch (err: any) {
-      const message = err?.response?.data?.detail || err.message || 'Something went wrong';
-      set({ view: 'home', error: message });
-    }
-  },
-
-  submitClarifications: async () => {
-    const { idea, clarificationAnswers } = get();
-    if (!idea.trim()) return;
-
-    set({ view: 'loading', error: null, chatMessages: [], chatPending: false, chatError: null, isChatOpen: false });
-    try {
-      const result = await researchIdea(idea, clarificationAnswers);
-      if (result.status === 'needs_clarification') {
-        set({ view: 'clarify', result, error: null });
-        get().resetChatSession();
-      } else if (result.status === 'error') {
-        set({ view: 'results', result, error: result.error });
-        get().resetChatSession();
-      } else {
-        set({ view: 'results', result, error: null });
-        get().resetChatSession();
-      }
-    } catch (err: any) {
-      const message = err?.response?.data?.detail || err.message || 'Something went wrong';
-      set({ view: 'clarify', error: message });
-    }
-  },
+  submitIdea: () => _runResearch(true, set, get),
+  submitClarifications: () => _runResearch(false, set, get),
 
   sendChatMessage: async (question) => {
     const trimmedQuestion = question.trim();
@@ -153,8 +123,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         chatPending: false,
         chatError: null,
       }));
-    } catch (err: any) {
-      const message = err?.response?.data?.detail || err.message || 'Something went wrong';
+    } catch (err: unknown) {
+      const message = extractErrorMessage(err);
       set({ chatPending: false, chatError: message });
     }
   },
@@ -172,19 +142,130 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
   },
 
-  reset: () =>
+  reset: () => {
+    const prior = get().activeResearchController;
+    if (prior) prior.abort();
     set({
       view: 'home',
       idea: '',
       result: null,
       error: null,
       clarificationAnswers: {},
+      progressSteps: initialProgressSteps(),
+      activeResearchController: null,
+      activeResearchRequestId: null,
       chatMessages: [],
       chatPending: false,
       chatError: null,
       isChatOpen: false,
-    }),
+    });
+  },
 }));
+
+// ─── Shared streaming run helper ──────────────────────────────────────────────
+
+let nextResearchRequestId = 1;
+
+async function _runResearch(
+  isInitialSubmit: boolean,
+  set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+): Promise<void> {
+  const { idea, clarificationAnswers, result: previousResult } = get();
+  if (!idea.trim()) return;
+
+  // Abort any prior in-flight stream
+  const prior = get().activeResearchController;
+  if (prior) prior.abort();
+
+  const controller = new AbortController();
+  const requestId = nextResearchRequestId++;
+
+  set({
+    view: 'loading',
+    error: null,
+    result: isInitialSubmit ? null : previousResult,
+    progressSteps: initialProgressSteps(), // step 1 = current locally during preflight
+    activeResearchController: controller,
+    activeResearchRequestId: requestId,
+    chatMessages: [],
+    chatPending: false,
+    chatError: null,
+    isChatOpen: false,
+    ...(isInitialSubmit ? { clarificationAnswers: {} } : {}),
+  });
+
+  try {
+    const result = await researchIdea(
+      idea,
+      isInitialSubmit ? {} : clarificationAnswers,
+      // onProgress — advance the step list
+      (message) => {
+        set((state) => {
+          if (state.activeResearchRequestId !== requestId) return {};
+          const idx = PROGRESS_STEPS.indexOf(message);
+          if (idx === -1) return {};
+          return {
+            progressSteps: state.progressSteps.map((step, i) => ({
+              ...step,
+              status:
+                i === idx
+                  ? 'current'
+                  : step.status === 'current'
+                    ? 'complete'
+                    : step.status,
+            })),
+          };
+        });
+      },
+      controller.signal,
+    );
+
+    if (get().activeResearchRequestId !== requestId) return;
+    set({ activeResearchController: null, activeResearchRequestId: null });
+
+    if (result.status === 'needs_clarification') {
+      if (isInitialSubmit) {
+        const freshAnswers = Object.fromEntries(
+          result.clarification_questions.map((q) => [q.key, '']),
+        );
+        set({ view: 'clarify', result, error: null, clarificationAnswers: freshAnswers });
+      } else {
+        // Keep existing answers — let user refine them
+        set({ view: 'clarify', result, error: null });
+      }
+      get().resetChatSession();
+    } else if (result.status === 'error') {
+      set({ view: 'results', result, error: result.error ?? null });
+      get().resetChatSession();
+    } else {
+      set({ view: 'results', result, error: null });
+      get().resetChatSession();
+    }
+  } catch (err: unknown) {
+    if (get().activeResearchRequestId !== requestId) return;
+    set({ activeResearchController: null, activeResearchRequestId: null });
+    if ((err as { name?: string })?.name === 'AbortError') return;
+    const message = extractErrorMessage(err);
+    if (isInitialSubmit) {
+      set({ view: 'home', error: message });
+    } else {
+      set({ view: 'clarify', error: message, result: previousResult });
+    }
+  }
+}
+
+// ─── Utilities ────────────────────────────────────────────────────────────────
+
+function extractErrorMessage(err: unknown): string {
+  if (err && typeof err === 'object') {
+    // axios-style
+    const axiosErr = err as { response?: { data?: { detail?: string } }; message?: string };
+    if (axiosErr.response?.data?.detail) return axiosErr.response.data.detail;
+    if (axiosErr.message) return axiosErr.message;
+  }
+  return 'Something went wrong';
+}
 
 function buildIntroMessage(result: AnalysisResponse): RepoChatMessage {
   const repoCount = getChatScope(result).length;

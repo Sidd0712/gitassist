@@ -1516,5 +1516,291 @@ class RepoChatRouteTests(HermeticAsyncTestCase):
         self.assertGreaterEqual(entrypoint_score, 0.95)
 
 
+class StreamingRouteTests(HermeticAsyncTestCase):
+    """Tests for the SSE streaming POST /api/research route."""
+
+    def setUp(self) -> None:
+        super().setUp()
+
+        # Build a minimal FastAPI app mirroring main.py
+        from fastapi import FastAPI
+        from fastapi.middleware.cors import CORSMiddleware
+        from starlette.testclient import TestClient
+        from routers.research import router as research_router
+
+        test_app = FastAPI()
+        test_app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        test_app.include_router(research_router)
+        self.client = TestClient(test_app, raise_server_exceptions=False)
+
+    @staticmethod
+    def _parse_sse(text: str) -> list[dict]:
+        """Parse raw SSE body text into a list of event dicts."""
+        import json as _json
+
+        events: list[dict] = []
+        for block in text.split("\n\n"):
+            for line in block.splitlines():
+                if line.startswith("data: "):
+                    try:
+                        events.append(_json.loads(line[6:]))
+                    except _json.JSONDecodeError:
+                        pass
+        return events
+
+    # ------------------------------------------------------------------
+    # 1. Successful full-pipeline run — ordered progress then result
+    # ------------------------------------------------------------------
+    def test_successful_stream_emits_ordered_progress_then_result(self):
+        """A clear idea should yield 6 ordered progress events then one result."""
+        import json as _json
+
+        fake_candidate = RepoSearchResult(
+            full_name="example/collab-board",
+            description="Collaborative whiteboard",
+            html_url="https://github.com/example/collab-board",
+            stars=120,
+            language="TypeScript",
+            topics=["whiteboard", "canvas", "websocket"],
+        )
+        fake_evidence = ShallowRepoEvidence(
+            repository=fake_candidate,
+            readme="Collaborative whiteboard with realtime sync and canvas.",
+            highlighted_paths=["src/socket/server.ts"],
+        )
+        fake_snapshot = RepoSnapshot(
+            full_name="example/collab-board",
+            description="Collaborative whiteboard",
+            html_url="https://github.com/example/collab-board",
+            stars=120,
+            language="TypeScript",
+            topics=["whiteboard", "canvas", "websocket"],
+            commit_sha="abc123",
+            tree=[],
+        )
+
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from services.rag.ranking_service import rank_repo_evidence as real_rank
+
+        ranked = ShallowRepoEvidence(
+            repository=RepoSearchResult(
+                full_name="example/collab-board",
+                html_url="https://github.com/example/collab-board",
+                description="Collaborative whiteboard",
+                commit_sha="abc123",
+                reference_type="end_to_end",
+                fit_score=0.9,
+            ),
+            readme="Collaborative whiteboard with realtime sync.",
+        )
+
+        fake_indexed = RepoSearchResult(
+            full_name="example/collab-board",
+            html_url="https://github.com/example/collab-board",
+            commit_sha="abc123",
+        )
+
+        fake_corpus = MagicMock()
+        fake_corpus.load_indexed_repository.return_value = None
+        fake_corpus.enqueue_index_job_placeholder.return_value = False
+        fake_corpus.index_repository_plan = AsyncMock(return_value=fake_indexed)
+
+        fake_retrieval = MagicMock()
+        fake_retrieval.retrieve = AsyncMock(return_value={})
+
+        with (
+            patch("routers.research.search_repo_candidates", AsyncMock(return_value=[fake_candidate])),
+            patch("routers.research.fetch_shallow_repo_evidence_batch", AsyncMock(return_value=[fake_evidence])),
+            patch("routers.research.rank_repo_evidence", AsyncMock(return_value=[ranked])),
+            patch("routers.research.fetch_repo_snapshot", AsyncMock(return_value=fake_snapshot)),
+            patch("routers.research.CorpusService", return_value=fake_corpus),
+            patch("routers.research.RetrievalService", return_value=fake_retrieval),
+        ):
+            response = self.client.post(
+                "/api/research",
+                json={"idea": "an app where friends can draw together online"},
+            )
+
+        self.assertEqual(200, response.status_code)
+        events = self._parse_sse(response.text)
+
+        progress_msgs = [e["message"] for e in events if e.get("type") == "progress"]
+        result_events = [e for e in events if e.get("type") == "result"]
+
+        expected_order = [
+            "Extracting intent from your idea...",
+            "Searching GitHub for relevant repositories...",
+            "Analysing top candidates...",
+            "Indexing real-world code (this takes a moment)...",
+            "Retrieving relevant code sections...",
+            "Generating your research report...",
+        ]
+        self.assertEqual(expected_order, progress_msgs)
+        self.assertEqual(1, len(result_events))
+        self.assertIn(result_events[0]["data"]["status"], {"complete", "error"})
+        # No SSE error events in a successful run
+        self.assertEqual(0, sum(1 for e in events if e.get("type") == "error"))
+
+    # ------------------------------------------------------------------
+    # 2. Clarification path — single result event, zero progress events
+    # ------------------------------------------------------------------
+    def test_clarification_emits_one_result_and_zero_progress_events(self):
+        """A vague idea needing clarification must skip all progress events."""
+        response = self.client.post(
+            "/api/research",
+            json={"idea": "something like Uber for tutors"},
+        )
+
+        self.assertEqual(200, response.status_code)
+        events = self._parse_sse(response.text)
+
+        progress_events = [e for e in events if e.get("type") == "progress"]
+        result_events = [e for e in events if e.get("type") == "result"]
+
+        self.assertEqual(0, len(progress_events), "No progress events before clarification result")
+        self.assertEqual(1, len(result_events))
+        self.assertEqual("needs_clarification", result_events[0]["data"]["status"])
+
+    # ------------------------------------------------------------------
+    # 3. Mid-stream exception → single error event, stream closes cleanly
+    # ------------------------------------------------------------------
+    def test_injected_exception_emits_error_event_and_closes(self):
+        """An exception after the stream starts must emit exactly one error event."""
+        from unittest.mock import AsyncMock, patch
+
+        with patch(
+            "routers.research.search_repo_candidates",
+            AsyncMock(side_effect=RuntimeError("simulated network failure")),
+        ):
+            response = self.client.post(
+                "/api/research",
+                json={"idea": "an app where friends can draw together online"},
+            )
+
+        self.assertEqual(200, response.status_code)
+        events = self._parse_sse(response.text)
+
+        error_events = [e for e in events if e.get("type") == "error"]
+        self.assertEqual(1, len(error_events))
+        self.assertIn("simulated network failure", error_events[0]["message"])
+        # Stream must close cleanly — no result events after the error
+        result_events = [e for e in events if e.get("type") == "result"]
+        self.assertEqual(0, len(result_events))
+
+    # ------------------------------------------------------------------
+    # 4. Response headers — CORS, Cache-Control, X-Accel-Buffering
+    # ------------------------------------------------------------------
+    def test_streaming_response_includes_required_headers(self):
+        """SSE response must carry no-cache and proxy-buffering-off headers."""
+        from unittest.mock import AsyncMock, patch
+
+        # Short-circuit after search so the test is fast.
+        # An Origin header must be present for the CORS middleware to emit
+        # Access-Control-Allow-Origin in the response.
+        with patch(
+            "routers.research.search_repo_candidates",
+            AsyncMock(return_value=[]),
+        ):
+            response = self.client.post(
+                "/api/research",
+                json={"idea": "an app where friends can draw together online"},
+                headers={"Origin": "http://localhost"},
+            )
+
+        self.assertIn("access-control-allow-origin", {h.lower() for h in response.headers})
+        self.assertEqual("no-cache", response.headers.get("cache-control"))
+        self.assertEqual("no", response.headers.get("x-accel-buffering"))
+
+    def test_skipped_retrieval_does_not_emit_retrieval_progress(self):
+        """If retrieval is skipped by budget, the retrieval progress event should not be sent."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        fake_candidate = RepoSearchResult(
+            full_name="example/collab-board",
+            description="Collaborative whiteboard",
+            html_url="https://github.com/example/collab-board",
+            stars=120,
+            language="TypeScript",
+            topics=["whiteboard", "canvas", "websocket"],
+        )
+        fake_evidence = ShallowRepoEvidence(
+            repository=fake_candidate,
+            readme="Collaborative whiteboard with realtime sync and canvas.",
+            highlighted_paths=["src/socket/server.ts"],
+        )
+        fake_snapshot = RepoSnapshot(
+            full_name="example/collab-board",
+            description="Collaborative whiteboard",
+            html_url="https://github.com/example/collab-board",
+            stars=120,
+            language="TypeScript",
+            topics=["whiteboard", "canvas", "websocket"],
+            commit_sha="abc123",
+            tree=[],
+        )
+        ranked = ShallowRepoEvidence(
+            repository=RepoSearchResult(
+                full_name="example/collab-board",
+                html_url="https://github.com/example/collab-board",
+                description="Collaborative whiteboard",
+                commit_sha="abc123",
+                reference_type="end_to_end",
+                fit_score=0.9,
+            ),
+            readme="Collaborative whiteboard with realtime sync.",
+        )
+        fake_indexed = RepoSearchResult(
+            full_name="example/collab-board",
+            html_url="https://github.com/example/collab-board",
+            commit_sha="abc123",
+        )
+        generated_analysis = AnalysisResponse(
+            idea_summary="Collaborative whiteboard for shared online drawing sessions.",
+            status="complete",
+            repositories=[fake_indexed],
+        )
+
+        fake_corpus = MagicMock()
+        fake_corpus.load_indexed_repository.return_value = None
+        fake_corpus.enqueue_index_job_placeholder.return_value = False
+        fake_corpus.index_repository_plan = AsyncMock(return_value=fake_indexed)
+
+        with (
+            patch("routers.research.search_repo_candidates", AsyncMock(return_value=[fake_candidate])),
+            patch("routers.research.fetch_shallow_repo_evidence_batch", AsyncMock(return_value=[fake_evidence])),
+            patch("routers.research.rank_repo_evidence", AsyncMock(return_value=[ranked])),
+            patch("routers.research.fetch_repo_snapshot", AsyncMock(return_value=fake_snapshot)),
+            patch("routers.research.CorpusService", return_value=fake_corpus),
+            patch("routers.research.RequestBudget.has_time_for", return_value=False),
+            patch("routers.research.generate_analysis", AsyncMock(return_value=generated_analysis)),
+        ):
+            response = self.client.post(
+                "/api/research",
+                json={"idea": "an app where friends can draw together online"},
+            )
+
+        self.assertEqual(200, response.status_code)
+        events = self._parse_sse(response.text)
+        progress_msgs = [event["message"] for event in events if event.get("type") == "progress"]
+
+        self.assertEqual(
+            [
+                "Extracting intent from your idea...",
+                "Searching GitHub for relevant repositories...",
+                "Analysing top candidates...",
+                "Indexing real-world code (this takes a moment)...",
+                "Generating your research report...",
+            ],
+            progress_msgs,
+        )
+        self.assertNotIn("Retrieving relevant code sections...", progress_msgs)
+
+
 if __name__ == "__main__":
     unittest.main()

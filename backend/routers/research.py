@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from time import perf_counter
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 
 from core.config import get_settings
 from models.schemas import (
@@ -43,10 +45,23 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["research"])
 
+_PROGRESS_EXTRACTING = "Extracting intent from your idea..."
+_PROGRESS_SEARCHING = "Searching GitHub for relevant repositories..."
+_PROGRESS_ANALYSING = "Analysing top candidates..."
+_PROGRESS_INDEXING = "Indexing real-world code (this takes a moment)..."
+_PROGRESS_RETRIEVING = "Retrieving relevant code sections..."
+_PROGRESS_GENERATING = "Generating your research report..."
 
-@router.post("/research", response_model=AnalysisResponse)
+
+def _sse(event: dict) -> str:
+    return f"data: {json.dumps(event)}\n\n"
+
+
 async def research_idea(request: IdeaRequest) -> AnalysisResponse:
-    """Run the project-research pipeline using staged ingestion and hybrid retrieval."""
+    """Plain async helper — run the full research pipeline and return AnalysisResponse.
+
+    Unit tests call this directly so the signature and return type must stay stable.
+    """
 
     settings = get_settings()
     budget = RequestBudget(total_seconds=settings.PIPELINE_REQUEST_BUDGET_SECONDS)
@@ -193,6 +208,185 @@ async def research_idea(request: IdeaRequest) -> AnalysisResponse:
     except Exception as exc:
         logger.exception("Research pipeline failed")
         raise HTTPException(status_code=500, detail=f"Research pipeline error: {exc}") from exc
+
+
+async def _research_sse_generator(request: IdeaRequest):
+    """Async generator that streams SSE events for the research pipeline."""
+
+    settings = get_settings()
+    budget = RequestBudget(total_seconds=settings.PIPELINE_REQUEST_BUDGET_SECONDS)
+
+    try:
+        logger.info("=" * 72)
+        logger.info("NEW RESEARCH REQUEST (SSE): %s", request.idea[:120])
+        logger.info("=" * 72)
+
+        # ── SILENT PREFLIGHT ─────────────────────────────────────────────────
+        keyword_started = perf_counter()
+        keywords = await extract_keywords(request.idea, request.clarification_answers)
+        logger.info("Keyword extraction completed in %.2fs", budget.record_stage("keyword_extraction", keyword_started))
+
+        clarification_questions = build_clarification_questions(keywords)
+        has_meaningful_answers = bool(
+            request.clarification_answers and any(value and value.strip() for value in request.clarification_answers.values())
+        )
+        if clarification_questions and not has_meaningful_answers:
+            logger.info("Returning %d clarification questions (SSE result event)", len(clarification_questions))
+            result = AnalysisResponse(
+                idea_summary=keywords.summary or request.idea,
+                keywords=keywords,
+                clarification_questions=clarification_questions,
+                assumptions=keywords.assumptions,
+                status="needs_clarification",
+            )
+            yield _sse({"type": "result", "data": json.loads(result.model_dump_json())})
+            return
+
+        # ── MAIN PIPELINE ─────────────────────────────────────────────────────
+        # Step 1 — already done during preflight; emit retroactively
+        yield _sse({"type": "progress", "message": _PROGRESS_EXTRACTING})
+
+        # Step 2 — search
+        yield _sse({"type": "progress", "message": _PROGRESS_SEARCHING})
+        search_started = perf_counter()
+        candidates = await search_repo_candidates(keywords)
+        for candidate in candidates:
+            _apply_baseline_fit_metrics(candidate)
+        logger.info(
+            "Candidate search completed in %.2fs with %d repos",
+            budget.record_stage("candidate_search", search_started),
+            len(candidates),
+        )
+
+        if not candidates:
+            yield _sse({"type": "progress", "message": _PROGRESS_GENERATING})
+            analysis = await generate_analysis(request.idea, keywords, [], {})
+            analysis.repo_descriptions = ["No strong GitHub reference repositories were found for this idea yet."]
+            logger.info("Research completed in %.2fs (no candidates, SSE)", perf_counter() - budget.started_at)
+            yield _sse({"type": "result", "data": json.loads(analysis.model_dump_json())})
+            return
+
+        # Step 3 — rerank / analyse candidates
+        yield _sse({"type": "progress", "message": _PROGRESS_ANALYSING})
+        rerank_started = perf_counter()
+        rerank_pool = candidates[: settings.RAG_README_RERANK_LIMIT]
+        shallow_evidence = await fetch_shallow_repo_evidence_batch(rerank_pool)
+        ranked_evidence = await rank_repo_evidence(request.idea, keywords, shallow_evidence)
+        logger.info(
+            "Shallow rerank completed in %.2fs for %d repositories",
+            budget.record_stage("shallow_rerank", rerank_started),
+            len(ranked_evidence),
+        )
+
+        selected = [evidence.repository for evidence in ranked_evidence[: settings.RAG_DEEP_INDEX_REPO_LIMIT]]
+        selected_evidence_map = {evidence.repository.full_name: evidence for evidence in ranked_evidence}
+        if not selected:
+            selected = candidates[: settings.RAG_DEEP_INDEX_REPO_LIMIT]
+
+        # Step 4 — indexing
+        yield _sse({"type": "progress", "message": _PROGRESS_INDEXING})
+        corpus_service = CorpusService()
+        index_started = perf_counter()
+        indexed_repositories = []
+        queued_jobs = 0
+        inline_plans = []
+
+        snapshot_pairs = await _fetch_selected_snapshots(selected)
+        for repository, snapshot in snapshot_pairs:
+            shallow = selected_evidence_map.get(repository.full_name)
+            plan = build_repo_fetch_plan(snapshot, keywords, shallow)
+            cached_repository = corpus_service.load_indexed_repository(plan.repository)
+            if cached_repository is not None:
+                indexed_repositories.append(_merge_ranked_repository_metrics(cached_repository, plan.repository))
+                continue
+
+            if settings.INDEXING_MODE.lower() == "background":
+                if len(inline_plans) < max(1, settings.RAG_INLINE_BOOTSTRAP_REPO_LIMIT):
+                    inline_plans.append(plan)
+                    continue
+                if corpus_service.enqueue_index_job_placeholder(plan):
+                    queued_jobs += 1
+                continue
+
+            inline_plans.append(plan)
+
+        if inline_plans:
+            newly_indexed = await _index_selected_plans(corpus_service, inline_plans)
+            indexed_repositories.extend(newly_indexed)
+
+        logger.info(
+            "Deep index preparation completed in %.2fs; %d repos ready and %d background jobs queued",
+            budget.record_stage("snapshot_and_index_stage", index_started),
+            len(indexed_repositories),
+            queued_jobs,
+        )
+
+        if not indexed_repositories:
+            analysis = await generate_analysis(request.idea, keywords, [], {})
+            analysis.status = "error"
+            analysis.error = "Deep repository indexing did not complete for any shortlisted repository."
+            analysis.repo_descriptions = [
+                "Deep repository analysis could not finish for the shortlisted repositories. Try again or reduce the scope of the idea."
+            ]
+            logger.info("Research completed in %.2fs (no deep repos ready, SSE)", perf_counter() - budget.started_at)
+            yield _sse({"type": "result", "data": json.loads(analysis.model_dump_json())})
+            return
+
+        # Step 5 — retrieval
+        section_hits = {}
+        if budget.has_time_for(settings.PIPELINE_RETRIEVAL_MIN_BUDGET_SECONDS):
+            yield _sse({"type": "progress", "message": _PROGRESS_RETRIEVING})
+            retrieval_plan_started = perf_counter()
+            retrieval_plan = await plan_retrieval_queries(request.idea, keywords, indexed_repositories)
+            logger.info("Retrieval plan completed in %.2fs", budget.record_stage("retrieval_planning", retrieval_plan_started))
+
+            retrieval_started = perf_counter()
+            retrieval_service = RetrievalService()
+            section_hits = await retrieval_service.retrieve(retrieval_plan, indexed_repositories)
+            logger.info("Retrieval completed in %.2fs", budget.record_stage("retrieval", retrieval_started))
+        else:
+            logger.info(
+                "Skipping deep retrieval because only %.2fs remain in the request budget",
+                budget.remaining_seconds(),
+            )
+
+        # Step 6 — generation
+        yield _sse({"type": "progress", "message": _PROGRESS_GENERATING})
+        generation_started = perf_counter()
+        analysis = await generate_analysis(
+            request.idea,
+            keywords,
+            indexed_repositories,
+            section_hits,
+        )
+        logger.info("Grounded generation completed in %.2fs", budget.record_stage("generation", generation_started))
+
+        for repository in analysis.repositories:
+            repository.files = []
+
+        logger.info(
+            "Research completed in %.2fs with stage timings: %s",
+            perf_counter() - budget.started_at,
+            budget.stage_durations,
+        )
+        yield _sse({"type": "result", "data": json.loads(analysis.model_dump_json())})
+
+    except Exception as exc:
+        logger.exception("Research pipeline failed in SSE stream")
+        yield _sse({"type": "error", "message": str(exc)})
+
+
+@router.post("/research")
+async def research_idea_stream(request: IdeaRequest) -> StreamingResponse:
+    """Stream research pipeline progress as Server-Sent Events."""
+    return StreamingResponse(
+        _research_sse_generator(request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/research/chat", response_model=RepoChatResponse)

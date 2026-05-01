@@ -1,52 +1,73 @@
 import { motion } from 'framer-motion';
+import { useAppStore } from '../store/useAppStore';
+import type { ProgressStep } from '../store/useAppStore';
 
-const messages = [
-  'Normalizing the idea into technical intent...',
-  'Checking if any build-critical details need clarification...',
-  'Searching GitHub for useful reference repositories...',
-  'Inspecting READMEs, manifests, and architecture clues...',
-  'Indexing the strongest repo evidence...',
-  'Building recommendations for architecture and stack...',
-  'Assembling the final build path...',
-];
+function StepIcon({ step }: { step: ProgressStep }) {
+  if (step.status === 'complete') {
+    return (
+      <motion.span
+        initial={{ scale: 0.5, opacity: 0 }}
+        animate={{ scale: 1, opacity: 1 }}
+        transition={{ type: 'spring', stiffness: 300, damping: 20 }}
+        className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-emerald-500/20 text-sm font-bold text-emerald-400"
+      >
+        {'\u2713'}
+      </motion.span>
+    );
+  }
+
+  if (step.status === 'current') {
+    return (
+      <motion.div
+        className="h-6 w-6 shrink-0 rounded-full border-2 border-accent-violet border-t-transparent"
+        animate={{ rotate: 360 }}
+        transition={{ duration: 0.85, repeat: Infinity, ease: 'linear' }}
+      />
+    );
+  }
+
+  return <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border-2 border-text-muted/20" />;
+}
 
 export function LoadingSpinner() {
-  return (
-    <div className="flex flex-col items-center justify-center min-h-[60vh] gap-8">
-      <div className="relative w-32 h-32">
-        <motion.div
-          className="absolute inset-0 rounded-full border-2 border-accent-violet/30"
-          animate={{ rotate: 360 }}
-          transition={{ duration: 3, repeat: Infinity, ease: 'linear' }}
-        />
-        <motion.div
-          className="absolute inset-2 rounded-full border-2 border-accent-fuchsia/40"
-          animate={{ rotate: -360 }}
-          transition={{ duration: 2.5, repeat: Infinity, ease: 'linear' }}
-        />
-        <motion.div
-          className="absolute inset-4 rounded-full border-2 border-accent-cyan/30"
-          animate={{ rotate: 360 }}
-          transition={{ duration: 2, repeat: Infinity, ease: 'linear' }}
-        />
-        <motion.div
-          className="absolute inset-0 m-auto w-4 h-4 rounded-full bg-gradient-to-r from-accent-violet to-accent-fuchsia"
-          animate={{ scale: [1, 1.3, 1] }}
-          transition={{ duration: 1.5, repeat: Infinity, ease: 'easeInOut' }}
-        />
-      </div>
+  const progressSteps = useAppStore((state) => state.progressSteps);
 
-      <div className="h-8 overflow-hidden">
-        <motion.div
-          animate={{ y: [0, -messages.length * 32] }}
-          transition={{ duration: messages.length * 3, repeat: Infinity, ease: 'linear' }}
-        >
-          {[...messages, ...messages].map((message, index) => (
-            <div key={index} className="h-8 flex items-center justify-center text-text-secondary text-sm font-medium">
-              {message}
-            </div>
-          ))}
-        </motion.div>
+  return (
+    <div className="flex min-h-[60vh] flex-col items-center justify-center gap-8">
+      <motion.div
+        className="h-14 w-14 rounded-full bg-gradient-to-br from-accent-violet via-accent-fuchsia to-accent-cyan opacity-70"
+        animate={{ scale: [1, 1.15, 1], opacity: [0.6, 0.9, 0.6] }}
+        transition={{ duration: 2.4, repeat: Infinity, ease: 'easeInOut' }}
+      />
+
+      <div
+        className="w-full max-w-sm space-y-4 rounded-2xl border border-border-glass bg-bg-card px-6 py-5 backdrop-blur-sm"
+        role="status"
+        aria-label="Research progress"
+      >
+        {progressSteps.map((step) => (
+          <motion.div
+            key={step.message}
+            initial={false}
+            animate={{ opacity: step.status === 'pending' ? 0.4 : 1 }}
+            transition={{ duration: 0.3 }}
+            className="flex items-center gap-3"
+          >
+            <StepIcon step={step} />
+            <span
+              className={[
+                'text-sm leading-snug transition-colors duration-300',
+                step.status === 'complete'
+                  ? 'text-text-secondary line-through decoration-text-muted/40'
+                  : step.status === 'current'
+                    ? 'font-medium text-text-primary'
+                    : 'text-text-muted',
+              ].join(' ')}
+            >
+              {step.message}
+            </span>
+          </motion.div>
+        ))}
       </div>
     </div>
   );
