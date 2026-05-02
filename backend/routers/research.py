@@ -106,7 +106,7 @@ async def research_idea(request: IdeaRequest) -> AnalysisResponse:
 
         rerank_started = perf_counter()
         rerank_pool = candidates[: settings.RAG_README_RERANK_LIMIT]
-        shallow_evidence = await fetch_shallow_repo_evidence_batch(rerank_pool)
+        shallow_evidence = await fetch_shallow_repo_evidence_batch(rerank_pool, keywords)
         ranked_evidence = await rank_repo_evidence(request.idea, keywords, shallow_evidence)
         logger.info(
             "Shallow rerank completed in %.2fs for %d repositories",
@@ -270,7 +270,7 @@ async def _research_sse_generator(request: IdeaRequest):
         yield _sse({"type": "progress", "message": _PROGRESS_ANALYSING})
         rerank_started = perf_counter()
         rerank_pool = candidates[: settings.RAG_README_RERANK_LIMIT]
-        shallow_evidence = await fetch_shallow_repo_evidence_batch(rerank_pool)
+        shallow_evidence = await fetch_shallow_repo_evidence_batch(rerank_pool, keywords)
         ranked_evidence = await rank_repo_evidence(request.idea, keywords, shallow_evidence)
         logger.info(
             "Shallow rerank completed in %.2fs for %d repositories",

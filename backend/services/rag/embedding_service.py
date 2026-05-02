@@ -115,7 +115,7 @@ class EmbeddingService:
         """
         if not text or not text.strip():
             logger.warning("embed_query() called with empty text — returning zero vector")
-            return [0.0] * self.dimension
+            return [0.0] * _EXPECTED_DIM
 
         results = await self._embed_batched([text.strip()], input_type="search_query")
         return results[0]
@@ -170,30 +170,33 @@ class EmbeddingService:
         self, texts: list[str], input_type: str
     ) -> list[list[float]]:
         """
-        Makes a single Cohere embed API call and returns the float vectors.
+        Makes a single Cohere embed API call with retry logic for rate limits.
 
-        embedding_types=["float"]:
-          Cohere v2 can return embeddings in multiple formats (float, int8, binary).
-          We explicitly request float — the same type pgvector expects — to avoid
-          any format mismatch. Without this, the API may return a default that
-          needs extra conversion.
-
-        Args:
-            texts:      A single batch (≤50 strings) to embed.
-            input_type: "search_document" or "search_query".
-
-        Returns:
-            List of float vectors, one per input text.
+        Retries up to 3 times with exponential backoff on 429 errors.
+        The trial tier limit is 100k tokens/minute — large indexing runs
+        can hit this when multiple batches fire concurrently.
         """
-        response = await self._client.embed(
-            texts=texts,
-            model=self.embedding_model_name,  # from settings: embed-english-light-v3.0
-            input_type=input_type,            # "search_document" or "search_query"
-            embedding_types=["float"],        # we only need float vectors for pgvector
-        )
+        from cohere.errors.too_many_requests_error import TooManyRequestsError
 
-        # response.embeddings.float_ is a list of lists (one per input text).
-        # We convert each inner list to a plain Python list[float] — psycopg
-        # and pgvector both expect standard Python types, not numpy arrays or
-        # Cohere wrapper objects.
-        return [list(embedding) for embedding in response.embeddings.float_]
+        for attempt in range(3):
+            try:
+                response = await self._client.embed(
+                    texts=texts,
+                    model=self.embedding_model_name,
+                    input_type=input_type,
+                    embedding_types=["float"],
+                )
+                return [list(embedding) for embedding in response.embeddings.float_]
+
+            except TooManyRequestsError:
+                if attempt == 2:
+                    logger.error("Cohere rate limit exceeded after 3 attempts — giving up")
+                    raise
+                wait = 5 * (2 ** attempt)  # 5s, then 10s
+                logger.warning(
+                    "Cohere rate limit hit (attempt %d/3), retrying in %ds...",
+                    attempt + 1, wait,
+                )
+                await asyncio.sleep(wait)
+
+        raise RuntimeError("Cohere embed call failed unexpectedly.")

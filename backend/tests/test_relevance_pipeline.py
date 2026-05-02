@@ -27,7 +27,13 @@ from models.schemas import (
 )
 from routers.research import chat_about_repositories, research_idea
 import services.github_service as github_service_module
-from services.github_service import build_repo_fetch_plan, build_search_queries, fetch_repo_snapshot, fetch_shallow_repo_evidence
+from services.github_service import (
+    build_repo_fetch_plan,
+    build_search_queries,
+    fetch_repo_snapshot,
+    fetch_shallow_repo_evidence,
+    search_repo_candidates,
+)
 from services.llm_service import build_clarification_questions, extract_keywords, generate_analysis, plan_retrieval_queries
 from services.pipeline_cache_service import clear_memory_caches
 from services.rag.ranking_service import rank_repo_evidence
@@ -579,17 +585,161 @@ class IntentExtractionTests(HermeticAsyncTestCase):
         self.assertIn("notifications", keywords.trivial_capabilities)
         self.assertNotIn("file uploads", keywords.primary_capabilities)
 
-    async def test_search_query_builder_prefers_batched_generation(self):
+    async def test_search_query_builder_combines_capability_and_batched_generation(self):
         keywords = await extract_keywords("an app where friends can draw together online")
+        self.fake_llm.generate_search_queries = AsyncMock(
+            side_effect=[
+                ["realtime collaboration repo"],
+                ["canvas rendering repo"],
+                ["presence repo"],
+                ["collaborative whiteboard reference"],
+            ]
+        )
         self.fake_llm.generate_search_queries_batch = AsyncMock(
             return_value=["collaborative whiteboard realtime collaboration", "shared canvas websocket"]
         )
-        self.fake_llm.generate_search_queries = AsyncMock(side_effect=AssertionError("legacy per-capability path should not run"))
 
-        queries = await build_search_queries(keywords)
+        with (
+            patch.object(github_service_module._persistent_cache, "get_json", return_value=None),
+            patch.object(github_service_module._persistent_cache, "set_json", return_value=None),
+        ):
+            queries = await build_search_queries(keywords)
 
+        self.assertEqual(4, self.fake_llm.generate_search_queries.await_count)
         self.fake_llm.generate_search_queries_batch.assert_awaited_once()
-        self.assertIn("collaborative whiteboard", " | ".join(queries).lower())
+        joined_queries = " | ".join(queries).lower()
+        self.assertIn("realtime collaboration repo", joined_queries)
+        self.assertIn("canvas rendering repo", joined_queries)
+        self.assertIn("presence repo", joined_queries)
+        self.assertIn("collaborative whiteboard", joined_queries)
+        self.assertIn("language:typescript", joined_queries)
+
+    async def test_search_query_builder_expands_concept_family_aliases(self):
+        keywords = await extract_keywords(
+            "A travel planner with chat, maps, and personalized recommendations",
+            {
+                "feature_priority": "chat messaging",
+                "platform": "Web app",
+            },
+        )
+
+        with (
+            patch.object(github_service_module._persistent_cache, "get_json", return_value=None),
+            patch.object(github_service_module._persistent_cache, "set_json", return_value=None),
+        ):
+            queries = await build_search_queries(keywords)
+
+        joined_queries = " | ".join(queries).lower()
+        self.assertIn("messaging", joined_queries)
+        self.assertIn("recommendation", joined_queries)
+
+    async def test_candidate_search_scores_repositories_with_semantic_coverage(self):
+        keywords = await extract_keywords("an app where friends can draw together online")
+
+        class FakeResponse:
+            def __init__(self, items: list[dict]) -> None:
+                self._items = items
+
+            def json(self) -> dict:
+                return {"items": self._items}
+
+            def raise_for_status(self) -> None:
+                return None
+
+        class SearchClient:
+            def __init__(self) -> None:
+                self.queries: list[str] = []
+
+            async def get(self, url: str, headers=None, params=None):
+                self.queries.append((params or {}).get("q", ""))
+                return FakeResponse(
+                    [
+                        {
+                            "full_name": "example/collab-board",
+                            "description": "Collaborative whiteboard with realtime collaboration, canvas rendering, and presence.",
+                            "html_url": "https://github.com/example/collab-board",
+                            "stargazers_count": 120,
+                            "language": "TypeScript",
+                            "topics": ["whiteboard", "canvas", "presence", "realtime"],
+                            "archived": False,
+                            "updated_at": "2026-04-18T10:00:00Z",
+                        },
+                        {
+                            "full_name": "popular/react-dashboard",
+                            "description": "Popular React dashboard starter.",
+                            "html_url": "https://github.com/popular/react-dashboard",
+                            "stargazers_count": 52000,
+                            "language": "TypeScript",
+                            "topics": ["react", "dashboard", "template"],
+                            "archived": False,
+                            "updated_at": "2026-04-18T10:00:00Z",
+                        },
+                    ]
+                )
+
+        client = SearchClient()
+        with (
+            patch("services.github_service.get_github_client", return_value=client),
+            patch.object(github_service_module._persistent_cache, "get_json", return_value=None),
+            patch.object(github_service_module._persistent_cache, "set_json", return_value=None),
+        ):
+            results = await search_repo_candidates(keywords)
+
+        self.assertGreaterEqual(len(client.queries), 1)
+        self.assertEqual("example/collab-board", results[0].full_name)
+        self.assertGreater(results[0].semantic_meta_score, 0.0)
+        self.assertGreaterEqual(results[0].query_hit_count, 1)
+        self.assertIn("concept-family coverage", " | ".join(results[0].rank_reasons))
+
+    async def test_candidate_search_prefers_higher_star_repo_when_both_are_relevant(self):
+        keywords = await extract_keywords("an app where friends can draw together online")
+
+        class FakeResponse:
+            def __init__(self, items: list[dict]) -> None:
+                self._items = items
+
+            def json(self) -> dict:
+                return {"items": self._items}
+
+            def raise_for_status(self) -> None:
+                return None
+
+        class SearchClient:
+            async def get(self, url: str, headers=None, params=None):
+                return FakeResponse(
+                    [
+                        {
+                            "full_name": "example/collab-enterprise",
+                            "description": "Collaborative whiteboard with realtime collaboration, canvas rendering, and presence.",
+                            "html_url": "https://github.com/example/collab-enterprise",
+                            "stargazers_count": 4200,
+                            "language": "TypeScript",
+                            "topics": ["whiteboard", "canvas", "presence", "realtime"],
+                            "archived": False,
+                            "updated_at": "2026-04-18T10:00:00Z",
+                        },
+                        {
+                            "full_name": "example/collab-lite",
+                            "description": "Collaborative whiteboard with realtime collaboration, canvas rendering, and presence.",
+                            "html_url": "https://github.com/example/collab-lite",
+                            "stargazers_count": 120,
+                            "language": "TypeScript",
+                            "topics": ["whiteboard", "canvas", "presence", "realtime"],
+                            "archived": False,
+                            "updated_at": "2026-04-18T10:00:00Z",
+                        },
+                    ]
+                )
+
+        with (
+            patch("services.github_service.get_github_client", return_value=SearchClient()),
+            patch.object(github_service_module._persistent_cache, "get_json", return_value=None),
+            patch.object(github_service_module._persistent_cache, "set_json", return_value=None),
+        ):
+            results = await search_repo_candidates(keywords)
+
+        self.assertEqual("example/collab-enterprise", results[0].full_name)
+        self.assertGreater(results[0].relevance_score, results[1].relevance_score)
 
 
 class RankingAndGenerationTests(HermeticAsyncTestCase):
@@ -843,6 +993,183 @@ class RankingAndGenerationTests(HermeticAsyncTestCase):
         self.assertIn("example/travel-chat-a", full_names)
         self.assertIn("example/travel-python", full_names)
         self.assertNotIn("example/travel-chat-b", full_names)
+
+    async def test_ranking_uses_sampled_code_to_rescue_vague_but_relevant_repo(self):
+        keywords = await extract_keywords("something like Uber for tutors")
+
+        vague_but_relevant = ShallowRepoEvidence(
+            repository=RepoSearchResult(
+                full_name="example/tutor-marketplace",
+                description="Marketplace backend for services",
+                html_url="https://github.com/example/tutor-marketplace",
+                stars=220,
+                language="Python",
+                topics=["marketplace", "booking", "payments"],
+            ),
+            readme="Service marketplace with accounts, scheduling modules, and API endpoints.",
+            sampled_files=[
+                RepoFile(
+                    path="services/booking/payments.py",
+                    content=(
+                        "def create_lesson_checkout(tutor_id, student_id): "
+                        "schedule lesson booking, tutor discovery, payout invoice, checkout session"
+                    ),
+                    size=124,
+                )
+            ],
+            sampled_paths=["services/booking/payments.py"],
+            highlighted_paths=["services/booking/payments.py"],
+        )
+        generic_starter = ShallowRepoEvidence(
+            repository=RepoSearchResult(
+                full_name="popular/marketplace-starter",
+                description="Marketplace starter kit",
+                html_url="https://github.com/popular/marketplace-starter",
+                stars=5400,
+                language="TypeScript",
+                topics=["starter", "dashboard", "marketplace"],
+            ),
+            readme="Starter kit for admin dashboards, CMS pages, analytics, and themes.",
+            sampled_files=[
+                RepoFile(
+                    path="src/admin/dashboard.ts",
+                    content="render charts reports theme admin analytics tables tenant settings",
+                    size=72,
+                )
+            ],
+            sampled_paths=["src/admin/dashboard.ts"],
+            highlighted_paths=["src/admin/dashboard.ts"],
+        )
+
+        ranked = await rank_repo_evidence(
+            "something like Uber for tutors",
+            keywords,
+            [generic_starter, vague_but_relevant],
+        )
+
+        self.assertEqual("example/tutor-marketplace", ranked[0].repository.full_name)
+        self.assertGreater(ranked[0].semantic_code_score, 0.0)
+        self.assertIn("sampled code semantic score", " | ".join(ranked[0].score_reasons))
+
+    async def test_ranking_keeps_end_to_end_references_ahead_of_subsystems_in_top_three(self):
+        keywords = await extract_keywords(
+            "A travel planner with chat, maps, and personalized recommendations",
+            {
+                "feature_priority": "chat messaging",
+                "platform": "Web app",
+            },
+        )
+
+        subsystem = ShallowRepoEvidence(
+            repository=RepoSearchResult(
+                full_name="example/travel-chat-service",
+                description="Realtime chat service for trip rooms",
+                html_url="https://github.com/example/travel-chat-service",
+                stars=6200,
+                language="TypeScript",
+                topics=["chat", "travel", "realtime"],
+                query_hit_count=4,
+            ),
+            readme="Chat messaging, rooms, websocket presence, and moderation for group trips.",
+            sampled_files=[
+                RepoFile(
+                    path="src/chat/socket.ts",
+                    content="chat messaging room websocket presence travel participants moderator",
+                    size=80,
+                )
+            ],
+            sampled_paths=["src/chat/socket.ts"],
+            highlighted_paths=["src/chat/socket.ts"],
+        )
+        end_to_end_a = ShallowRepoEvidence(
+            repository=RepoSearchResult(
+                full_name="example/travel-planner-a",
+                description="Travel planner with maps chat and recommendations",
+                html_url="https://github.com/example/travel-planner-a",
+                stars=1400,
+                language="Python",
+                topics=["travel", "maps", "chat", "recommendation"],
+                query_hit_count=3,
+            ),
+            readme=(
+                "Travel planner with chat messaging, maps integration, recommendation engine, itinerary editing, "
+                "installation steps, usage notes, and architecture guidance."
+            ),
+            sampled_files=[
+                RepoFile(
+                    path="planner/recommendations.py",
+                    content="trip planner recommendation engine maps itinerary chat messaging geospatial ranking",
+                    size=92,
+                )
+            ],
+            sampled_paths=["planner/recommendations.py"],
+            highlighted_paths=["planner/recommendations.py", "README.md"],
+        )
+        end_to_end_b = ShallowRepoEvidence(
+            repository=RepoSearchResult(
+                full_name="example/travel-planner-b",
+                description="Collaborative trip organizer with routing and group chat",
+                html_url="https://github.com/example/travel-planner-b",
+                stars=980,
+                language="Go",
+                topics=["travel", "routing", "chat", "recommendations"],
+                query_hit_count=3,
+            ),
+            readme=(
+                "Collaborative trip organizer covering maps integration, recommendation engine, chat messaging, "
+                "route planning, getting started, and architecture documentation."
+            ),
+            sampled_files=[
+                RepoFile(
+                    path="internal/routes/trips.go",
+                    content="maps integration recommendation engine chat messaging route planner geolocation",
+                    size=90,
+                )
+            ],
+            sampled_paths=["internal/routes/trips.go"],
+            highlighted_paths=["internal/routes/trips.go", "README.md"],
+        )
+        end_to_end_c = ShallowRepoEvidence(
+            repository=RepoSearchResult(
+                full_name="example/travel-planner-c",
+                description="Itinerary platform with destination discovery and group planning",
+                html_url="https://github.com/example/travel-planner-c",
+                stars=760,
+                language="Rust",
+                topics=["travel", "itinerary", "maps", "recommendations"],
+                query_hit_count=2,
+            ),
+            readme=(
+                "Itinerary platform with chat messaging, maps integration, recommendation engine, shared planning, "
+                "installation guide, usage docs, and architecture notes."
+            ),
+            sampled_files=[
+                RepoFile(
+                    path="src/itinerary/mod.rs",
+                    content="shared itinerary recommendation engine maps integration chat messaging planning",
+                    size=85,
+                )
+            ],
+            sampled_paths=["src/itinerary/mod.rs"],
+            highlighted_paths=["src/itinerary/mod.rs", "README.md"],
+        )
+
+        ranked = await rank_repo_evidence(
+            "A travel planner with chat, maps, and personalized recommendations",
+            keywords,
+            [subsystem, end_to_end_a, end_to_end_b, end_to_end_c],
+        )
+
+        top_three_names = [evidence.repository.full_name for evidence in ranked[:3]]
+        self.assertEqual(
+            [
+                "example/travel-planner-a",
+                "example/travel-planner-b",
+                "example/travel-planner-c",
+            ],
+            top_three_names,
+        )
+        self.assertTrue(all(evidence.repository.reference_type == "end_to_end" for evidence in ranked[:3]))
 
 
 class CacheAndFallbackTests(HermeticAsyncTestCase):

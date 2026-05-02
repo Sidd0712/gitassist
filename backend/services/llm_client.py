@@ -509,6 +509,8 @@ Instructions:
 - Favor phrases that would find end-to-end repos or strong subsystem references.
 - Keep the queries concise and realistic for GitHub repository search.
 - Avoid repeating the same terms with tiny wording changes.
+- Each query must be 2-5 words maximum. No long sentences.
+- Do not append the idea context to every query — use it only to choose the right terms.
 
 Return ONLY a JSON array of search query strings:
 ["query 1", "query 2", "query 3"]"""
@@ -540,6 +542,39 @@ Return ONLY a JSON array of search query strings:
             timeout_seconds=self.settings.LLM_AUX_TIMEOUT_SECONDS,
         )
         return queries if isinstance(queries, list) else []
+    
+    async def expand_capability_aliases(
+        self,
+        capabilities: list[str],
+        idea_context: str,
+        aliases_per_capability: int = 4,
+    ) -> dict[str, list[str]]:
+        """Generate synonyms and related search terms for each capability."""
+
+        prompt = f"""You are a JSON API. Return ONLY a JSON object, no explanation, no prose, no markdown.
+
+    Task: for each capability below, generate {aliases_per_capability} concise synonyms or related GitHub search terms.
+
+    Idea context: {idea_context[:200]}
+    Capabilities: {json.dumps(capabilities)}
+
+    Rules:
+    - Keys must exactly match the input capability strings
+    - Each value is a list of {aliases_per_capability} short search-friendly synonyms
+    - Synonyms should be terms a developer would use on GitHub, not marketing language
+    - Return nothing except the JSON object
+
+    {json.dumps({cap: ["synonym1", "synonym2", "synonym3", "synonym4"] for cap in capabilities})}
+
+    Replace the placeholder values with real synonyms and return the object:"""
+
+        result = await self._call_json_api(
+            prompt,
+            temperature=0.2,
+            max_tokens=800,
+            timeout_seconds=self.settings.LLM_AUX_TIMEOUT_SECONDS,
+        )
+        return result if isinstance(result, dict) else {}
 
     async def evaluate_repository_quality(self, repo_name: str, description: str, readme: str, topics: list[str]) -> dict:
         """Evaluate repository quality and relevance using AI."""

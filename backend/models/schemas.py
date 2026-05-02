@@ -137,12 +137,16 @@ class ShallowRepoEvidence(BaseModel):
     readme_path: str | None = None
     readme: str = ""
     manifest_files: list[RepoFile] = Field(default_factory=list)
+    sampled_files: list[RepoFile] = Field(default_factory=list)
+    sampled_paths: list[str] = Field(default_factory=list)
     highlighted_paths: list[str] = Field(default_factory=list)
     matched_keywords: list[str] = Field(default_factory=list)
     matched_frameworks: list[str] = Field(default_factory=list)
     matched_capabilities: list[str] = Field(default_factory=list)
+    concept_family_matches: list[str] = Field(default_factory=list)
     matched_stack_families: list[str] = Field(default_factory=list)
     capability_coverage: float = 0.0
+    semantic_code_score: float = 0.0
     score: float = 0.0
     score_reasons: list[str] = Field(default_factory=list)
 

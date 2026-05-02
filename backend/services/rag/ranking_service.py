@@ -2,19 +2,28 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
-import re
 from collections import Counter
 
 from core.config import get_settings
 from models.schemas import ExtractedKeywords, ShallowRepoEvidence
-from services.llm_service import get_ranking_weights
+from services.github_service import build_concept_families
 from services.rag.embedding_service import EmbeddingService
 
 logger = logging.getLogger(__name__)
 
-# LOW_VALUE_PATTERNS removed - now using AI to evaluate repository quality
+_FINAL_RANKING_WEIGHTS = {
+    "sampled_code_semantic": 0.24,
+    "readme_semantic": 0.16,
+    "metadata_semantic": 0.08,
+    "star_quality": 0.24,
+    "concept_family_coverage": 0.15,
+    "domain_alignment": 0.08,
+    "doc_quality": 0.03,
+    "query_diversity": 0.02,
+}
 
 
 async def rank_repo_evidence(
@@ -22,7 +31,7 @@ async def rank_repo_evidence(
     keywords: ExtractedKeywords,
     evidence_items: list[ShallowRepoEvidence],
 ) -> list[ShallowRepoEvidence]:
-    """Score, deduplicate, diversify, and select repositories by idea fit."""
+    """Score, deduplicate, and select repositories by end-to-end semantic fit."""
 
     if not evidence_items:
         return []
@@ -32,57 +41,137 @@ async def rank_repo_evidence(
     intent_text = _intent_text(keywords, idea)
     intent_embedding = await embedding_service.embed_query(intent_text)
     repo_texts = [_repo_text(evidence) for evidence in evidence_items]
-    repo_embeddings = await embedding_service.embed_documents(repo_texts)
+    metadata_texts = [_metadata_text(evidence.repository) for evidence in evidence_items]
+    readme_texts = [_readme_semantic_text(evidence) for evidence in evidence_items]
+    sampled_code_texts = [_sampled_code_text(evidence) for evidence in evidence_items]
+    repo_embeddings, metadata_embeddings, readme_embeddings, sampled_code_embeddings = await asyncio.gather(
+        embedding_service.embed_documents(repo_texts),
+        embedding_service.embed_documents(metadata_texts),
+        embedding_service.embed_documents(readme_texts),
+        embedding_service.embed_documents(sampled_code_texts),
+    )
     max_query_hits = max((evidence.repository.query_hit_count for evidence in evidence_items), default=1)
-    weights = await get_ranking_weights(idea, len(evidence_items))
+    concept_families = await build_concept_families(
+        keywords, idea_context=keywords.core_intent or keywords.summary, limit=6
+    )
+    concept_family_embeddings = await embedding_service.embed_documents(
+        [
+            " ".join(
+                [
+                    str(family.get("label", "")),
+                    *[str(alias) for alias in family.get("aliases", [])[:3]],
+                ]
+            ).strip()
+            for family in concept_families
+        ]
+    ) if concept_families else []
+    concept_embedding_map = {
+        str(family["canonical"]): embedding
+        for family, embedding in zip(concept_families, concept_family_embeddings)
+    }
+    weights = dict(_FINAL_RANKING_WEIGHTS)
 
-    for evidence, repo_embedding, repo_text in zip(evidence_items, repo_embeddings, repo_texts):
+    primary_lookup = {
+        _normalize_phrase(capability): capability
+        for capability in (keywords.primary_capabilities or keywords.capabilities[:3])
+    }
+    secondary_lookup = {
+        _normalize_phrase(capability): capability
+        for capability in (keywords.secondary_capabilities or keywords.capabilities[3:6])
+    }
+
+    for evidence, repo_embedding, metadata_embedding, readme_embedding, sampled_code_embedding, repo_text in zip(
+        evidence_items,
+        repo_embeddings,
+        metadata_embeddings,
+        readme_embeddings,
+        sampled_code_embeddings,
+        repo_texts,
+    ):
         repo = evidence.repository
         lowered = repo_text.lower()
-        primary_capabilities = keywords.primary_capabilities or keywords.capabilities[:3]
-        secondary_capabilities = keywords.secondary_capabilities or keywords.capabilities[3:6]
+        normalized_text = _normalize_phrase(repo_text)
         trivial_capabilities = keywords.trivial_capabilities or []
-
-        covered_primary = _matched_capabilities(primary_capabilities, lowered, keywords)
-        covered_secondary = _matched_capabilities(secondary_capabilities, lowered, keywords)
+        concept_scores = _concept_family_scores(concept_families, normalized_text, repo_embedding, concept_embedding_map)
+        covered_primary = [
+            capability
+            for canonical, capability in primary_lookup.items()
+            if concept_scores.get(canonical, 0.0) >= 0.52
+        ]
+        covered_secondary = [
+            capability
+            for canonical, capability in secondary_lookup.items()
+            if concept_scores.get(canonical, 0.0) >= 0.52
+        ]
         matched_trivial = _matched_capabilities(trivial_capabilities, lowered, keywords)
+        primary_capabilities = list(primary_lookup.values())
         missing_primary = [capability for capability in primary_capabilities if capability not in covered_primary]
 
-        semantic_readme_score = _cosine_similarity(intent_embedding, repo_embedding)
-        weighted_coverage = _weighted_coverage(keywords, lowered)
-        semantic_meta_score = repo.semantic_meta_score
+        semantic_readme_score = _cosine_similarity(intent_embedding, readme_embedding)
+        sampled_code_semantic_score = _cosine_similarity(intent_embedding, sampled_code_embedding)
+        weighted_coverage = _weighted_coverage_from_scores(keywords, concept_scores)
+        semantic_meta_score = repo.semantic_meta_score or _cosine_similarity(intent_embedding, metadata_embedding)
         query_diversity_score = repo.query_hit_count / max(max_query_hits, 1)
+        domain_alignment = _domain_alignment_score(keywords, normalized_text)
         doc_quality = _doc_quality_score(evidence.readme, evidence.manifest_files)
         quality_score = _repo_quality_score(repo)
-        low_value_penalty = _low_value_penalty(repo.full_name, repo.description or "", evidence.readme)
-        scope_penalty = _scope_mismatch_penalty(keywords, lowered)
+        low_value_penalty = min(0.18, _low_value_penalty(repo.full_name, repo.description or "", evidence.readme) * 1.5)
+        scope_penalty = min(0.20, _scope_mismatch_penalty(keywords, lowered))
+        low_semantic_code_penalty = (
+            0.15
+            if evidence.sampled_files and sampled_code_semantic_score < settings.RAG_SEMANTIC_MIN_RELEVANCE
+            else 0.0
+        )
+        reference_type = _classify_reference_type(
+            covered_primary,
+            weighted_coverage,
+            doc_quality,
+            sampled_code_semantic_score,
+            semantic_readme_score,
+        )
+        end_to_end_bonus = 0.10 if reference_type == "end_to_end" else 0.05 if reference_type == "subsystem" else 0.0
+        concept_breadth_bonus = 0.05 if len(covered_primary) >= 2 else 0.0
 
         final_score = (
-            weights.get("readme_semantic", 0.45) * semantic_readme_score
-            + weights.get("metadata_semantic", 0.20) * semantic_meta_score
-            + weights.get("capability_coverage", 0.20) * weighted_coverage
-            + weights.get("doc_quality", 0.07) * doc_quality
-            + weights.get("query_diversity", 0.04) * query_diversity_score
-            + weights.get("star_quality", 0.04) * quality_score
+            weights["sampled_code_semantic"] * sampled_code_semantic_score
+            + weights["readme_semantic"] * semantic_readme_score
+            + weights["metadata_semantic"] * semantic_meta_score
+            + weights["star_quality"] * quality_score
+            + weights["concept_family_coverage"] * weighted_coverage
+            + weights["domain_alignment"] * domain_alignment
+            + weights["doc_quality"] * doc_quality
+            + weights["query_diversity"] * query_diversity_score
+            + end_to_end_bonus
+            + concept_breadth_bonus
             - low_value_penalty
             - scope_penalty
+            - low_semantic_code_penalty
         )
 
         evidence.matched_capabilities = _dedupe_preserve([*covered_primary, *covered_secondary, *matched_trivial])
         evidence.matched_keywords = _matched_keywords(keywords.domain_terms or keywords.keywords, lowered)
         evidence.matched_frameworks = _matched_keywords(keywords.frameworks, lowered)
         evidence.matched_stack_families = _matched_keywords(keywords.tech_terms or keywords.likely_stack_families, lowered)
+        evidence.concept_family_matches = [
+            str(family["label"])
+            for family in concept_families
+            if concept_scores.get(str(family["canonical"]), 0.0) >= 0.52
+        ][:6]
         evidence.capability_coverage = round(weighted_coverage, 4)
+        evidence.semantic_code_score = round(sampled_code_semantic_score, 5)
         evidence.score = max(0.0, round(final_score, 4))
         evidence.score_reasons = _build_reasons(
             repo,
             covered_primary,
             covered_secondary,
             semantic_readme_score,
+            sampled_code_semantic_score,
             query_diversity_score,
+            domain_alignment,
             doc_quality,
             low_value_penalty,
             scope_penalty,
+            low_semantic_code_penalty,
         )
 
         repo.semantic_readme_score = round(semantic_readme_score, 5)
@@ -90,7 +179,7 @@ async def rank_repo_evidence(
         repo.relevance_score = evidence.score
         repo.covered_primary = covered_primary
         repo.missing_primary = missing_primary
-        repo.reference_type = _classify_reference_type(covered_primary, weighted_coverage, doc_quality)
+        repo.reference_type = reference_type
         repo.fit_summary = _build_fit_summary(repo.reference_type, covered_primary, covered_secondary, missing_primary)
         repo.rank_reasons = evidence.score_reasons
 
@@ -127,6 +216,7 @@ def _intent_text(keywords: ExtractedKeywords, idea: str) -> str:
 def _repo_text(evidence: ShallowRepoEvidence) -> str:
     repo = evidence.repository
     manifest_text = " ".join(file.content[:1200] for file in evidence.manifest_files[:3])
+    sampled_code_text = " ".join(file.content[:1600] for file in evidence.sampled_files[:3])
     return "\n".join(
         [
             repo.full_name,
@@ -134,9 +224,97 @@ def _repo_text(evidence: ShallowRepoEvidence) -> str:
             " ".join(repo.topics),
             evidence.readme[:12000],
             manifest_text,
+            sampled_code_text,
+            " ".join(evidence.highlighted_paths[:12]),
+            " ".join(evidence.sampled_paths[:6]),
+        ]
+    )
+
+
+def _metadata_text(repo) -> str:
+    return "\n".join(
+        [
+            repo.full_name,
+            repo.description or "",
+            " ".join(repo.topics),
+            repo.language or "",
+        ]
+    )
+
+
+def _readme_semantic_text(evidence: ShallowRepoEvidence) -> str:
+    manifest_text = " ".join(file.content[:1200] for file in evidence.manifest_files[:3])
+    return "\n".join(
+        [
+            evidence.readme[:12000],
+            manifest_text,
             " ".join(evidence.highlighted_paths[:12]),
         ]
     )
+
+
+def _sampled_code_text(evidence: ShallowRepoEvidence) -> str:
+    sampled_text = " ".join(file.content[:1600] for file in evidence.sampled_files[:3])
+    return "\n".join(
+        [
+            sampled_text,
+            " ".join(evidence.sampled_paths[:6]),
+        ]
+    )
+
+
+def _normalize_phrase(value: str) -> str:
+    return " ".join(part for part in value.lower().replace("_", " ").replace("-", " ").split() if part)
+
+
+def _concept_family_scores(
+    concept_families: list[dict[str, object]],
+    normalized_text: str,
+    repo_embedding: list[float],
+    concept_embedding_map: dict[str, list[float]],
+) -> dict[str, float]:
+    scores: dict[str, float] = {}
+    for family in concept_families:
+        canonical = str(family["canonical"])
+        aliases = [_normalize_phrase(str(alias)) for alias in family.get("aliases", []) if str(alias).strip()]
+        literal_hits = sum(1 for alias in aliases if alias and alias in normalized_text)
+        literal_score = min(1.0, literal_hits / max(1, min(len(aliases), 2)))
+        semantic_score = _cosine_similarity(repo_embedding, concept_embedding_map.get(canonical, []))
+        scores[canonical] = max(literal_score, semantic_score)
+    return scores
+
+
+def _weighted_coverage_from_scores(keywords: ExtractedKeywords, concept_scores: dict[str, float]) -> float:
+    weights = {
+        _normalize_phrase(capability): weight
+        for capability, weight in (keywords.capability_weights or {
+            capability: 1.0 for capability in (keywords.primary_capabilities or keywords.capabilities[:3])
+        }).items()
+    }
+    if not weights:
+        return 0.0
+
+    total_weight = sum(weights.values()) or 1.0
+    covered_weight = sum(weights.get(canonical, 0.0) * concept_scores.get(canonical, 0.0) for canonical in weights)
+    return min(covered_weight / total_weight, 1.0)
+
+
+def _domain_alignment_score(keywords: ExtractedKeywords, lowered_text: str) -> float:
+    terms = [
+        keywords.product_type,
+        *keywords.domain_terms[:6],
+        *keywords.likely_components[:4],
+    ]
+    normalized_terms = [
+        _normalize_phrase(term)
+        for term in terms
+        if isinstance(term, str) and term.strip()
+    ]
+    if not normalized_terms:
+        return 0.0
+    normalized_text = _normalize_phrase(lowered_text)
+    hits = sum(1 for term in normalized_terms if term and term in normalized_text)
+    return hits / len(normalized_terms)
 
 
 def _matched_capabilities(capabilities: list[str], lowered_text: str, keywords: ExtractedKeywords) -> list[str]:
@@ -243,12 +421,20 @@ def _low_value_penalty(full_name: str, description: str, readme: str) -> float:
     lowered = f"{full_name} {description} {readme[:800]}".lower()
     
     # Count generic tutorial/template indicators
-    tutorial_indicators = sum(1 for word in ["tutorial", "example", "template", "boilerplate", "starter"] if word in lowered)
+    tutorial_indicators = sum(
+        1
+        for word in ["tutorial", "example", "template", "boilerplate", "starter", "demo", "sample"]
+        if word in lowered
+    )
     if tutorial_indicators >= 2:
         penalty += 0.12
     elif tutorial_indicators == 1:
         penalty += 0.06
-    
+
+    docs_only_indicators = sum(1 for word in ["docs", "documentation", "guide"] if word in lowered)
+    if docs_only_indicators >= 2 and "src/" not in lowered and "app/" not in lowered:
+        penalty += 0.08
+
     return min(penalty, 0.25)
 
 
@@ -273,10 +459,24 @@ def _scope_mismatch_penalty(keywords: ExtractedKeywords, repo_text: str) -> floa
     return 0.0
 
 
-def _classify_reference_type(covered_primary: list[str], weighted_coverage: float, doc_quality: float) -> str:
-    if len(covered_primary) >= 2 and weighted_coverage >= 0.55 and doc_quality >= 0.35:
+def _classify_reference_type(
+    covered_primary: list[str],
+    weighted_coverage: float,
+    doc_quality: float,
+    sampled_code_semantic_score: float,
+    semantic_readme_score: float,
+) -> str:
+    if (
+        len(covered_primary) >= 2
+        and weighted_coverage >= 0.55
+        and doc_quality >= 0.25
+        and (
+            sampled_code_semantic_score >= 0.34
+            or semantic_readme_score >= 0.42
+        )
+    ):
         return "end_to_end"
-    if covered_primary or weighted_coverage >= 0.3:
+    if covered_primary or weighted_coverage >= 0.35 or sampled_code_semantic_score >= get_settings().RAG_SEMANTIC_MIN_RELEVANCE:
         return "subsystem"
     return "pattern"
 
@@ -302,10 +502,13 @@ def _build_reasons(
     covered_primary: list[str],
     covered_secondary: list[str],
     semantic_readme_score: float,
+    sampled_code_semantic_score: float,
     query_diversity_score: float,
+    domain_alignment: float,
     doc_quality: float,
     low_value_penalty: float,
     scope_penalty: float,
+    low_semantic_code_penalty: float,
 ) -> list[str]:
     reasons: list[str] = []
     if covered_primary:
@@ -313,14 +516,20 @@ def _build_reasons(
     elif covered_secondary:
         reasons.append(f"covers supporting capabilities: {', '.join(covered_secondary[:3])}")
     reasons.append(f"README semantic score {semantic_readme_score:.2f}")
+    if sampled_code_semantic_score > 0:
+        reasons.append(f"sampled code semantic score {sampled_code_semantic_score:.2f}")
     if repo.query_hit_count:
         reasons.append(f"matched {repo.query_hit_count} search families")
+    if domain_alignment >= 0.25:
+        reasons.append(f"domain alignment {domain_alignment:.2f}")
     if doc_quality >= 0.45:
         reasons.append("good implementation docs or manifests")
     if low_value_penalty > 0:
         reasons.append("discounted as likely template/tutorial/test-style repo")
     if scope_penalty > 0:
         reasons.append("discounted for emphasizing implementation scope outside the resolved idea")
+    if low_semantic_code_penalty > 0:
+        reasons.append("discounted because sampled code did not strongly match the resolved product intent")
     if query_diversity_score >= 0.6:
         reasons.append("appeared across multiple idea-focused query families")
     return reasons[:6]
@@ -357,40 +566,75 @@ def _select_diverse_covering(
     selected: list[ShallowRepoEvidence] = []
     covered_primary: set[str] = set()
     language_counts: Counter[str] = Counter()
-    remaining = evidence_items[:]
-    needs_end_to_end = True
+    remaining = sorted(evidence_items, key=lambda evidence: evidence.repository.fit_score, reverse=True)
+    preferred_slots = min(3, output_limit)
+
+    def _can_add(repo) -> bool:
+        language = (repo.language or "Unknown").strip() or "Unknown"
+        return language_counts[language] < max_per_language
+
+    def _selection_score(evidence: ShallowRepoEvidence, prefer_end_to_end: bool) -> float:
+        repo = evidence.repository
+        uncovered = len([capability for capability in repo.covered_primary if capability not in covered_primary])
+        language = (repo.language or "Unknown").strip() or "Unknown"
+        language_penalty = 0.03 * language_counts[language]
+        missing_penalty = 0.04 * len(repo.missing_primary[:2])
+        reference_bonus = 0.12 if prefer_end_to_end and repo.reference_type == "end_to_end" else 0.03 if repo.reference_type == "subsystem" else 0.0
+        if not prefer_end_to_end and repo.reference_type == "end_to_end":
+            reference_bonus = 0.04
+        return repo.fit_score + (0.08 * uncovered) + reference_bonus - missing_penalty - language_penalty
+
+    while remaining and len(selected) < preferred_slots:
+        best: ShallowRepoEvidence | None = None
+        best_score = float("-inf")
+        for evidence in remaining:
+            repo = evidence.repository
+            if not _can_add(repo):
+                continue
+            selection_score = _selection_score(evidence, prefer_end_to_end=True)
+            if selection_score > best_score:
+                best = evidence
+                best_score = selection_score
+
+        if best is None:
+            break
+
+        selected.append(best)
+        covered_primary.update(best.repository.covered_primary)
+        language = (best.repository.language or "Unknown").strip() or "Unknown"
+        language_counts[language] += 1
+        remaining = [evidence for evidence in remaining if evidence.repository.full_name != best.repository.full_name]
 
     while remaining and len(selected) < output_limit:
         best: ShallowRepoEvidence | None = None
         best_score = float("-inf")
         for evidence in remaining:
             repo = evidence.repository
-            language = (repo.language or "Unknown").strip() or "Unknown"
-            if language_counts[language] >= max_per_language:
+            if not _can_add(repo):
                 continue
-
-            uncovered = len([capability for capability in repo.covered_primary if capability not in covered_primary])
-            end_to_end_bonus = 0.15 if needs_end_to_end and repo.reference_type == "end_to_end" else 0.0
-            missing_penalty = 0.04 * len(repo.missing_primary[:2])
-            language_penalty = 0.03 * language_counts[language]
-            selection_score = repo.fit_score + (0.12 * uncovered) + end_to_end_bonus - missing_penalty - language_penalty
-
+            selection_score = _selection_score(evidence, prefer_end_to_end=False)
             if selection_score > best_score:
                 best = evidence
                 best_score = selection_score
 
         if best is None:
-            best = remaining[0]
+            break
 
         selected.append(best)
         covered_primary.update(best.repository.covered_primary)
         language = (best.repository.language or "Unknown").strip() or "Unknown"
         language_counts[language] += 1
-        needs_end_to_end = needs_end_to_end and best.repository.reference_type != "end_to_end"
         remaining = [evidence for evidence in remaining if evidence.repository.full_name != best.repository.full_name]
 
-        if primary_capabilities and covered_primary.issuperset(primary_capabilities[: len(primary_capabilities)]):
-            remaining.sort(key=lambda evidence: evidence.repository.fit_score, reverse=True)
+    if len(selected) < output_limit:
+        already_selected = {evidence.repository.full_name for evidence in selected}
+        for evidence in evidence_items:
+            if len(selected) >= output_limit:
+                break
+            if evidence.repository.full_name in already_selected:
+                continue
+            selected.append(evidence)
+            already_selected.add(evidence.repository.full_name)
 
     return selected
 
