@@ -51,15 +51,20 @@ class Settings(BaseSettings):
     RAG_SEARCH_PER_QUERY: int = 20
     RAG_DEEP_INDEX_REPO_LIMIT: int = 5
     RAG_INLINE_BOOTSTRAP_REPO_LIMIT: int = 5
-    RAG_SHALLOW_CODE_SAMPLE_COUNT: int = 5
+    # RAG limits — tuned for full-repo ingestion on Cohere free tier (1000 calls/month).
+    # Math: 120 files × ~5 avg chunks × 5 repos = 3000 chunks ÷ 50 batch = 60 embed
+    # calls for indexing + ~11 other calls = ~71 total per fresh request (~14/month).
+    # asyncio.gather fires all batches concurrently so wall-clock time ≈ slowest batch
+    # (~1.5s), not the sum — fits comfortably within the 150s request budget.
+    RAG_SHALLOW_CODE_SAMPLE_COUNT: int = 8  # was 5; more diverse ranking signal
     RAG_SHALLOW_CODE_SAMPLE_MAX_CHARS: int = 6_000
     RAG_SEMANTIC_MIN_RELEVANCE: float = 0.30
-    RAG_MAX_FILES_PER_REPO: int = 60
-    RAG_MAX_CHARS_PER_REPO: int = 400_000
+    RAG_MAX_FILES_PER_REPO: int = 120        # was 60 — doubled for full-repo ingestion
+    RAG_MAX_CHARS_PER_REPO: int = 1_500_000  # was 400_000 — fits 120 files at avg 12KB
     RAG_MAX_FILE_SIZE: int = 80_000
     RAG_ARCHIVE_MAX_BYTES: int = 25_000_000
     RAG_ARCHIVE_MAX_EXTRACTED_BYTES: int = 20_000_000
-    RAG_ARCHIVE_MAX_FILES: int = 400
+    RAG_ARCHIVE_MAX_FILES: int = 500  # was 400 — wider scan window before zip cutoff
     RAG_CHUNK_TOKENS: int = 300
     RAG_CHUNK_OVERLAP: int = 60
     RAG_SECTION_TOP_K: int = 8
@@ -78,7 +83,7 @@ class Settings(BaseSettings):
     INDEXER_MAX_CONCURRENCY: int = 3
     RAG_DB_POOL_MIN_SIZE: int = 1
     RAG_DB_POOL_MAX_SIZE: int = 4
-    PIPELINE_REQUEST_BUDGET_SECONDS: int = 110
+    PIPELINE_REQUEST_BUDGET_SECONDS: int = 150  # was 110 — accommodates deeper indexing
     PIPELINE_RETRIEVAL_MIN_BUDGET_SECONDS: int = 25
     GITHUB_HTTP_TIMEOUT_SECONDS: int = 30
     GITHUB_MAX_CONNECTIONS: int = 20

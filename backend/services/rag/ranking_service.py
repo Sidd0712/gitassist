@@ -54,7 +54,14 @@ async def rank_repo_evidence(
     concept_families = await build_concept_families(
         keywords, idea_context=keywords.core_intent or keywords.summary, limit=6
     )
-    concept_family_embeddings = await embedding_service.embed_documents(
+    # CRITICAL: embed concept families as search_query vectors, NOT search_document.
+    # Concept family texts (label + aliases) represent semantic intents \u2014 "what we
+    # are looking for". They must be paired with repo embeddings (search_document)
+    # using Cohere's asymmetric retrieval model. Using embed_documents here embeds
+    # both sides as search_document, producing depressed cosine scores (0.30\u20130.48)
+    # that fall below the 0.52 threshold \u2014 causing every capability to show as
+    # "Missing" and blocking the end_to_end_bonus and concept_breadth_bonus entirely.
+    concept_family_embeddings = await embedding_service.embed_queries_batch(
         [
             " ".join(
                 [

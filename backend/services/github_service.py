@@ -48,7 +48,12 @@ _SEARCH_CACHE_VERSION = 5
 
 SKIP_PATH_PARTS = {
     "node_modules", "vendor", ".git", "dist", "build", "coverage",
-    "test", "tests", "__pycache__", ".next", ".nuxt", "target",
+    # NOTE: "test" and "tests" intentionally omitted — integration test files
+    # often contain real feature demonstrations that are valuable for chat retrieval.
+    # The chunker classifies them as role="test" and _path_priority gives them the
+    # lowest priority score (20), so they only fill budget after all implementation
+    # files are already selected.
+    "__pycache__", ".next", ".nuxt", "target",
     "bin", "obj", "packages", ".vscode", ".idea",
 }
 
@@ -73,9 +78,19 @@ _IMPL_ROUTE_TOKENS = (
 _IMPL_ENTRY_TOKENS = ("main.", "app.", "server.", "api.", "index.")
 _DOC_TOKENS = ("/docs/", "/doc/", "guide", "tutorial", "example", "demo", "sample")
 
-# Minimum cosine similarity to consider a repo as "covering" a concept family.
-# Single tunable constant — no per-domain tables.
-_CAPABILITY_COVERAGE_THRESHOLD = 0.52
+# Minimum cosine similarity to consider a repo as "covering" a concept family
+# during candidate search (metadata-only context: name + description + topics).
+#
+# WHY 0.42 and not 0.52:
+# This threshold is evaluated against sparse repo metadata embeddings — just
+# the repo name, a one-line description, and a few topic tags. Even with the
+# correct Cohere input_type (search_query vs search_document), sparse metadata
+# text produces lower cosine similarity than rich text (README + source code).
+# The stricter 0.52 threshold is used in ranking_service.py where the full
+# README + sampled code is available. Setting 0.52 here caused all candidate
+# repos to show capabilities as "Missing" even when the description clearly
+# mentioned them.
+_CAPABILITY_COVERAGE_THRESHOLD = 0.42
 
 
 @dataclass(frozen=True)
@@ -530,7 +545,12 @@ async def _compute_concept_family_embeddings(
         ]).strip()
         for f in concept_families
     ]
-    embeddings = await embedding_service.embed_documents(texts)
+    # IMPORTANT: use embed_queries_batch (search_query input_type), NOT embed_documents.
+    # Concept family texts are semantic intent descriptions — "what we are looking for".
+    # They must be compared against search_document repo metadata embeddings using
+    # Cohere's asymmetric retrieval pairing. Using embed_documents here would make
+    # both sides search_document, depressing scores below the coverage threshold.
+    embeddings = await embedding_service.embed_queries_batch(texts)
     return {str(f["canonical"]): emb for f, emb in zip(concept_families, embeddings)}
 
 

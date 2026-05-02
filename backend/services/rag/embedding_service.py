@@ -120,6 +120,35 @@ class EmbeddingService:
         results = await self._embed_batched([text.strip()], input_type="search_query")
         return results[0]
 
+    async def embed_queries_batch(self, texts: list[str]) -> list[list[float]]:
+        """
+        Embed a list of semantic intent strings as search_query vectors.
+
+        IMPORTANT: Use this method — not embed_documents — when embedding
+        concept families, capability labels, or any text that represents
+        "what we are looking for" rather than "content we have found".
+
+        Background: Cohere's retrieval model is asymmetrically trained.
+        Query vectors (search_query) and document vectors (search_document)
+        live in different subspaces that are compatible with each other.
+        Comparing two search_document vectors (e.g. a concept label embedded
+        as a document vs a repo chunk embedded as a document) produces
+        depressed cosine scores in the 0.30–0.48 range instead of the
+        expected 0.55–0.80. This was the root cause of every capability
+        showing as "Missing" — all scores fell below the 0.52 threshold.
+
+        Args:
+            texts: List of intent/concept strings to embed as queries.
+                   Typical callers: _compute_concept_family_embeddings,
+                   rank_repo_evidence concept family block.
+
+        Returns:
+            List of float vectors in the same order. Each vector is length 384.
+        """
+        if not texts:
+            return []
+        return await self._embed_batched(texts, input_type="search_query")
+
     # ------------------------------------------------------------------
     # Private: batching logic
     # ------------------------------------------------------------------
