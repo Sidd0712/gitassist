@@ -5,9 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
+import time
+from collections import defaultdict
 from time import perf_counter
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from core.config import get_settings
@@ -55,6 +58,38 @@ _PROGRESS_GENERATING = "Generating your research report..."
 
 def _sse(event: dict) -> str:
     return f"data: {json.dumps(event)}\n\n"
+
+
+# ── Auth + rate limiting ────────────────────────────────────────────────────
+# Single-operator tool: a shared API key gate plus a simple per-IP rolling-hour
+# counter is enough to stop a leaked URL from running up GitHub/Groq/Cohere
+# usage. Neither is meant to hold up under multi-instance/multi-tenant load.
+
+_rate_limit_buckets: dict[str, list[float]] = defaultdict(list)
+
+
+def _require_api_key(x_api_key: str | None = Header(default=None)) -> None:
+    settings = get_settings()
+    if not settings.API_KEY:
+        return
+    if not x_api_key or not secrets.compare_digest(x_api_key, settings.API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
+
+def _enforce_rate_limit(http_request: Request) -> None:
+    settings = get_settings()
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    now = time.monotonic()
+    window_start = now - 3600
+    bucket = _rate_limit_buckets[client_ip]
+    while bucket and bucket[0] < window_start:
+        bucket.pop(0)
+    if len(bucket) >= settings.RATE_LIMIT_PER_HOUR:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again later.")
+    bucket.append(now)
+
+
+_guarded = [Depends(_require_api_key), Depends(_enforce_rate_limit)]
 
 
 async def research_idea(request: IdeaRequest) -> AnalysisResponse:
@@ -127,7 +162,6 @@ async def research_idea(request: IdeaRequest) -> AnalysisResponse:
         corpus_service = CorpusService()
         index_started = perf_counter()
         indexed_repositories = []
-        queued_jobs = 0
         inline_plans = []
 
         snapshot_pairs = await _fetch_selected_snapshots(selected)
@@ -139,14 +173,6 @@ async def research_idea(request: IdeaRequest) -> AnalysisResponse:
                 indexed_repositories.append(_merge_ranked_repository_metrics(cached_repository, plan.repository))
                 continue
 
-            if settings.INDEXING_MODE.lower() == "background":
-                if len(inline_plans) < max(1, settings.RAG_INLINE_BOOTSTRAP_REPO_LIMIT):
-                    inline_plans.append(plan)
-                    continue
-                if corpus_service.enqueue_index_job_placeholder(plan):
-                    queued_jobs += 1
-                continue
-
             inline_plans.append(plan)
 
         if inline_plans:
@@ -154,10 +180,9 @@ async def research_idea(request: IdeaRequest) -> AnalysisResponse:
             indexed_repositories.extend(newly_indexed)
 
         logger.info(
-            "Deep index preparation completed in %.2fs; %d repos ready and %d background jobs queued",
+            "Deep index preparation completed in %.2fs; %d repos ready",
             budget.record_stage("snapshot_and_index_stage", index_started),
             len(indexed_repositories),
-            queued_jobs,
         )
 
         if not indexed_repositories:
@@ -210,11 +235,17 @@ async def research_idea(request: IdeaRequest) -> AnalysisResponse:
         raise HTTPException(status_code=500, detail=f"Research pipeline error: {exc}") from exc
 
 
-async def _research_sse_generator(request: IdeaRequest):
+async def _research_sse_generator(request: IdeaRequest, http_request: Request):
     """Async generator that streams SSE events for the research pipeline."""
 
     settings = get_settings()
     budget = RequestBudget(total_seconds=settings.PIPELINE_REQUEST_BUDGET_SECONDS)
+
+    async def _client_gone() -> bool:
+        if await http_request.is_disconnected():
+            logger.info("Client disconnected mid-stream; stopping research pipeline early")
+            return True
+        return False
 
     try:
         logger.info("=" * 72)
@@ -242,6 +273,9 @@ async def _research_sse_generator(request: IdeaRequest):
             yield _sse({"type": "result", "data": json.loads(result.model_dump_json())})
             return
 
+        if await _client_gone():
+            return
+
         # ── MAIN PIPELINE ─────────────────────────────────────────────────────
         # Step 1 — already done during preflight; emit retroactively
         yield _sse({"type": "progress", "message": _PROGRESS_EXTRACTING})
@@ -266,6 +300,9 @@ async def _research_sse_generator(request: IdeaRequest):
             yield _sse({"type": "result", "data": json.loads(analysis.model_dump_json())})
             return
 
+        if await _client_gone():
+            return
+
         # Step 3 — rerank / analyse candidates
         yield _sse({"type": "progress", "message": _PROGRESS_ANALYSING})
         rerank_started = perf_counter()
@@ -283,12 +320,14 @@ async def _research_sse_generator(request: IdeaRequest):
         if not selected:
             selected = candidates[: settings.RAG_DEEP_INDEX_REPO_LIMIT]
 
+        if await _client_gone():
+            return
+
         # Step 4 — indexing
         yield _sse({"type": "progress", "message": _PROGRESS_INDEXING})
         corpus_service = CorpusService()
         index_started = perf_counter()
         indexed_repositories = []
-        queued_jobs = 0
         inline_plans = []
 
         snapshot_pairs = await _fetch_selected_snapshots(selected)
@@ -300,25 +339,23 @@ async def _research_sse_generator(request: IdeaRequest):
                 indexed_repositories.append(_merge_ranked_repository_metrics(cached_repository, plan.repository))
                 continue
 
-            if settings.INDEXING_MODE.lower() == "background":
-                if len(inline_plans) < max(1, settings.RAG_INLINE_BOOTSTRAP_REPO_LIMIT):
-                    inline_plans.append(plan)
-                    continue
-                if corpus_service.enqueue_index_job_placeholder(plan):
-                    queued_jobs += 1
-                continue
-
             inline_plans.append(plan)
 
         if inline_plans:
-            newly_indexed = await _index_selected_plans(corpus_service, inline_plans)
+            try:
+                newly_indexed = await asyncio.wait_for(
+                    _index_selected_plans(corpus_service, inline_plans),
+                    timeout=max(1.0, budget.remaining_seconds()),
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Deep indexing exceeded remaining request budget; continuing with repos indexed so far")
+                newly_indexed = []
             indexed_repositories.extend(newly_indexed)
 
         logger.info(
-            "Deep index preparation completed in %.2fs; %d repos ready and %d background jobs queued",
+            "Deep index preparation completed in %.2fs; %d repos ready",
             budget.record_stage("snapshot_and_index_stage", index_started),
             len(indexed_repositories),
-            queued_jobs,
         )
 
         if not indexed_repositories:
@@ -330,6 +367,9 @@ async def _research_sse_generator(request: IdeaRequest):
             ]
             logger.info("Research completed in %.2fs (no deep repos ready, SSE)", perf_counter() - budget.started_at)
             yield _sse({"type": "result", "data": json.loads(analysis.model_dump_json())})
+            return
+
+        if await _client_gone():
             return
 
         # Step 5 — retrieval
@@ -349,6 +389,9 @@ async def _research_sse_generator(request: IdeaRequest):
                 "Skipping deep retrieval because only %.2fs remain in the request budget",
                 budget.remaining_seconds(),
             )
+
+        if await _client_gone():
+            return
 
         # Step 6 — generation
         yield _sse({"type": "progress", "message": _PROGRESS_GENERATING})
@@ -376,11 +419,11 @@ async def _research_sse_generator(request: IdeaRequest):
         yield _sse({"type": "error", "message": str(exc)})
 
 
-@router.post("/research")
-async def research_idea_stream(request: IdeaRequest) -> StreamingResponse:
+@router.post("/research", dependencies=_guarded)
+async def research_idea_stream(request: IdeaRequest, http_request: Request) -> StreamingResponse:
     """Stream research pipeline progress as Server-Sent Events."""
     return StreamingResponse(
-        _research_sse_generator(request),
+        _research_sse_generator(request, http_request),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -389,7 +432,7 @@ async def research_idea_stream(request: IdeaRequest) -> StreamingResponse:
     )
 
 
-@router.post("/research/chat", response_model=RepoChatResponse)
+@router.post("/research/chat", response_model=RepoChatResponse, dependencies=_guarded)
 async def chat_about_repositories(request: RepoChatRequest) -> RepoChatResponse:
     """Answer a grounded chat question using only the indexed repositories in scope."""
 

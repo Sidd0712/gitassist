@@ -70,6 +70,7 @@ SOURCE_EXTENSIONS = {
     ".kt", ".scala", ".r", ".m", ".vue", ".svelte", ".dart",
     ".sh", ".bash", ".sql", ".graphql", ".proto", ".yaml", ".yml",
     ".json", ".xml", ".md", ".txt", ".toml", ".ini", ".cfg",
+    ".html", ".css", ".scss", ".less",
 }
 
 _IMPL_ROUTE_TOKENS = (
@@ -1143,6 +1144,7 @@ def build_repo_fetch_plan(
         intent,
         matched_capabilities=shallow.matched_capabilities[:4] if shallow else None,
     )
+    total_blobs = sum(1 for e in snapshot.tree if e.type == "blob")
     prioritized = sorted(
         (
             e for e in snapshot.tree
@@ -1150,6 +1152,10 @@ def build_repo_fetch_plan(
         ),
         key=lambda e: (_path_priority(e.path, idea_terms), e.size * -1),
         reverse=True,
+    )
+    logger.info(
+        "%s: %d/%d files in tree are index-eligible (extension/path/size filters)",
+        snapshot.full_name, len(prioritized), total_blobs,
     )
 
     selected_paths: list[str] = []
@@ -1169,6 +1175,16 @@ def build_repo_fetch_plan(
         selected_paths.append(entry.path)
         selected_set.add(entry.path)
         estimated_chars += entry.size
+
+    if skipped_paths:
+        logger.warning(
+            "%s: fetch plan truncated by budget — indexed %d/%d eligible files "
+            "(%d chars/%d budget); %d files skipped, e.g. %s",
+            snapshot.full_name,
+            len(selected_paths), len(selected_paths) + len(skipped_paths),
+            estimated_chars, settings.RAG_MAX_CHARS_PER_REPO,
+            len(skipped_paths), skipped_paths[:5],
+        )
 
     repo_payload = snapshot.model_dump(exclude={"tree", "search_queries", "files"})
     ranked_overrides = shallow.repository.model_dump(

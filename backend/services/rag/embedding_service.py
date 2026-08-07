@@ -11,8 +11,11 @@ logger = logging.getLogger(__name__)
 
 # Cohere's batch limit per API call.
 # embed-english-light-v3.0 supports up to 96 texts per call.
-# We use 50 to stay safely under and keep individual payloads small.
-_BATCH_SIZE = 50
+# The free tier's 1000 calls/month is metered by call count, not tokens, so
+# packing each call to the documented max directly buys more effective quota —
+# there's no per-call token cap tight enough at our chunk size (RAG_CHUNK_TOKENS)
+# to make a smaller batch worthwhile.
+_BATCH_SIZE = 96
 _EXPECTED_DIM = 384
 
 

@@ -37,7 +37,6 @@ async def lifespan(app: FastAPI):
     )
     logger.info("  Candidate repo limit: %d", settings.RAG_CANDIDATE_REPO_LIMIT)
     logger.info("  Deep index repo limit: %d", settings.RAG_DEEP_INDEX_REPO_LIMIT)
-    logger.info("  Inline bootstrap repo limit: %d", settings.RAG_INLINE_BOOTSTRAP_REPO_LIMIT)
     logger.info("  PGVECTOR_DIMENSION loaded as: %d", settings.PGVECTOR_DIMENSION)
     yield
     await close_github_client()
@@ -55,8 +54,8 @@ app = FastAPI(
 settings = get_settings()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=[settings.FRONTEND_URL],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

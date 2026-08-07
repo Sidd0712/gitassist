@@ -51,3 +51,5 @@ node_modules/
 .nuxt/
 dist/
 build/
+CLAUDE.md
+.claude/

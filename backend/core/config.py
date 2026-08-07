@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     # CORS
     FRONTEND_URL: str = "http://localhost:5173"
 
+    # Auth
+    API_KEY: str = ""  # If set, required via X-API-Key header on /research and /research/chat
+    RATE_LIMIT_PER_HOUR: int = 20  # Max /research calls per IP per rolling hour
+
     # GitHub
     GITHUB_TOKEN: str = ""
     GITHUB_API_BASE: str = "https://api.github.com"
@@ -50,17 +54,23 @@ class Settings(BaseSettings):
     RAG_OUTPUT_REPO_LIMIT: int = 5
     RAG_SEARCH_PER_QUERY: int = 20
     RAG_DEEP_INDEX_REPO_LIMIT: int = 5
-    RAG_INLINE_BOOTSTRAP_REPO_LIMIT: int = 5
-    # RAG limits — tuned for full-repo ingestion on Cohere free tier (1000 calls/month).
-    # Math: 120 files × ~5 avg chunks × 5 repos = 3000 chunks ÷ 50 batch = 60 embed
-    # calls for indexing + ~11 other calls = ~71 total per fresh request (~14/month).
-    # asyncio.gather fires all batches concurrently so wall-clock time ≈ slowest batch
-    # (~1.5s), not the sum — fits comfortably within the 150s request budget.
+    # RAG limits — right-sized for what generation actually reads, not for
+    # hypothetical "ingest everything" completeness.
+    #
+    # Measured (2026-08-07): the 4 generation calls only ever read hits[:6] truncated
+    # to ~900 chars each per section (_build_generation_evidence in llm_service.py) —
+    # a few thousand characters total, regardless of how much is indexed. Indexing
+    # depth beyond that exists purely to make repo-chat's open-ended questions answerable
+    # later, which is a real but genuinely smaller need than "ingest every eligible file."
+    # Single-provider (Cohere only, 1000 calls/month, call-metered):
+    # 150 files × ~5 avg chunks × 5 repos = 3,750 chunks ÷ 96 batch ≈ 40 embed calls
+    # + ~11 other calls ≈ 51/request ≈ 19-20 full requests/month on the free tier.
+    # Watch the "N/M files in tree are index-eligible" log line for real per-repo usage.
     RAG_SHALLOW_CODE_SAMPLE_COUNT: int = 8  # was 5; more diverse ranking signal
     RAG_SHALLOW_CODE_SAMPLE_MAX_CHARS: int = 6_000
     RAG_SEMANTIC_MIN_RELEVANCE: float = 0.30
-    RAG_MAX_FILES_PER_REPO: int = 120        # was 60 — doubled for full-repo ingestion
-    RAG_MAX_CHARS_PER_REPO: int = 1_500_000  # was 400_000 — fits 120 files at avg 12KB
+    RAG_MAX_FILES_PER_REPO: int = 150
+    RAG_MAX_CHARS_PER_REPO: int = 1_800_000
     RAG_MAX_FILE_SIZE: int = 80_000
     RAG_ARCHIVE_MAX_BYTES: int = 25_000_000
     RAG_ARCHIVE_MAX_EXTRACTED_BYTES: int = 20_000_000
@@ -71,16 +81,12 @@ class Settings(BaseSettings):
     RAG_SECTION_CONTEXT_CHARS: int = 14_000
     RAG_MAX_SEARCH_CONCURRENCY: int = 8
     RAG_QUERY_LIMIT: int = 8
-    RAG_DEDUP_THRESHOLD: float = 0.92
     RAG_MAX_PER_LANGUAGE: int = 4
     RAG_CHUNKING_VERSION: str = "v1"
     RAG_STORE_BACKEND: str = "postgres"
     DATABASE_URL: str = ""
-    INDEXING_MODE: str = "inline"
-    INDEX_JOB_TIMEOUT_SECONDS: int = 900
-    INDEX_JOB_MAX_RETRIES: int = 3
-    INDEXER_POLL_INTERVAL_SECONDS: int = 5
-    INDEXER_MAX_CONCURRENCY: int = 3
+    MAX_INDEXED_REPOS: int = 150  # Oldest-by-last-use repos beyond this cap are evicted at startup
+    INDEXER_MAX_CONCURRENCY: int = 3  # Bounds concurrent inline indexing within one request
     RAG_DB_POOL_MIN_SIZE: int = 1
     RAG_DB_POOL_MAX_SIZE: int = 4
     PIPELINE_REQUEST_BUDGET_SECONDS: int = 150  # was 110 — accommodates deeper indexing

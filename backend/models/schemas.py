@@ -69,8 +69,6 @@ class ExtractedKeywords(BaseModel):
     capabilities: list[str] = Field(default_factory=list)
     primary_capabilities: list[str] = Field(default_factory=list)
     secondary_capabilities: list[str] = Field(default_factory=list)
-    trivial_capabilities: list[str] = Field(default_factory=list)
-    capability_weights: dict[str, float] = Field(default_factory=dict)
     domain_terms: list[str] = Field(default_factory=list)
     tech_terms: list[str] = Field(default_factory=list)
     constraints: list[str] = Field(default_factory=list)
@@ -143,12 +141,7 @@ class ShallowRepoEvidence(BaseModel):
     matched_keywords: list[str] = Field(default_factory=list)
     matched_frameworks: list[str] = Field(default_factory=list)
     matched_capabilities: list[str] = Field(default_factory=list)
-    concept_family_matches: list[str] = Field(default_factory=list)
-    matched_stack_families: list[str] = Field(default_factory=list)
-    capability_coverage: float = 0.0
-    semantic_code_score: float = 0.0
     score: float = 0.0
-    score_reasons: list[str] = Field(default_factory=list)
 
 
 class RepoFetchPlan(BaseModel):
@@ -162,12 +155,10 @@ class RepoFetchPlan(BaseModel):
 
 
 class RetrievalWeights(BaseModel):
-    """Signal weights used when merging dense and lexical retrieval hits."""
+    """Signal weights used when scoring dense retrieval hits."""
 
-    dense_weight: float = 0.5
-    lexical_weight: float = 0.25
-    repo_weight: float = 0.15
-    role_weight: float = 0.1
+    dense_weight: float = 0.8
+    repo_weight: float = 0.2
 
 
 class RetrievalQuery(BaseModel):
@@ -217,9 +208,7 @@ class RetrievalHit(BaseModel):
     end_line: int | None = None
     score: float = 0.0
     dense_score: float = 0.0
-    lexical_score: float = 0.0
     repo_prior: float = 0.0
-    role_prior: float = 0.0
     reason: str = ""
     text: str
 

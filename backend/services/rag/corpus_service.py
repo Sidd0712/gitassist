@@ -1,20 +1,20 @@
-"""Background-safe corpus maintenance for shared Postgres storage."""
+"""Repository indexing: fetch, chunk, embed, and persist into Postgres."""
 
 from __future__ import annotations
 
 import logging
 
-from models.schemas import RepoFetchPlan, RepoSearchResult, ShallowRepoEvidence
+from models.schemas import RepoFetchPlan, RepoSearchResult
 from services.github_service import fetch_repo_files_for_indexing
 from services.rag.chunking_service import ChunkingService
 from services.rag.embedding_service import EmbeddingService
-from services.rag.store_service import ClaimedIndexJob, get_rag_store
+from services.rag.store_service import get_rag_store
 
 logger = logging.getLogger(__name__)
 
 
 class CorpusService:
-    """Queue and process repository indexing without blocking the request path."""
+    """Index repository fetch plans directly, in-process."""
 
     def __init__(self) -> None:
         self.store = get_rag_store()
@@ -40,46 +40,15 @@ class CorpusService:
             self.chunking_version,
         )
 
-    def enqueue_index_job(self, plan: RepoFetchPlan, shallow: ShallowRepoEvidence) -> bool:
-        return self.store.enqueue_index_job(
-            plan,
-            shallow,
-            self.embedding_model_name,
-            self.chunking_version,
-        )
-
-    def enqueue_index_job_placeholder(self, plan: RepoFetchPlan) -> bool:
-        """Queue a deep indexing job without any shallow evidence payload."""
-
-        return self.enqueue_index_job(
-            plan,
-            ShallowRepoEvidence(repository=plan.repository.model_copy(deep=True)),
-        )
-
-    async def index_repository_plan(
-        self,
-        plan: RepoFetchPlan,
-        shallow: ShallowRepoEvidence | None = None,
-    ) -> RepoSearchResult:
-        """Index a repository plan immediately in-process."""
+    async def index_repository_plan(self, plan: RepoFetchPlan) -> RepoSearchResult:
+        """Fetch, chunk, embed, and persist a repository fetch plan immediately."""
 
         existing = self.load_indexed_repository(plan.repository)
         if existing is not None:
             return existing
 
-        placeholder = shallow or ShallowRepoEvidence(repository=plan.repository.model_copy(deep=True))
-        self.enqueue_index_job(plan, placeholder)
-        job = ClaimedIndexJob(plan=plan, shallow_summary={}, retry_count=0)
-        return await self.process_index_job(job)
-
-    def claim_index_job(self, worker_id: str) -> ClaimedIndexJob | None:
-        return self.store.claim_index_job(worker_id, self.embedding_model_name, self.chunking_version)
-
-    async def process_index_job(self, job: ClaimedIndexJob) -> RepoSearchResult:
-        """Fetch, chunk, embed, and persist a claimed indexing job."""
-
-        repository = job.plan.repository
-        files = await fetch_repo_files_for_indexing(job.plan)
+        repository = plan.repository
+        files = await fetch_repo_files_for_indexing(plan)
         if not files:
             logger.warning("No files fetched for indexing: %s", repository.full_name)
             self.store.replace_repository_index(
@@ -88,12 +57,6 @@ class CorpusService:
                 embeddings=[],
                 embedding_model=self.embedding_model_name,
                 chunking_version=self.chunking_version,
-            )
-            self.store.mark_index_job_completed(
-                job,
-                self.embedding_model_name,
-                self.chunking_version,
-                chunk_count=0,
             )
             return repository
 
@@ -107,12 +70,6 @@ class CorpusService:
                 embedding_model=self.embedding_model_name,
                 chunking_version=self.chunking_version,
             )
-            self.store.mark_index_job_completed(
-                job,
-                self.embedding_model_name,
-                self.chunking_version,
-                chunk_count=0,
-            )
             return repository
 
         embeddings = await self.embedding_service.embed_documents([chunk.text for chunk in chunks])
@@ -123,12 +80,6 @@ class CorpusService:
             embedding_model=self.embedding_model_name,
             chunking_version=self.chunking_version,
         )
-        self.store.mark_index_job_completed(
-            job,
-            self.embedding_model_name,
-            self.chunking_version,
-            chunk_count=len(chunks),
-        )
         logger.info(
             "Indexed %s with %d files and %d chunks",
             repository.full_name,
@@ -136,22 +87,3 @@ class CorpusService:
             len(chunks),
         )
         return repository
-
-    async def run_next_index_job(self, worker_id: str) -> bool:
-        """Claim and process a single background indexing job."""
-
-        job = self.claim_index_job(worker_id)
-        if job is None:
-            return False
-
-        try:
-            await self.process_index_job(job)
-        except Exception as exc:
-            self.store.mark_index_job_failed(
-                job,
-                self.embedding_model_name,
-                self.chunking_version,
-                str(exc),
-            )
-            logger.exception("Background indexing failed for %s", job.plan.repository.full_name)
-        return True

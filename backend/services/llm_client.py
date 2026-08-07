@@ -32,6 +32,8 @@ class LLMClient:
         temperature: float = 0.7,
         max_tokens: int = 2048,
         timeout_seconds: int | None = None,
+        json_mode: bool = False,
+        seed: int | None = None,
     ) -> str:
         """Make async API call to Groq with retry logic."""
 
@@ -47,12 +49,16 @@ class LLMClient:
                     len(prompt),
                     timeout_seconds,
                 )
+                extra_kwargs = {"response_format": {"type": "json_object"}} if json_mode else {}
+                if seed is not None:
+                    extra_kwargs["seed"] = seed
                 response = await asyncio.wait_for(
                     self.client.chat.completions.create(
                         model=self.model,
                         messages=[{"role": "user", "content": prompt}],
                         temperature=temperature,
                         max_tokens=max_tokens,
+                        **extra_kwargs,
                     ),
                     timeout=timeout_seconds,
                 )
@@ -86,14 +92,45 @@ class LLMClient:
         temperature: float,
         max_tokens: int,
         timeout_seconds: int,
+        json_mode: bool = True,
+        seed: int | None = None,
     ) -> dict | list:
+        """Call the model expecting a JSON response.
+
+        Groq's (OpenAI-compatible) json_object response_format requires the
+        top-level response to be a JSON *object* — it cannot produce a bare
+        JSON array. Callers whose prompt asks for a bare array (e.g. `[...]`)
+        must pass json_mode=False and rely on _parse_json_response's fallback
+        parsing instead.
+        """
+
         response = await self._call_api(
             prompt,
             temperature=temperature,
             max_tokens=max_tokens,
             timeout_seconds=timeout_seconds,
+            json_mode=json_mode,
+            seed=seed,
         )
         return self._parse_json_response(response)
+
+    @staticmethod
+    def _coerce_json_list(value: object) -> list:
+        """Best-effort coercion of a JSON response into a list.
+
+        Models sometimes ignore a "return a bare array" instruction and wrap
+        the array in an object instead (e.g. {"items": [...]}). If we get a
+        dict with exactly one list-valued key, unwrap it rather than nesting
+        the whole dict as a single malformed list entry.
+        """
+
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            list_values = [v for v in value.values() if isinstance(v, list)]
+            if len(list_values) == 1:
+                return list_values[0]
+        return []
 
     async def extract_keywords(self, idea: str, clarification_answers: dict[str, str] | None = None) -> dict:
         """Use model to extract technical keywords and capabilities from user idea."""
@@ -146,9 +183,10 @@ Extract and return ONLY valid JSON (no markdown, no explanation):
 
         result = await self._call_json_api(
             prompt,
-            temperature=0.3,
+            temperature=0.0,
             max_tokens=1200,
             timeout_seconds=self.settings.LLM_AUX_TIMEOUT_SECONDS,
+            seed=42,
         )
         logger.info(
             "Keywords extracted: %d capabilities, %d frameworks",
@@ -156,39 +194,6 @@ Extract and return ONLY valid JSON (no markdown, no explanation):
             len(result.get("frameworks", [])),
         )
         return result
-
-    async def build_clarification_questions(self, idea: str, extracted: dict) -> list[dict]:
-        """Use model to identify key ambiguities needing clarification."""
-
-        prompt = f"""Given this project idea and extracted analysis, suggest 2-3 critical clarification questions.
-
-Idea: {idea}
-
-Current Analysis:
-- Product Type: {extracted.get('product_type', 'unknown')}
-- Capabilities: {', '.join(extracted.get('primary_capabilities', []))}
-- Ambiguities: {extracted.get('ambiguities', [])}
-
-Return ONLY valid JSON array (no markdown):
-[
-  {{
-    "key": "unique_key",
-    "question": "clarification question",
-    "options": ["option 1", "option 2", "option 3"],
-    "reason": "why this matters"
-  }}
-]"""
-
-        questions = await self._call_json_api(
-            prompt,
-            temperature=0.5,
-            max_tokens=700,
-            timeout_seconds=self.settings.LLM_AUX_TIMEOUT_SECONDS,
-        )
-        if not isinstance(questions, list):
-            questions = [questions]
-        logger.info("Generated %d clarification questions", len(questions))
-        return questions
 
     async def plan_retrieval_queries(self, idea: str, keywords: dict, repositories: list[dict]) -> dict:
         """Use model to generate targeted retrieval queries and weights for each analysis section."""
@@ -213,9 +218,7 @@ Return ONLY valid JSON (no markdown):
       "top_k": 8,
       "weights": {{
         "dense_weight": 0.0-1.0,
-        "lexical_weight": 0.0-1.0,
-        "repo_weight": 0.0-1.0,
-        "role_weight": 0.0-1.0
+        "repo_weight": 0.0-1.0
       }}
     }}
   ]
@@ -316,9 +319,9 @@ No markdown, just the JSON array."""
             temperature=0.55,
             max_tokens=900,
             timeout_seconds=self.settings.LLM_GENERATION_TIMEOUT_SECONDS,
+            json_mode=False,
         )
-        if not isinstance(descriptions, list):
-            descriptions = [descriptions]
+        descriptions = [item for item in self._coerce_json_list(descriptions) if isinstance(item, str)]
         logger.info("Generated %d repository descriptions", len(descriptions))
         return descriptions
 
@@ -358,9 +361,9 @@ Generate 5-6 concrete learning steps with milestones. Return JSON array (no mark
             temperature=0.65,
             max_tokens=1400,
             timeout_seconds=self.settings.LLM_GENERATION_TIMEOUT_SECONDS,
+            json_mode=False,
         )
-        if not isinstance(path, list):
-            path = [path]
+        path = [item for item in self._coerce_json_list(path) if isinstance(item, dict)]
         logger.info("Generated %d-step learning path", len(path))
         return path
 
@@ -405,9 +408,9 @@ Return JSON array (no markdown):
             temperature=0.55,
             max_tokens=1200,
             timeout_seconds=self.settings.LLM_GENERATION_TIMEOUT_SECONDS,
+            json_mode=False,
         )
-        if not isinstance(stack, list):
-            stack = [stack]
+        stack = [item for item in self._coerce_json_list(stack) if isinstance(item, dict)]
         logger.info("Generated %d tech stack recommendations", len(stack))
         return stack
 
@@ -520,10 +523,61 @@ Return ONLY a JSON array of search query strings:
             temperature=0.35,
             max_tokens=700,
             timeout_seconds=self.settings.LLM_AUX_TIMEOUT_SECONDS,
+            json_mode=False,
         )
-        if not isinstance(queries, list):
-            return []
-        return [query for query in queries if isinstance(query, str)]
+        return [query for query in self._coerce_json_list(queries) if isinstance(query, str)]
+
+    async def rank_repositories(
+        self,
+        idea: str,
+        keywords: dict,
+        candidates: list[dict],
+        limit: int = 5,
+    ) -> list[dict]:
+        """Judge and select the best reference repositories for this idea."""
+
+        candidates_text = "\n\n".join(
+            f"### {c.get('full_name', '')}\n"
+            f"Stars: {c.get('stars', 0)} | Language: {c.get('language', '')}\n"
+            f"Description: {c.get('description', '')}\n"
+            f"Manifests: {', '.join(c.get('manifest_files', []))}\n"
+            f"README excerpt: {c.get('readme_excerpt', '')}"
+            for c in candidates
+        )
+
+        prompt = f"""You are a JSON API. Return ONLY a JSON object, no explanation, no markdown.
+
+Project idea: {idea}
+Key capabilities: {', '.join(keywords.get('primary_capabilities', []) or keywords.get('capabilities', [])[:3])}
+
+Below are candidate GitHub repositories. Select the best {limit} to use as real-world reference
+implementations for this idea, ordered best first.
+
+{candidates_text}
+
+For each selected repository return:
+- full_name: exact repo full_name as given above
+- fit_score: 0.0-1.0, how well it fits as a reference for this idea
+- reference_type: "end_to_end" (implements the whole idea), "subsystem" (implements one important part), or "pattern" (useful code patterns only)
+- fit_summary: one sentence explaining why it was selected
+- matched_capabilities: list of capability names from "Key capabilities" that this repo demonstrates
+
+Return ONLY:
+{{"repositories": [{{"full_name": "...", "fit_score": 0.0, "reference_type": "...", "fit_summary": "...", "matched_capabilities": []}}]}}"""
+
+        result = await self._call_json_api(
+            prompt,
+            temperature=0.2,
+            max_tokens=1500,
+            timeout_seconds=self.settings.LLM_AUX_TIMEOUT_SECONDS,
+        )
+        if isinstance(result, dict):
+            repositories = result.get("repositories", [])
+        elif isinstance(result, list):
+            repositories = result
+        else:
+            repositories = []
+        return [item for item in repositories if isinstance(item, dict) and item.get("full_name")]
 
     async def generate_search_queries(self, capability: str, idea_context: str, num_queries: int = 3) -> list[str]:
         """Generate GitHub search queries for a capability using AI."""
@@ -540,8 +594,9 @@ Return ONLY a JSON array of search query strings:
             temperature=0.4,
             max_tokens=400,
             timeout_seconds=self.settings.LLM_AUX_TIMEOUT_SECONDS,
+            json_mode=False,
         )
-        return queries if isinstance(queries, list) else []
+        return self._coerce_json_list(queries)
     
     async def expand_capability_aliases(
         self,
@@ -575,143 +630,6 @@ Return ONLY a JSON array of search query strings:
             timeout_seconds=self.settings.LLM_AUX_TIMEOUT_SECONDS,
         )
         return result if isinstance(result, dict) else {}
-
-    async def evaluate_repository_quality(self, repo_name: str, description: str, readme: str, topics: list[str]) -> dict:
-        """Evaluate repository quality and relevance using AI."""
-
-        prompt = f"""You are a JSON API. Return ONLY a JSON object.
-
-Evaluate this GitHub repository:
-Repository: {repo_name}
-Description: {description[:300]}
-Topics: {', '.join(topics)}
-README: {readme[:600]}
-
-{{"quality_score": 0.0, "is_template_or_tutorial": false, "is_production_quality": false, "primary_purpose": "one phrase", "reasoning": "one sentence max"}}
-
-Replace values and return the object:"""
-
-        result = await self._call_json_api(
-            prompt,
-            temperature=0.3,
-            max_tokens=600,
-            timeout_seconds=self.settings.LLM_AUX_TIMEOUT_SECONDS,
-        )
-        return result if isinstance(result, dict) else {}
-
-    async def prioritize_files(self, file_paths: list[str], project_intent: str, max_files: int = 30) -> list[dict]:
-        """Rank files by relevance to project intent using AI."""
-
-        prompt = f"""Given this project intent: {project_intent}
-
-Rank these files by relevance (most important first):
-{chr(10).join(file_paths[:100])}
-
-Return top {max_files} as JSON array:
-[{{"path": "file path", "priority_score": 0.0-1.0, "reason": "why important"}}]"""
-
-        result = await self._call_json_api(
-            prompt,
-            temperature=0.4,
-            max_tokens=1000,
-            timeout_seconds=self.settings.LLM_AUX_TIMEOUT_SECONDS,
-        )
-        return result if isinstance(result, list) else []
-
-    async def evaluate_capability_match(self, capability: str, repo_text: str, keywords_context: dict) -> float:
-        """Score how well a repository supports a capability using AI."""
-
-        prompt = f"""You are a JSON API. Return ONLY a JSON object.
-
-Does this repository support the capability: {capability}
-
-Repository text: {repo_text[:2000]}
-Project keywords: {keywords_context.get('keywords', [])}
-
-{{"match_score": 0.0, "confidence": "high", "evidence": "one sentence max"}}
-
-Replace values and return the object:"""
-
-        result = await self._call_json_api(
-            prompt,
-            temperature=0.3,
-            max_tokens=400,
-            timeout_seconds=self.settings.LLM_AUX_TIMEOUT_SECONDS,
-        )
-        if not isinstance(result, dict):
-            return 0.0
-        return float(result.get("match_score", 0.0))
-
-    async def calculate_ranking_weights(self, idea: str, repositories_count: int) -> dict:
-        """Determine optimal repository ranking weights using AI."""
-
-        prompt = f"""You are a JSON API. Return ONLY a JSON object, no explanation, no prose, no markdown.
-
-    Task: assign ranking weights for {repositories_count} repositories matching this idea: {idea}
-
-    Rules:
-    - All 6 values must be floats between 0.0 and 1.0
-    - Values must sum to exactly 1.0
-    - Return nothing except the JSON object
-
-    {{"readme_semantic": 0.0, "metadata_semantic": 0.0, "capability_coverage": 0.0, "doc_quality": 0.0, "query_diversity": 0.0, "star_quality": 0.0}}
-
-    Replace the 0.0 values with your weights and return the object:"""
-
-        result = await self._call_json_api(
-            prompt,
-            temperature=0.1,
-            max_tokens=120,
-            timeout_seconds=self.settings.LLM_AUX_TIMEOUT_SECONDS,
-        )
-        return result if isinstance(result, dict) else {}
-
-    async def determine_retrieval_weights(self, query_type: str, context: str) -> dict:
-        """Calculate optimal retrieval scoring weights using AI."""
-
-        prompt = f"""You are a JSON API. Return ONLY a JSON object, no explanation, no prose, no markdown.
-
-Task: assign retrieval weights for a {query_type} query in this context: {context[:200]}
-
-Rules:
-- All 4 values must be floats between 0.0 and 1.0
-- Values must sum to exactly 1.0
-- Return nothing except the JSON object
-
-{{"dense_weight": 0.0, "lexical_weight": 0.0, "repo_weight": 0.0, "role_weight": 0.0}}
-
-Replace the 0.0 values with your weights and return the object:"""
-
-        result = await self._call_json_api(
-            prompt,
-            temperature=0.3,
-            max_tokens=400,
-            timeout_seconds=self.settings.LLM_AUX_TIMEOUT_SECONDS,
-        )
-        return result if isinstance(result, dict) else {}
-
-    async def assess_document_quality(self, text: str) -> float:
-        """Evaluate documentation quality using AI."""
-
-        prompt = f"""You are a JSON API. Return ONLY a JSON object.
-
-Rate this documentation's quality as a float from 0.0 (useless) to 1.0 (excellent):
-
-{text[:1500]}
-
-{{"quality_score": 0.0}}
-
-Replace 0.0 with your score:"""
-
-        result = await self._call_json_api(
-            prompt,
-            temperature=0.3,
-            max_tokens=300,
-            timeout_seconds=self.settings.LLM_AUX_TIMEOUT_SECONDS,
-        )
-        if not isinstance(result, dict):
-            return 0.0
-        return float(result.get("quality_score", 0.0))
 
     def _format_evidence(self, evidence: dict | None) -> str:
         if not evidence:

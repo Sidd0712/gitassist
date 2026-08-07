@@ -26,14 +26,6 @@ from services.rag.query_planning_service import build_default_retrieval_plan
 logger = logging.getLogger(__name__)
 
 _cache = PipelineCacheService()
-_DEFAULT_RANKING_WEIGHTS = {
-    "readme_semantic": 0.45,
-    "metadata_semantic": 0.2,
-    "capability_coverage": 0.2,
-    "doc_quality": 0.07,
-    "query_diversity": 0.04,
-    "star_quality": 0.04,
-}
 _DEFAULT_RETRIEVAL_WEIGHTS = RetrievalWeights()
 
 
@@ -42,7 +34,7 @@ async def extract_keywords(idea: str, clarification_answers: dict[str, str] | No
 
     cache_key = stable_cache_key(
         {
-            "idea": idea.strip(),
+            "idea": " ".join(idea.strip().lower().split()),
             "clarification_answers": compact_mapping(clarification_answers or {}),
         }
     )
@@ -65,8 +57,6 @@ async def extract_keywords(idea: str, clarification_answers: dict[str, str] | No
         capabilities=extracted.get("primary_capabilities", []) + extracted.get("secondary_capabilities", [])[:12],
         primary_capabilities=extracted.get("primary_capabilities", [])[:3],
         secondary_capabilities=extracted.get("secondary_capabilities", [])[:6],
-        trivial_capabilities=extracted.get("trivial_capabilities", [])[:8],
-        capability_weights=_normalize_capability_weights(extracted.get("capability_weights", {})),
         domain_terms=(extracted.get("domain_terms") or extracted.get("keywords", []))[:12],
         tech_terms=(extracted.get("tech_terms") or (extracted.get("frameworks", []) + extracted.get("languages", [])))[:10],
         constraints=extracted.get("constraints", [])[:8],
@@ -122,31 +112,6 @@ def build_clarification_questions(keywords: ExtractedKeywords) -> list[Clarifica
             break
 
     return questions
-
-
-async def get_ranking_weights(idea: str, repositories_count: int) -> dict[str, float]:
-    """Load cached ranking weights or compute them once for the current idea."""
-
-    cache_key = stable_cache_key(
-        {
-            "idea": idea.strip(),
-            "repositories_count": repositories_count,
-        }
-    )
-    cached = _cache.get_json("llm_ranking_weights", cache_key)
-    if isinstance(cached, dict):
-        return _normalize_ranking_weights(cached)
-
-    llm = get_llm_client()
-    try:
-        weights = await llm.calculate_ranking_weights(idea, repositories_count)
-    except Exception as exc:
-        logger.warning("Failed to get AI ranking weights: %s. Using defaults.", exc)
-        return dict(_DEFAULT_RANKING_WEIGHTS)
-
-    normalized = _normalize_ranking_weights(weights)
-    _cache.set_json("llm_ranking_weights", cache_key, normalized)
-    return normalized
 
 
 async def plan_retrieval_queries(
@@ -223,7 +188,7 @@ def build_repo_chat_retrieval_query(
         query="\n".join(query_parts),
         preferred_roles=_chat_preferred_roles(question),
         top_k=6,
-        weights=RetrievalWeights(dense_weight=0.45, lexical_weight=0.25, repo_weight=0.1, role_weight=0.2),
+        weights=RetrievalWeights(dense_weight=0.85, repo_weight=0.15),
     )
 
 
@@ -267,9 +232,9 @@ async def answer_repo_chat(
                 "path": hit.path,
                 "lines": [hit.start_line, hit.end_line],
                 "reason": hit.reason,
-                "snippet": _truncate_text(hit.text, 420),
+                "snippet": _truncate_text(hit.text, 600),
             }
-            for hit in hits[:6]
+            for hit in hits[:8]
         ],
     }
 
@@ -447,39 +412,6 @@ def _normalize_clarification_options(options: object) -> list[str]:
     return normalized
 
 
-def _normalize_capability_weights(raw_weights: object) -> dict[str, float]:
-    """Coerce capability weights into a clean string-to-float mapping."""
-
-    if not isinstance(raw_weights, dict):
-        return {}
-
-    normalized: dict[str, float] = {}
-    for key, value in raw_weights.items():
-        if not isinstance(key, str):
-            continue
-        try:
-            normalized_key = key.strip()
-            if not normalized_key:
-                continue
-            normalized[normalized_key] = float(value)
-        except (TypeError, ValueError):
-            continue
-    return normalized
-
-
-def _normalize_ranking_weights(raw_weights: object) -> dict[str, float]:
-    normalized = dict(_DEFAULT_RANKING_WEIGHTS)
-    if not isinstance(raw_weights, dict):
-        return normalized
-    for key, value in raw_weights.items():
-        if key not in normalized:
-            continue
-        try:
-            normalized[key] = max(0.0, float(value))
-        except (TypeError, ValueError):
-            continue
-    total = sum(normalized.values()) or 1.0
-    return {key: value / total for key, value in normalized.items()}
 
 
 def _normalize_retrieval_weights(raw_weights: object) -> RetrievalWeights:
@@ -547,9 +479,9 @@ def _build_generation_evidence(
                     "repo": hit.repo_full_name,
                     "path": hit.path,
                     "reason": hit.reason,
-                    "snippet": _truncate_text(hit.text, 360),
+                    "snippet": _truncate_text(hit.text, 900),
                 }
-                for hit in hits[:4]
+                for hit in hits[:6]
             ],
         }
 

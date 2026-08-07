@@ -13,7 +13,6 @@ from typing import Any
 from cachetools import TTLCache
 
 from core.config import get_settings
-from services.rag.store_service import get_rag_store
 
 logger = logging.getLogger(__name__)
 
@@ -29,49 +28,20 @@ def stable_cache_key(payload: Any) -> str:
 
 
 class PipelineCacheService:
-    """Cross-request cache backed by Postgres when available, with in-process fallback."""
+    """In-process TTL cache for warm-path pipeline artifacts (same-process repeat/retry requests)."""
 
     def __init__(self) -> None:
         self.settings = get_settings()
-        self._store = None
-        self._store_checked = False
 
     def get_json(self, namespace: str, cache_key: str) -> Any | None:
         """Get a cached JSON-compatible payload."""
 
-        memory_cache = self._get_memory_cache(namespace)
-        cached = memory_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        store = self._get_store()
-        if store is None:
-            return None
-
-        try:
-            payload = store.get_cache_entry(namespace, cache_key)
-        except Exception as exc:
-            logger.debug("Persistent cache read failed for %s:%s: %s", namespace, cache_key, exc)
-            return None
-
-        if payload is not None:
-            memory_cache[cache_key] = payload
-        return payload
+        return self._get_memory_cache(namespace).get(cache_key)
 
     def set_json(self, namespace: str, cache_key: str, payload: Any, ttl_seconds: int | None = None) -> None:
         """Persist a JSON-compatible payload in cache."""
 
-        memory_cache = self._get_memory_cache(namespace)
-        memory_cache[cache_key] = payload
-
-        store = self._get_store()
-        if store is None:
-            return
-
-        try:
-            store.set_cache_entry(namespace, cache_key, payload, ttl_seconds or self._default_ttl(namespace))
-        except Exception as exc:
-            logger.debug("Persistent cache write failed for %s:%s: %s", namespace, cache_key, exc)
+        self._get_memory_cache(namespace)[cache_key] = payload
 
     def get_ttl(self, namespace: str) -> int:
         """Expose the configured TTL for a namespace."""
@@ -86,22 +56,6 @@ class PipelineCacheService:
                 cache = TTLCache(maxsize=256, ttl=ttl)
                 _memory_caches[namespace] = cache
             return cache
-
-    def _get_store(self):
-        if self._store_checked:
-            return self._store
-
-        self._store_checked = True
-        if self.settings.RAG_STORE_BACKEND.lower() != "postgres" or not self.settings.DATABASE_URL:
-            self._store = None
-            return None
-
-        try:
-            self._store = get_rag_store()
-        except Exception as exc:
-            logger.debug("Pipeline cache store unavailable: %s", exc)
-            self._store = None
-        return self._store
 
     def _default_ttl(self, namespace: str) -> int:
         if namespace.startswith("llm_"):

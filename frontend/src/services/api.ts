@@ -1,11 +1,16 @@
 import axios from 'axios';
 import type { AnalysisResponse, RepoChatRequest, RepoChatResponse } from '../types';
 
+const API_KEY: string = (import.meta.env.VITE_API_KEY as string) ?? '';
+
 // axios instance kept for health + chat (non-streaming endpoints)
 const api = axios.create({
   baseURL: import.meta.env.VITE_API_URL,
   timeout: 600_000,
-  headers: { 'Content-Type': 'application/json' },
+  headers: {
+    'Content-Type': 'application/json',
+    ...(API_KEY ? { 'X-API-Key': API_KEY } : {}),
+  },
 });
 
 const BASE_URL: string = (import.meta.env.VITE_API_URL as string) ?? '';
@@ -26,7 +31,10 @@ export async function researchIdea(
 ): Promise<AnalysisResponse> {
   const response = await fetch(`${BASE_URL}/research`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(API_KEY ? { 'X-API-Key': API_KEY } : {}),
+    },
     body: JSON.stringify({ idea, clarification_answers: clarificationAnswers }),
     signal,
   });

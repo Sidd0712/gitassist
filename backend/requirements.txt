@@ -2,7 +2,7 @@ fastapi
 uvicorn[standard]
 pydantic
 pydantic-settings
-httpx
+httpx<0.28
 groq
 python-dotenv
 cachetools

@@ -352,15 +352,31 @@ class FakeLLMClient:
             for cap in capabilities
         }
 
-    async def calculate_ranking_weights(self, idea: str, repositories_count: int) -> dict:
-        return {
-            "readme_semantic": 0.45,
-            "metadata_semantic": 0.2,
-            "capability_coverage": 0.2,
-            "doc_quality": 0.07,
-            "query_diversity": 0.04,
-            "star_quality": 0.04,
-        }
+    async def rank_repositories(self, idea: str, keywords: dict, candidates: list[dict], limit: int = 5) -> list[dict]:
+        """Deterministic default: order by simple keyword overlap with the idea's capabilities."""
+
+        primary = [c.lower() for c in (keywords.get("primary_capabilities") or keywords.get("capabilities") or [])]
+
+        def _score(candidate: dict) -> float:
+            text = f"{candidate.get('description', '')} {candidate.get('readme_excerpt', '')}".lower()
+            hits = sum(1 for capability in primary if capability in text)
+            return hits / max(1, len(primary)) if primary else 0.5
+
+        scored = sorted(candidates, key=_score, reverse=True)[:limit]
+        return [
+            {
+                "full_name": candidate["full_name"],
+                "fit_score": round(_score(candidate), 2),
+                "reference_type": "subsystem",
+                "fit_summary": f"Selected as a reference for {idea[:60]}.",
+                "matched_capabilities": [
+                    capability
+                    for capability in (keywords.get("primary_capabilities") or [])
+                    if capability.lower() in f"{candidate.get('description', '')} {candidate.get('readme_excerpt', '')}".lower()
+                ],
+            }
+            for candidate in scored
+        ]
 
     async def plan_retrieval_queries(self, idea: str, keywords: dict, repositories: list[dict]) -> dict:
         return {"queries": []}
@@ -537,13 +553,6 @@ class FakeLLMClient:
   D --> E[Presence Updates]
   C --> F[Stroke Store]"""
 
-    async def determine_retrieval_weights(self, query_type: str, context: str) -> dict:
-        return {
-            "dense_weight": 0.5,
-            "lexical_weight": 0.25,
-            "repo_weight": 0.15,
-            "role_weight": 0.1,
-        }
 
 
 class HermeticAsyncTestCase(unittest.IsolatedAsyncioTestCase):
@@ -554,8 +563,8 @@ class HermeticAsyncTestCase(unittest.IsolatedAsyncioTestCase):
         self.patchers = [
             patch("services.llm_service.get_llm_client", return_value=self.fake_llm),
             patch("services.llm_client.get_llm_client", return_value=self.fake_llm),
+            patch("services.rag.ranking_service.get_llm_client", return_value=self.fake_llm),
             patch("services.github_service.EmbeddingService", FakeEmbeddingService),
-            patch("services.rag.ranking_service.EmbeddingService", FakeEmbeddingService),
         ]
         for patcher in self.patchers:
             patcher.start()
@@ -608,15 +617,13 @@ class IntentExtractionTests(HermeticAsyncTestCase):
         self.assertIn("meal planning", keywords.primary_capabilities)
         self.assertIn("ingredient inventory", keywords.primary_capabilities)
 
-    async def test_generic_features_are_trivial_by_default(self):
+    async def test_generic_features_do_not_become_primary_capabilities(self):
         keywords = await extract_keywords(
             "A travel planner with maps, chat, recommendations, login, notifications, and file uploads"
         )
         question_keys = {question.key for question in build_clarification_questions(keywords)}
 
         self.assertIn("feature_priority", question_keys)
-        self.assertIn("file uploads", keywords.trivial_capabilities)
-        self.assertIn("notifications", keywords.trivial_capabilities)
         self.assertNotIn("file uploads", keywords.primary_capabilities)
 
     async def test_search_query_builder_combines_capability_and_batched_generation(self):
@@ -971,7 +978,7 @@ class RankingAndGenerationTests(HermeticAsyncTestCase):
         self.assertIn("example/pantry-meals", full_names)
         self.assertIn("example/ai-meal-planner", full_names)
 
-    async def test_ranking_dedupes_similar_repos_and_keeps_language_diversity(self):
+    async def test_ranking_applies_language_diversity_cap(self):
         keywords = await extract_keywords(
             "A travel planner with chat, maps, and personalized recommendations",
             {
@@ -986,14 +993,8 @@ class RankingAndGenerationTests(HermeticAsyncTestCase):
                 html_url="https://github.com/example/travel-chat-a",
                 stars=140,
                 language="TypeScript",
-                topics=["travel", "chat", "maps"],
-                query_hit_count=3,
-                semantic_meta_score=0.8,
             ),
-            readme=(
-                "Travel planner with chat messaging, maps integration, recommendation engine, and shared itineraries."
-            ),
-            highlighted_paths=["README.md", "package.json"],
+            readme="Travel planner with chat messaging and maps integration.",
         )
         repo_b = ShallowRepoEvidence(
             repository=RepoSearchResult(
@@ -1002,14 +1003,8 @@ class RankingAndGenerationTests(HermeticAsyncTestCase):
                 html_url="https://github.com/example/travel-chat-b",
                 stars=100,
                 language="TypeScript",
-                topics=["travel", "chat", "maps"],
-                query_hit_count=2,
-                semantic_meta_score=0.79,
             ),
-            readme=(
-                "Travel planner with chat messaging, maps integration, recommendation engine, and shared itineraries."
-            ),
-            highlighted_paths=["README.md", "package.json"],
+            readme="Travel planner with chat messaging and maps integration.",
         )
         repo_c = ShallowRepoEvidence(
             repository=RepoSearchResult(
@@ -1018,83 +1013,75 @@ class RankingAndGenerationTests(HermeticAsyncTestCase):
                 html_url="https://github.com/example/travel-python",
                 stars=90,
                 language="Python",
-                topics=["travel", "recommendation", "maps"],
-                query_hit_count=2,
-                semantic_meta_score=0.75,
             ),
-            readme=(
-                "Travel planner backend with maps integration, recommendation engine, and itinerary persistence."
-            ),
-            highlighted_paths=["README.md", "requirements.txt"],
+            readme="Travel planner backend with maps integration and recommendation engine.",
         )
 
-        ranked = await rank_repo_evidence(
-            "A travel planner with chat, maps, and personalized recommendations",
-            keywords,
-            [repo_a, repo_b, repo_c],
-        )
+        class FixedRankingLLM:
+            async def rank_repositories(self, idea, keywords, candidates, limit=5):
+                return [
+                    {"full_name": "example/travel-chat-a", "fit_score": 0.9, "reference_type": "end_to_end", "fit_summary": "Best chat match.", "matched_capabilities": ["chat messaging"]},
+                    {"full_name": "example/travel-chat-b", "fit_score": 0.85, "reference_type": "subsystem", "fit_summary": "Also a chat match.", "matched_capabilities": ["chat messaging"]},
+                    {"full_name": "example/travel-python", "fit_score": 0.7, "reference_type": "subsystem", "fit_summary": "Backend reference.", "matched_capabilities": ["maps integration"]},
+                ]
+
+        with (
+            patch("services.rag.ranking_service.get_llm_client", return_value=FixedRankingLLM()),
+            patch(
+                "services.rag.ranking_service.get_settings",
+                return_value=SimpleNamespace(RAG_OUTPUT_REPO_LIMIT=5, RAG_MAX_PER_LANGUAGE=1),
+            ),
+        ):
+            ranked = await rank_repo_evidence(
+                "A travel planner with chat, maps, and personalized recommendations",
+                keywords,
+                [repo_a, repo_b, repo_c],
+            )
         full_names = [evidence.repository.full_name for evidence in ranked]
 
         self.assertIn("example/travel-chat-a", full_names)
         self.assertIn("example/travel-python", full_names)
         self.assertNotIn("example/travel-chat-b", full_names)
 
-    async def test_ranking_uses_sampled_code_to_rescue_vague_but_relevant_repo(self):
+    async def test_ranking_falls_back_to_relevance_order_when_llm_call_fails(self):
         keywords = await extract_keywords("something like Uber for tutors")
 
-        vague_but_relevant = ShallowRepoEvidence(
+        higher = ShallowRepoEvidence(
             repository=RepoSearchResult(
                 full_name="example/tutor-marketplace",
                 description="Marketplace backend for services",
                 html_url="https://github.com/example/tutor-marketplace",
                 stars=220,
                 language="Python",
-                topics=["marketplace", "booking", "payments"],
+                relevance_score=0.8,
             ),
             readme="Service marketplace with accounts, scheduling modules, and API endpoints.",
-            sampled_files=[
-                RepoFile(
-                    path="services/booking/payments.py",
-                    content=(
-                        "def create_lesson_checkout(tutor_id, student_id): "
-                        "schedule lesson booking, tutor discovery, payout invoice, checkout session"
-                    ),
-                    size=124,
-                )
-            ],
-            sampled_paths=["services/booking/payments.py"],
-            highlighted_paths=["services/booking/payments.py"],
         )
-        generic_starter = ShallowRepoEvidence(
+        lower = ShallowRepoEvidence(
             repository=RepoSearchResult(
                 full_name="popular/marketplace-starter",
                 description="Marketplace starter kit",
                 html_url="https://github.com/popular/marketplace-starter",
                 stars=5400,
                 language="TypeScript",
-                topics=["starter", "dashboard", "marketplace"],
+                relevance_score=0.4,
             ),
             readme="Starter kit for admin dashboards, CMS pages, analytics, and themes.",
-            sampled_files=[
-                RepoFile(
-                    path="src/admin/dashboard.ts",
-                    content="render charts reports theme admin analytics tables tenant settings",
-                    size=72,
-                )
-            ],
-            sampled_paths=["src/admin/dashboard.ts"],
-            highlighted_paths=["src/admin/dashboard.ts"],
         )
 
-        ranked = await rank_repo_evidence(
-            "something like Uber for tutors",
-            keywords,
-            [generic_starter, vague_but_relevant],
-        )
+        class FailingRankingLLM:
+            async def rank_repositories(self, *args, **kwargs):
+                raise RuntimeError("model unavailable")
+
+        with patch("services.rag.ranking_service.get_llm_client", return_value=FailingRankingLLM()):
+            ranked = await rank_repo_evidence(
+                "something like Uber for tutors",
+                keywords,
+                [lower, higher],
+            )
 
         self.assertEqual("example/tutor-marketplace", ranked[0].repository.full_name)
-        self.assertGreater(ranked[0].semantic_code_score, 0.0)
-        self.assertIn("sampled code semantic score", " | ".join(ranked[0].score_reasons))
+        self.assertTrue(ranked[0].repository.fit_summary)
 
     async def test_ranking_keeps_end_to_end_references_ahead_of_subsystems_in_top_three(self):
         keywords = await extract_keywords(
@@ -1368,153 +1355,7 @@ class CacheAndFallbackTests(HermeticAsyncTestCase):
 
 
 class ResearchPipelineOrchestrationTests(HermeticAsyncTestCase):
-    async def test_research_request_enqueues_background_indexing_without_blocking(self):
-        keywords = ExtractedKeywords(
-            summary="Collaborative whiteboard for shared online drawing sessions.",
-            core_intent="Build a realtime shared canvas experience for multiple users.",
-            product_type="collaborative whiteboard",
-            capabilities=["realtime collaboration", "canvas rendering", "presence"],
-            primary_capabilities=["realtime collaboration", "canvas rendering", "presence"],
-            keywords=["whiteboard", "canvas", "realtime"],
-        )
-        repository = RepoSearchResult(
-            full_name="example/collab-board",
-            description="Collaborative whiteboard",
-            html_url="https://github.com/example/collab-board",
-            stars=120,
-            language="TypeScript",
-            topics=["whiteboard", "canvas", "websocket"],
-        )
-        secondary_repository = RepoSearchResult(
-            full_name="example/secondary-board",
-            description="Secondary whiteboard reference",
-            html_url="https://github.com/example/secondary-board",
-            stars=80,
-            language="TypeScript",
-            topics=["whiteboard", "multiplayer"],
-        )
-        snapshot = RepoSnapshot(
-            **repository.model_dump(exclude={"commit_sha"}),
-            commit_sha="commit-123",
-            tree=[],
-        )
-        secondary_snapshot = RepoSnapshot(
-            **secondary_repository.model_dump(exclude={"commit_sha"}),
-            commit_sha="commit-456",
-            tree=[],
-        )
-        fetch_plan = RepoFetchPlan(
-            repository=RepoSearchResult(**{**repository.model_dump(), "commit_sha": "commit-123"}),
-            selected_paths=["README.md", "src/socket/server.ts"],
-            skipped_paths=[],
-            estimated_chars=500,
-            rationale=["Prioritized README and realtime code paths."],
-        )
-        secondary_fetch_plan = RepoFetchPlan(
-            repository=RepoSearchResult(**{**secondary_repository.model_dump(), "commit_sha": "commit-456"}),
-            selected_paths=["README.md", "src/canvas/index.ts"],
-            skipped_paths=[],
-            estimated_chars=420,
-            rationale=["Prioritized collaborative canvas paths."],
-        )
-        shallow = ShallowRepoEvidence(
-            repository=RepoSearchResult(**{
-                **repository.model_dump(),
-                "reference_type": "end_to_end",
-                "fit_score": 0.91,
-                "fit_summary": "It behaves like an end to end reference covering realtime collaboration and canvas rendering.",
-                "covered_primary": ["realtime collaboration", "canvas rendering"],
-                "missing_primary": ["presence"],
-                "semantic_readme_score": 0.82,
-                "relevance_score": 0.91,
-                "rank_reasons": ["covers primary capabilities: realtime collaboration, canvas rendering"],
-            }),
-            readme="Collaborative whiteboard with realtime collaboration and canvas rendering.",
-        )
-        secondary_shallow = ShallowRepoEvidence(
-            repository=RepoSearchResult(**{
-                **secondary_repository.model_dump(),
-                "reference_type": "subsystem",
-                "fit_score": 0.73,
-                "fit_summary": "It behaves like a subsystem reference covering canvas rendering.",
-                "covered_primary": ["canvas rendering"],
-                "missing_primary": ["realtime collaboration", "presence"],
-                "semantic_readme_score": 0.67,
-                "relevance_score": 0.73,
-                "rank_reasons": ["covers primary capabilities: canvas rendering"],
-            }),
-            readme="Collaborative canvas UI focused on drawing interactions.",
-        )
-        generated_analysis = AnalysisResponse(
-            idea_summary=keywords.summary,
-            keywords=keywords,
-            repositories=[repository],
-            repo_descriptions=["example/collab-board is useful because it demonstrates realtime collaboration."],
-            learning_path=[],
-            architecture_diagram="graph TD; User-->App;",
-            tech_stack=[],
-            status="complete",
-        )
-
-        class FakeCorpusService:
-            queued: list[str] = []
-            indexed: list[str] = []
-
-            def __init__(self) -> None:
-                self.queued = []
-                type(self).queued = self.queued
-                self.indexed = []
-                type(self).indexed = self.indexed
-
-            def load_indexed_repository(self, repo: RepoSearchResult) -> RepoSearchResult | None:
-                return None
-
-            def enqueue_index_job_placeholder(self, plan: RepoFetchPlan) -> bool:
-                self.queued.append(f"{plan.repository.full_name}@{plan.repository.commit_sha}")
-                return True
-
-            async def index_repository_plan(self, plan: RepoFetchPlan) -> RepoSearchResult:
-                self.indexed.append(f"{plan.repository.full_name}@{plan.repository.commit_sha}")
-                return plan.repository
-
-        class FakeRetrievalService:
-            async def retrieve(self, plan, repositories) -> dict:
-                return {}
-
-        with (
-            patch(
-                "routers.research.get_settings",
-                return_value=SimpleNamespace(
-                    PIPELINE_REQUEST_BUDGET_SECONDS=110,
-                    RAG_DEEP_INDEX_REPO_LIMIT=2,
-                    RAG_README_RERANK_LIMIT=2,
-                    INDEXING_MODE="background",
-                    RAG_INLINE_BOOTSTRAP_REPO_LIMIT=1,
-                    PIPELINE_RETRIEVAL_MIN_BUDGET_SECONDS=25,
-                    INDEXER_MAX_CONCURRENCY=2,
-                ),
-            ),
-            patch("routers.research.extract_keywords", AsyncMock(return_value=keywords)),
-            patch("routers.research.search_repo_candidates", AsyncMock(return_value=[repository, secondary_repository])),
-            patch("routers.research.fetch_shallow_repo_evidence_batch", AsyncMock(return_value=[shallow, secondary_shallow])),
-            patch("routers.research.rank_repo_evidence", AsyncMock(return_value=[shallow, secondary_shallow])),
-            patch("routers.research.fetch_repo_snapshot", AsyncMock(side_effect=[snapshot, secondary_snapshot])),
-            patch("routers.research.build_repo_fetch_plan", side_effect=[fetch_plan, secondary_fetch_plan]),
-            patch("routers.research.CorpusService", FakeCorpusService),
-            patch("routers.research.plan_retrieval_queries", AsyncMock(return_value=RetrievalPlan(queries=[]))) as plan_mock,
-            patch("routers.research.RetrievalService", return_value=FakeRetrievalService()),
-            patch("routers.research.generate_analysis", AsyncMock(return_value=generated_analysis)) as generate_mock,
-        ):
-            response = await research_idea(IdeaRequest(idea="an app where friends can draw together online"))
-
-        self.assertEqual("complete", response.status)
-        self.assertEqual(["example/secondary-board@commit-456"], FakeCorpusService.queued)
-        self.assertEqual(["example/collab-board@commit-123"], FakeCorpusService.indexed)
-        plan_mock.assert_awaited_once()
-        generate_mock.assert_awaited_once()
-        self.assertEqual({}, generate_mock.await_args.args[3])
-
-    async def test_research_request_inlines_five_repositories_when_bootstrap_limit_is_five(self):
+    async def test_research_request_indexes_all_selected_repositories_inline(self):
         keywords = ExtractedKeywords(
             summary="Collaborative whiteboard for shared online drawing sessions.",
             core_intent="Build a realtime shared canvas experience for multiple users.",
@@ -1584,21 +1425,14 @@ class ResearchPipelineOrchestrationTests(HermeticAsyncTestCase):
         )
 
         class FakeCorpusService:
-            queued: list[str] = []
             indexed: list[str] = []
 
             def __init__(self) -> None:
-                self.queued = []
-                type(self).queued = self.queued
                 self.indexed = []
                 type(self).indexed = self.indexed
 
             def load_indexed_repository(self, repo: RepoSearchResult) -> RepoSearchResult | None:
                 return None
-
-            def enqueue_index_job_placeholder(self, plan: RepoFetchPlan) -> bool:
-                self.queued.append(f"{plan.repository.full_name}@{plan.repository.commit_sha}")
-                return True
 
             async def index_repository_plan(self, plan: RepoFetchPlan) -> RepoSearchResult:
                 self.indexed.append(f"{plan.repository.full_name}@{plan.repository.commit_sha}")
@@ -1615,8 +1449,6 @@ class ResearchPipelineOrchestrationTests(HermeticAsyncTestCase):
                     PIPELINE_REQUEST_BUDGET_SECONDS=110,
                     RAG_DEEP_INDEX_REPO_LIMIT=5,
                     RAG_README_RERANK_LIMIT=5,
-                    INDEXING_MODE="background",
-                    RAG_INLINE_BOOTSTRAP_REPO_LIMIT=5,
                     PIPELINE_RETRIEVAL_MIN_BUDGET_SECONDS=25,
                     INDEXER_MAX_CONCURRENCY=3,
                 ),
@@ -1635,7 +1467,6 @@ class ResearchPipelineOrchestrationTests(HermeticAsyncTestCase):
             response = await research_idea(IdeaRequest(idea="an app where friends can draw together online"))
 
         self.assertEqual("complete", response.status)
-        self.assertEqual([], FakeCorpusService.queued)
         self.assertEqual(
             [f"example/collab-board-{index}@commit-{index}" for index in range(5)],
             FakeCorpusService.indexed,
@@ -1723,8 +1554,6 @@ class ResearchPipelineOrchestrationTests(HermeticAsyncTestCase):
                     PIPELINE_REQUEST_BUDGET_SECONDS=110,
                     RAG_DEEP_INDEX_REPO_LIMIT=1,
                     RAG_README_RERANK_LIMIT=1,
-                    INDEXING_MODE="background",
-                    RAG_INLINE_BOOTSTRAP_REPO_LIMIT=1,
                     PIPELINE_RETRIEVAL_MIN_BUDGET_SECONDS=25,
                     INDEXER_MAX_CONCURRENCY=2,
                 ),
@@ -1770,9 +1599,7 @@ class RepoChatRouteTests(HermeticAsyncTestCase):
                 end_line=24,
                 score=0.88,
                 dense_score=0.7,
-                lexical_score=0.6,
                 repo_prior=1.0,
-                role_prior=1.0,
                 reason="strong semantic match",
                 text="Architecture overview and realtime collaboration flow.",
             )
@@ -1896,17 +1723,6 @@ class RepoChatRouteTests(HermeticAsyncTestCase):
         self.assertEqual([], response.citations)
         self.assertEqual([], response.evidence_hits)
 
-    def test_chat_answer_role_prior_favors_docs_config_and_entrypoints(self):
-        retrieval_service = RetrievalService.__new__(RetrievalService)
-
-        documentation_score = retrieval_service._role_prior("documentation", ["documentation"], "chat_answer", "README.md")
-        config_score = retrieval_service._role_prior("config", ["config"], "chat_answer", "requirements.txt")
-        entrypoint_score = retrieval_service._role_prior("entrypoint", ["source"], "chat_answer", "src/server/main.py")
-
-        self.assertGreaterEqual(documentation_score, 1.0)
-        self.assertGreaterEqual(config_score, 1.0)
-        self.assertGreaterEqual(entrypoint_score, 0.95)
-
 
 class StreamingRouteTests(HermeticAsyncTestCase):
     """Tests for the SSE streaming POST /api/research route."""
@@ -2000,7 +1816,6 @@ class StreamingRouteTests(HermeticAsyncTestCase):
 
         fake_corpus = MagicMock()
         fake_corpus.load_indexed_repository.return_value = None
-        fake_corpus.enqueue_index_job_placeholder.return_value = False
         fake_corpus.index_repository_plan = AsyncMock(return_value=fake_indexed)
 
         fake_retrieval = MagicMock()
@@ -2160,7 +1975,6 @@ class StreamingRouteTests(HermeticAsyncTestCase):
 
         fake_corpus = MagicMock()
         fake_corpus.load_indexed_repository.return_value = None
-        fake_corpus.enqueue_index_job_placeholder.return_value = False
         fake_corpus.index_repository_plan = AsyncMock(return_value=fake_indexed)
 
         with (
