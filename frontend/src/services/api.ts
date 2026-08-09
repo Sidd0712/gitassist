@@ -1,19 +1,20 @@
-import axios from 'axios';
 import type { AnalysisResponse, RepoChatRequest, RepoChatResponse } from '../types';
 
 const API_KEY: string = (import.meta.env.VITE_API_KEY as string) ?? '';
-
-// axios instance kept for health + chat (non-streaming endpoints)
-const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL,
-  timeout: 600_000,
-  headers: {
-    'Content-Type': 'application/json',
-    ...(API_KEY ? { 'X-API-Key': API_KEY } : {}),
-  },
-});
-
 const BASE_URL: string = (import.meta.env.VITE_API_URL as string) ?? '';
+
+function authHeaders(): Record<string, string> {
+  return API_KEY ? { 'X-API-Key': API_KEY } : {};
+}
+
+async function parseErrorResponse(response: Response): Promise<string> {
+  try {
+    const errData = await response.json();
+    return (errData?.detail as string) || `HTTP ${response.status}`;
+  } catch {
+    return (await response.text()) || `HTTP ${response.status}`;
+  }
+}
 
 /**
  * Stream a research request via SSE.
@@ -33,21 +34,14 @@ export async function researchIdea(
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      ...(API_KEY ? { 'X-API-Key': API_KEY } : {}),
+      ...authHeaders(),
     },
     body: JSON.stringify({ idea, clarification_answers: clarificationAnswers }),
     signal,
   });
 
   if (!response.ok) {
-    let errorMessage: string;
-    try {
-      const errData = await response.json();
-      errorMessage = (errData?.detail as string) || `HTTP ${response.status}`;
-    } catch {
-      errorMessage = (await response.text()) || `HTTP ${response.status}`;
-    }
-    throw new Error(errorMessage);
+    throw new Error(await parseErrorResponse(response));
   }
 
   if (!response.body) {
@@ -111,11 +105,20 @@ function parseSseEvent(block: string): { type: string; message?: string; data?: 
 }
 
 export async function healthCheck(): Promise<{ status: string }> {
-  const { data } = await api.get('/health');
-  return data;
+  const response = await fetch(`${BASE_URL}/health`, { headers: authHeaders() });
+  if (!response.ok) throw new Error(await parseErrorResponse(response));
+  return response.json();
 }
 
 export async function chatAboutRepos(payload: RepoChatRequest): Promise<RepoChatResponse> {
-  const { data } = await api.post<RepoChatResponse>('/research/chat', payload);
-  return data;
+  const response = await fetch(`${BASE_URL}/research/chat`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...authHeaders(),
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) throw new Error(await parseErrorResponse(response));
+  return response.json();
 }

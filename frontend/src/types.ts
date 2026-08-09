@@ -1,5 +1,15 @@
 /* API response types mirroring the backend models. */
 
+export interface AmbiguityFlag {
+  axis: string;
+  question: string;
+  reason: string;
+  options: string[];
+  severity: 'low' | 'medium' | 'high';
+  resolved: boolean;
+  answer: string | null;
+}
+
 export interface ExtractedKeywords {
   keywords: string[];
   frameworks: string[];
@@ -11,14 +21,13 @@ export interface ExtractedKeywords {
   capabilities: string[];
   primary_capabilities: string[];
   secondary_capabilities: string[];
-  trivial_capabilities: string[];
-  capability_weights: Record<string, number>;
   domain_terms: string[];
   tech_terms: string[];
   constraints: string[];
   likely_components: string[];
   likely_integrations: string[];
   likely_stack_families: string[];
+  ambiguities: AmbiguityFlag[];
   assumptions: string[];
 }
 

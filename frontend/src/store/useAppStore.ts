@@ -4,6 +4,44 @@ import type { AnalysisResponse, RepoChatMessage, RepoChatScopeRepository } from 
 
 type AppView = 'home' | 'loading' | 'clarify' | 'results';
 type StepStatus = 'pending' | 'current' | 'complete';
+type Theme = 'light' | 'dark';
+
+export interface IdeaHistoryEntry {
+  id: string;
+  title: string;
+  idea: string;
+  when: number;
+}
+
+const THEME_STORAGE_KEY = 'gitassist:theme';
+const HISTORY_STORAGE_KEY = 'gitassist:idea-history';
+const MAX_HISTORY_ENTRIES = 12;
+
+function loadStoredTheme(): Theme | null {
+  if (typeof window === 'undefined') return null;
+  const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+  return stored === 'light' || stored === 'dark' ? stored : null;
+}
+
+function systemPrefersDark(): boolean {
+  return typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: dark)').matches;
+}
+
+function loadIdeaHistory(): IdeaHistoryEntry[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem(HISTORY_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveIdeaHistory(entries: IdeaHistoryEntry[]): void {
+  if (typeof window === 'undefined') return;
+  window.localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(entries));
+}
 
 export interface ProgressStep {
   message: string;
@@ -40,6 +78,8 @@ interface AppState {
   chatPending: boolean;
   chatError: string | null;
   isChatOpen: boolean;
+  theme: Theme;
+  ideaHistory: IdeaHistoryEntry[];
 
   setIdea: (idea: string) => void;
   setClarificationAnswer: (key: string, value: string) => void;
@@ -48,8 +88,19 @@ interface AppState {
   sendChatMessage: (question: string) => Promise<void>;
   toggleChat: () => void;
   resetChatSession: () => void;
+  setTheme: (theme: Theme) => void;
+  toggleTheme: () => void;
+  loadFromHistory: (entry: IdeaHistoryEntry) => void;
   reset: () => void;
 }
+
+function applyThemeToDocument(theme: Theme): void {
+  if (typeof document === 'undefined') return;
+  document.documentElement.dataset.theme = theme;
+}
+
+const initialTheme: Theme = loadStoredTheme() ?? (systemPrefersDark() ? 'dark' : 'light');
+applyThemeToDocument(initialTheme);
 
 export const useAppStore = create<AppState>((set, get) => ({
   view: 'home',
@@ -64,6 +115,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   chatPending: false,
   chatError: null,
   isChatOpen: false,
+  theme: initialTheme,
+  ideaHistory: loadIdeaHistory(),
 
   setIdea: (idea) => set({ idea }),
   setClarificationAnswer: (key, value) =>
@@ -73,6 +126,17 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   submitIdea: () => _runResearch(true, set, get),
   submitClarifications: () => _runResearch(false, set, get),
+
+  setTheme: (theme) => {
+    window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+    applyThemeToDocument(theme);
+    set({ theme });
+  },
+  toggleTheme: () => {
+    const next: Theme = get().theme === 'dark' ? 'light' : 'dark';
+    get().setTheme(next);
+  },
+  loadFromHistory: (entry) => set({ idea: entry.idea }),
 
   sendChatMessage: async (question) => {
     const trimmedQuestion = question.trim();
@@ -174,6 +238,10 @@ async function _runResearch(
   const { idea, clarificationAnswers, result: previousResult } = get();
   if (!idea.trim()) return;
 
+  if (isInitialSubmit) {
+    _recordHistoryEntry(idea, set, get);
+  }
+
   // Abort any prior in-flight stream
   const prior = get().activeResearchController;
   if (prior) prior.abort();
@@ -258,13 +326,26 @@ async function _runResearch(
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
 function extractErrorMessage(err: unknown): string {
-  if (err && typeof err === 'object') {
-    // axios-style
-    const axiosErr = err as { response?: { data?: { detail?: string } }; message?: string };
-    if (axiosErr.response?.data?.detail) return axiosErr.response.data.detail;
-    if (axiosErr.message) return axiosErr.message;
-  }
+  if (err instanceof Error && err.message) return err.message;
   return 'Something went wrong';
+}
+
+function _recordHistoryEntry(
+  idea: string,
+  set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+): void {
+  const trimmed = idea.trim();
+  const title = trimmed.length > 60 ? `${trimmed.slice(0, 60).trimEnd()}…` : trimmed;
+  const entry: IdeaHistoryEntry = {
+    id: `hist-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    title,
+    idea: trimmed,
+    when: Date.now(),
+  };
+  const next = [entry, ...get().ideaHistory].slice(0, MAX_HISTORY_ENTRIES);
+  saveIdeaHistory(next);
+  set({ ideaHistory: next });
 }
 
 function buildIntroMessage(result: AnalysisResponse): RepoChatMessage {
