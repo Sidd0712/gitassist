@@ -346,7 +346,18 @@ Implementation References: {repositories[0].get('full_name', 'reference') if rep
 Evidence:
 {self._format_evidence(evidence)}
 
-Generate 5-6 concrete learning steps with milestones. Return JSON array (no markdown):
+Generate 5-6 concrete learning steps with milestones.
+
+For "resources": never invent a specific article, blog post, or deep sub-page
+URL -- you cannot verify one exists. Only include a URL if it is either (a) a
+path shown in the Evidence above, referenced as "owner/repo - path", or (b) a
+top-level official documentation homepage for a named technology (e.g.
+"https://react.dev", "https://fastapi.tiangolo.com", "https://developer.mozilla.org",
+"https://docs.python.org", "https://redis.io") with no sub-path appended.
+Otherwise give the resource as plain text with no URL at all (e.g. "Official
+Express.js routing guide").
+
+Return JSON array (no markdown):
 [
   {{
     "step": 1,

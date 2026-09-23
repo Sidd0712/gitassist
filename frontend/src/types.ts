@@ -52,6 +52,7 @@ export interface RepoSearchResult {
   fit_summary?: string;
   covered_primary?: string[];
   missing_primary?: string[];
+  evidence_type?: 'deep_retrieval' | 'shallow_evidence' | 'no_evidence';
 }
 
 export interface LearningStep {

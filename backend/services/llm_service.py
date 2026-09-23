@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+
+import httpx
 
 from core.config import get_settings
 from models.schemas import (
@@ -331,6 +334,9 @@ async def generate_analysis(
         ),
     )
 
+    validated_resources = await _validate_resource_links(
+        [item.get("resources", [])[:6] for item in learning_path_data]
+    )
     learning_path = [
         LearningStep(
             step_number=item.get("step", index + 1),
@@ -338,7 +344,7 @@ async def generate_analysis(
             description=item.get("description", ""),
             milestone=item.get("milestone", ""),
             concepts=item.get("concepts", [])[:6],
-            resources=item.get("resources", [])[:6],
+            resources=validated_resources[index],
         )
         for index, item in enumerate(learning_path_data)
     ]
@@ -354,11 +360,17 @@ async def generate_analysis(
         for item in tech_stack_data
     ]
 
+    evidence_types = _compute_evidence_types(repositories, section_hits)
+    repositories_with_evidence = [
+        repo.model_copy(update={"evidence_type": evidence_types.get(repo.full_name, "shallow_evidence")})
+        for repo in repositories
+    ]
+
     return AnalysisResponse(
         idea_summary=keywords.summary or idea,
         keywords=keywords,
         assumptions=keywords.assumptions,
-        repositories=repositories,
+        repositories=repositories_with_evidence,
         repo_descriptions=repo_descriptions_data,
         learning_path=learning_path,
         architecture_diagram=architecture_diagram,
@@ -494,6 +506,104 @@ def _build_generation_evidence(
         "architecture_diagram": pack_hits("architecture_diagram"),
         "tech_stack": pack_hits("tech_stack"),
     }
+
+
+def _compute_evidence_types(
+    repositories: list[RepoSearchResult],
+    section_hits: dict[str, list[RetrievalHit]],
+) -> dict[str, str]:
+    """Classify what actually grounds each repo's narrative claims.
+
+    Deep-indexed retrieval hits are real evidence; a repo the pipeline only
+    ever saw via shallow candidate-ranking (README/manifest) text is weaker
+    but not nothing; a repo with neither should never sit next to citations
+    looking as verified as one that does. Surfaced on the response so the UI
+    can stop presenting all five selected repos as equally evidenced when
+    background indexing has only finished for some of them.
+    """
+    deep_hit_repos = {hit.repo_full_name for hits in section_hits.values() for hit in hits}
+
+    evidence_types: dict[str, str] = {}
+    for repo in repositories:
+        if repo.full_name in deep_hit_repos:
+            evidence_types[repo.full_name] = "deep_retrieval"
+        elif repo.description or repo.fit_summary:
+            evidence_types[repo.full_name] = "shallow_evidence"
+        else:
+            evidence_types[repo.full_name] = "no_evidence"
+    return evidence_types
+
+
+_URL_PATTERN = re.compile(r"https?://[^\s\)\]\"']+")
+_MAX_LINKS_TO_VALIDATE = 20
+
+
+async def _validate_resource_links(resource_lists: list[list[str]]) -> list[list[str]]:
+    """Drop learning-path resource links that don't actually resolve.
+
+    The model occasionally invents a plausible-looking but nonexistent
+    "further reading" URL alongside genuinely correct ones in the same
+    response. A bounded, concurrent check catches most of these before a
+    user clicks one. Ambiguous results (timeout, DNS failure, 4xx/5xx,
+    bot-blocked) are treated as "drop the link, keep the descriptive text"
+    rather than assumed valid -- a wrongly-dropped real link costs far less
+    trust than a kept fake one.
+    """
+    all_urls: list[str] = []
+    for resources in resource_lists:
+        for resource in resources:
+            match = _URL_PATTERN.search(resource)
+            if match:
+                all_urls.append(match.group(0).rstrip(".,;:)]'\""))
+
+    unique_urls = list(dict.fromkeys(all_urls))[:_MAX_LINKS_TO_VALIDATE]
+    if not unique_urls:
+        return resource_lists
+
+    validity = await _check_urls(unique_urls)
+
+    def clean(resource: str) -> str:
+        match = _URL_PATTERN.search(resource)
+        if not match:
+            return resource
+        url = match.group(0).rstrip(".,;:)]'\"")
+        if validity.get(url, True):
+            return resource
+        stripped = (resource[: match.start()] + resource[match.end():]).strip(" -–—:")
+        return stripped or resource
+
+    return [[clean(resource) for resource in resources] for resources in resource_lists]
+
+
+async def _check_urls(urls: list[str]) -> dict[str, bool]:
+    results: dict[str, bool] = {}
+
+    async def check(client: httpx.AsyncClient, url: str) -> None:
+        for method in ("HEAD", "GET"):
+            try:
+                response = await client.request(method, url, timeout=2.5)
+                if response.status_code == 405 and method == "HEAD":
+                    continue
+                results[url] = response.status_code < 400
+                return
+            except httpx.HTTPError:
+                continue
+        results[url] = False
+
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            headers={"User-Agent": "GitAssistAI-LinkValidator/1.0"},
+        ) as client:
+            await asyncio.gather(*(check(client, url) for url in urls))
+    except Exception as exc:
+        logger.warning("Resource link validation failed outright, keeping all links unchanged: %s", exc)
+        return {url: True for url in urls}
+
+    dropped = sum(1 for ok in results.values() if not ok)
+    if dropped:
+        logger.info("Resource link validation: dropped %d/%d unresolved URLs", dropped, len(urls))
+    return results
 
 
 def _truncate_text(text: str, limit: int) -> str:

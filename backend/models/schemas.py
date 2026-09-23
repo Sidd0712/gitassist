@@ -119,6 +119,7 @@ class RepoSearchResult(BaseModel):
     covered_primary: list[str] = Field(default_factory=list)
     missing_primary: list[str] = Field(default_factory=list)
     files: list[RepoFile] = Field(default_factory=list, description="Fetched source files")
+    evidence_type: Literal["deep_retrieval", "shallow_evidence", "no_evidence"] = "shallow_evidence"
 
 
 class RepoSnapshot(RepoSearchResult):

@@ -37,7 +37,13 @@ from services.github_service import (
     fetch_shallow_repo_evidence,
     search_repo_candidates,
 )
-from services.llm_service import build_clarification_questions, extract_keywords, generate_analysis, plan_retrieval_queries
+from services.llm_service import (
+    _validate_resource_links,
+    build_clarification_questions,
+    extract_keywords,
+    generate_analysis,
+    plan_retrieval_queries,
+)
 from services.pipeline_cache_service import clear_memory_caches
 from services.rag.ranking_service import rank_repo_evidence
 from services.rag.retrieval_service import RetrievalService
@@ -906,6 +912,75 @@ class RankingAndGenerationTests(HermeticAsyncTestCase):
         self.assertTrue(all(step.milestone for step in analysis.learning_path))
         self.assertTrue(all(step.concepts for step in analysis.learning_path[:3]))
         self.assertTrue(all(step.resources for step in analysis.learning_path[:3]))
+
+    async def test_generated_analysis_tags_repos_by_evidence_type(self):
+        """Regression test: repos backed by real retrieval hits vs. only shallow
+        README/manifest text must be distinguishable on the response, not both
+        presented as equally evidenced."""
+        keywords = await extract_keywords("Build a real-time collaborative whiteboard with WebSocket and canvas")
+        deep_repo = RepoSearchResult(
+            full_name="example/deep-indexed",
+            description="Fully indexed reference repo",
+            html_url="https://github.com/example/deep-indexed",
+            fit_summary="Covers realtime sync end to end.",
+        )
+        shallow_repo = RepoSearchResult(
+            full_name="example/shallow-only",
+            description="Still indexing in the background",
+            html_url="https://github.com/example/shallow-only",
+            fit_summary="Looked relevant from its README.",
+        )
+        no_evidence_repo = RepoSearchResult(
+            full_name="example/no-evidence",
+            html_url="https://github.com/example/no-evidence",
+        )
+
+        analysis = await generate_analysis(
+            "Build a real-time collaborative whiteboard with WebSocket and canvas",
+            keywords,
+            [deep_repo, shallow_repo, no_evidence_repo],
+            {
+                "repo_descriptions": [
+                    RetrievalHit(
+                        chunk_id="example/deep-indexed:src/sync.ts:1",
+                        repo_full_name="example/deep-indexed",
+                        path="src/sync.ts",
+                        chunk_role="source",
+                        start_line=1,
+                        end_line=10,
+                        reason="strong match",
+                        text="realtime sync implementation",
+                        score=0.9,
+                    )
+                ],
+                "learning_path": [],
+                "architecture_diagram": [],
+                "tech_stack": [],
+            },
+        )
+
+        by_name = {repo.full_name: repo.evidence_type for repo in analysis.repositories}
+        self.assertEqual("deep_retrieval", by_name["example/deep-indexed"])
+        self.assertEqual("shallow_evidence", by_name["example/shallow-only"])
+        self.assertEqual("no_evidence", by_name["example/no-evidence"])
+
+    async def test_validate_resource_links_drops_unresolved_urls_only(self):
+        """A fabricated/dead resource URL must be stripped while a real one is
+        kept, and the descriptive text around a dropped URL must survive."""
+        resource_lists = [
+            ["Official docs - https://real.example/docs", "Plain text resource, no URL"],
+            ["Fabricated guide - https://fake.example/nonexistent-page"],
+        ]
+
+        with patch(
+            "services.llm_service._check_urls",
+            AsyncMock(return_value={"https://real.example/docs": True, "https://fake.example/nonexistent-page": False}),
+        ):
+            cleaned = await _validate_resource_links(resource_lists)
+
+        self.assertEqual(["Official docs - https://real.example/docs", "Plain text resource, no URL"], cleaned[0])
+        self.assertNotIn("https://fake.example/nonexistent-page", cleaned[1][0])
+        self.assertIn("Fabricated guide", cleaned[1][0])
 
     async def test_meal_prep_generation_does_not_default_to_ai_stack(self):
         keywords = await extract_keywords(

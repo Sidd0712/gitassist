@@ -30,6 +30,14 @@ export function RepoList({ repositories, descriptions, citations, onCite }: Repo
                     {repo.full_name}
                   </a>
                   {repo.reference_type && <span className="tag tag-accent-2">{repo.reference_type}</span>}
+                  {repo.evidence_type && repo.evidence_type !== 'deep_retrieval' && (
+                    <span
+                      className="tag tag-neutral"
+                      title="This repo hasn't finished deep code indexing yet, so its description is based on its overview page only"
+                    >
+                      {repo.evidence_type === 'shallow_evidence' ? 'based on repo overview' : 'not yet reviewed'}
+                    </span>
+                  )}
                 </div>
                 <p className="card-body" style={{ marginTop: 4 }}>
                   {description}
