@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import re
 import sys
@@ -22,11 +23,12 @@ from models.schemas import (
     RepoFile,
     RepoSearchResult,
     RepoSnapshot,
+    RepoTreeEntry,
     RetrievalHit,
     RetrievalPlan,
     ShallowRepoEvidence,
 )
-from routers.research import chat_about_repositories, research_idea
+from routers.research import _low_confidence_caveat, _skip_if_not_indexable, chat_about_repositories, research_idea
 import services.github_service as github_service_module
 from services.github_service import (
     build_repo_fetch_plan,
@@ -571,6 +573,46 @@ class HermeticAsyncTestCase(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(patcher.stop)
         clear_memory_caches()
         github_service_module._cache.clear()
+
+
+class ConfidenceSignalingTests(unittest.TestCase):
+    """Unit tests for the absolute-floor confidence caveat and zero-files gate."""
+
+    def test_weak_pool_gets_a_caveat_even_when_relatively_ranked_first(self):
+        weak_repo = RepoSearchResult(
+            full_name="unrelated/repo",
+            html_url="https://github.com/unrelated/repo",
+            fit_score=0.19,
+            relevance_score=0.43,
+        )
+        caveat = _low_confidence_caveat([weak_repo])
+        self.assertIsNotNone(caveat)
+        self.assertIn("weak match", caveat)
+
+    def test_strong_pool_gets_no_caveat(self):
+        strong_repo = RepoSearchResult(
+            full_name="example/great-match",
+            html_url="https://github.com/example/great-match",
+            fit_score=0.88,
+        )
+        self.assertIsNone(_low_confidence_caveat([strong_repo]))
+
+    def test_empty_repository_list_gets_no_caveat(self):
+        self.assertIsNone(_low_confidence_caveat([]))
+
+    def test_plan_with_no_selected_paths_is_flagged_unindexable(self):
+        empty_plan = RepoFetchPlan(
+            repository=RepoSearchResult(full_name="Sfedfcv/redesigned-pancake", html_url="https://github.com/Sfedfcv/redesigned-pancake"),
+            selected_paths=[],
+        )
+        self.assertTrue(_skip_if_not_indexable(empty_plan))
+
+    def test_plan_with_selected_paths_is_not_flagged_unindexable(self):
+        real_plan = RepoFetchPlan(
+            repository=RepoSearchResult(full_name="example/real-repo", html_url="https://github.com/example/real-repo"),
+            selected_paths=["README.md", "src/main.py"],
+        )
+        self.assertFalse(_skip_if_not_indexable(real_plan))
 
 
 class IntentExtractionTests(HermeticAsyncTestCase):
@@ -1355,7 +1397,7 @@ class CacheAndFallbackTests(HermeticAsyncTestCase):
 
 
 class ResearchPipelineOrchestrationTests(HermeticAsyncTestCase):
-    async def test_research_request_indexes_all_selected_repositories_inline(self):
+    async def test_research_request_returns_fast_and_indexes_in_background(self):
         keywords = ExtractedKeywords(
             summary="Collaborative whiteboard for shared online drawing sessions.",
             core_intent="Build a realtime shared canvas experience for multiple users.",
@@ -1466,10 +1508,21 @@ class ResearchPipelineOrchestrationTests(HermeticAsyncTestCase):
         ):
             response = await research_idea(IdeaRequest(idea="an app where friends can draw together online"))
 
-        self.assertEqual("complete", response.status)
+            # The response must not block on deep indexing (council finding,
+            # 2026-09: real embedding throughput makes synchronous indexing take
+            # minutes per repo) — it returns immediately with FakeCorpusService
+            # still empty, then the fire-and-forget background task catches up.
+            self.assertEqual("complete", response.status)
+            self.assertEqual([], FakeCorpusService.indexed)
+
+            from routers.research import _background_tasks
+
+            self.assertEqual(1, len(_background_tasks))
+            await asyncio.gather(*_background_tasks)
+
         self.assertEqual(
-            [f"example/collab-board-{index}@commit-{index}" for index in range(5)],
-            FakeCorpusService.indexed,
+            {f"example/collab-board-{index}@commit-{index}" for index in range(5)},
+            set(FakeCorpusService.indexed),
         )
 
     async def test_research_request_merges_fresh_fit_metrics_into_cached_repositories(self):
@@ -1576,6 +1629,79 @@ class ResearchPipelineOrchestrationTests(HermeticAsyncTestCase):
         self.assertEqual("end_to_end", routed_repo.reference_type)
         self.assertEqual(0.88, routed_repo.fit_score)
         self.assertIn("realtime collaboration", routed_repo.covered_primary)
+
+    async def test_repo_with_zero_indexable_files_is_skipped_not_selected(self):
+        """Regression test for a live-reproduced failure: GitHub metadata search can
+
+        surface an empty/placeholder repo (e.g. "Sfedfcv/redesigned-pancake", an
+        unrelated repo with 0 index-eligible files) as the sole candidate for a
+        niche idea. It must be skipped before wasting an indexing attempt, and
+        the request must fail cleanly with status="error" rather than crash.
+        """
+        keywords = ExtractedKeywords(
+            summary="A Slack bot that triages GitHub issues by severity.",
+            core_intent="Automate issue triage and routing based on code ownership.",
+            product_type="devops automation bot",
+        )
+        empty_repo = RepoSearchResult(
+            full_name="Sfedfcv/redesigned-pancake",
+            html_url="https://github.com/Sfedfcv/redesigned-pancake",
+            stars=266,
+            commit_sha="commit-empty",
+        )
+        shallow = ShallowRepoEvidence(repository=empty_repo, readme="")
+        snapshot = RepoSnapshot(
+            full_name="Sfedfcv/redesigned-pancake",
+            html_url="https://github.com/Sfedfcv/redesigned-pancake",
+            stars=266,
+            commit_sha="commit-empty",
+            tree=[],
+        )
+        empty_plan = RepoFetchPlan(
+            repository=empty_repo,
+            selected_paths=[],
+            skipped_paths=[],
+            estimated_chars=0,
+            rationale=[],
+        )
+
+        load_indexed_calls: list[str] = []
+        index_calls: list[str] = []
+
+        class FakeCorpusService:
+            def load_indexed_repository(self, repo: RepoSearchResult) -> RepoSearchResult | None:
+                load_indexed_calls.append(repo.full_name)
+                return None
+
+            async def index_repository_plan(self, plan: RepoFetchPlan) -> RepoSearchResult:
+                index_calls.append(plan.repository.full_name)
+                return plan.repository
+
+        with (
+            patch(
+                "routers.research.get_settings",
+                return_value=SimpleNamespace(
+                    PIPELINE_REQUEST_BUDGET_SECONDS=110,
+                    RAG_DEEP_INDEX_REPO_LIMIT=1,
+                    RAG_README_RERANK_LIMIT=1,
+                    PIPELINE_RETRIEVAL_MIN_BUDGET_SECONDS=25,
+                    INDEXER_MAX_CONCURRENCY=2,
+                ),
+            ),
+            patch("routers.research.extract_keywords", AsyncMock(return_value=keywords)),
+            patch("routers.research.search_repo_candidates", AsyncMock(return_value=[empty_repo])),
+            patch("routers.research.fetch_shallow_repo_evidence_batch", AsyncMock(return_value=[shallow])),
+            patch("routers.research.rank_repo_evidence", AsyncMock(return_value=[shallow])),
+            patch("routers.research.fetch_repo_snapshot", AsyncMock(return_value=snapshot)),
+            patch("routers.research.build_repo_fetch_plan", return_value=empty_plan),
+            patch("routers.research.CorpusService", return_value=FakeCorpusService()),
+            patch("routers.research.generate_analysis", AsyncMock(return_value=AnalysisResponse(status="complete"))),
+        ):
+            response = await research_idea(IdeaRequest(idea="a Slack bot that triages GitHub issues by severity"))
+
+        self.assertEqual("error", response.status)
+        self.assertEqual([], load_indexed_calls, "Should never check the cache for an unindexable repo")
+        self.assertEqual([], index_calls, "Should never attempt to index a repo with zero eligible files")
 
 
 class RepoChatRouteTests(HermeticAsyncTestCase):
@@ -1790,7 +1916,7 @@ class StreamingRouteTests(HermeticAsyncTestCase):
             language="TypeScript",
             topics=["whiteboard", "canvas", "websocket"],
             commit_sha="abc123",
-            tree=[],
+            tree=[RepoTreeEntry(path="src/socket/server.ts", type="blob", size=500)],
         )
 
         from unittest.mock import AsyncMock, MagicMock, patch
@@ -1814,8 +1940,12 @@ class StreamingRouteTests(HermeticAsyncTestCase):
             commit_sha="abc123",
         )
 
+        # Simulate a cache hit (already indexed at this commit) — retrieval only
+        # runs against cache-hit repos now that fresh indexing is fire-and-forget
+        # in the background, so this is what it takes to exercise the full
+        # 6-step happy path including the retrieval progress step.
         fake_corpus = MagicMock()
-        fake_corpus.load_indexed_repository.return_value = None
+        fake_corpus.load_indexed_repository.return_value = fake_indexed
         fake_corpus.index_repository_plan = AsyncMock(return_value=fake_indexed)
 
         fake_retrieval = MagicMock()
@@ -1949,7 +2079,7 @@ class StreamingRouteTests(HermeticAsyncTestCase):
             language="TypeScript",
             topics=["whiteboard", "canvas", "websocket"],
             commit_sha="abc123",
-            tree=[],
+            tree=[RepoTreeEntry(path="src/socket/server.ts", type="blob", size=500)],
         )
         ranked = ShallowRepoEvidence(
             repository=RepoSearchResult(

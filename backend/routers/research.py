@@ -20,6 +20,7 @@ from models.schemas import (
     RepoChatEvidenceHit,
     RepoChatRequest,
     RepoChatResponse,
+    RepoFetchPlan,
     RepoSearchResult,
     RepoSnapshot,
     RetrievalPlan,
@@ -92,6 +93,36 @@ def _enforce_rate_limit(http_request: Request) -> None:
 _guarded = [Depends(_require_api_key), Depends(_enforce_rate_limit)]
 
 
+# ── Background (non-blocking) deep indexing ─────────────────────────────────
+# Council finding (2026-09): deep indexing was being awaited synchronously
+# before generation, but generate_analysis's evidence pack is grounded mainly
+# by repo_dicts (description/fit_summary/reference_type from shallow rerank)
+# with section_hits only adding citations on top — so a repo missing deep
+# hits still gets a real, metadata-grounded description, not a blank one.
+# Given real measured embedding throughput (~6 chunks/sec on realistic code,
+# not the ~56/sec a toy benchmark suggested), blocking the request on fresh
+# indexing could take minutes per repo — the report doesn't need to wait for
+# that. Deep indexing now runs fire-and-forget; repo-chat naturally 409s /
+# returns "no evidence" for a repo until its background job lands, then finds
+# real chunks on the next attempt with no extra plumbing needed.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _fire_and_forget_indexing(corpus_service: CorpusService, plans: list) -> None:
+    if not plans:
+        return
+
+    async def _run() -> None:
+        try:
+            await _index_selected_plans(corpus_service, plans)
+        except Exception:
+            logger.exception("Background deep indexing failed for %d plan(s)", len(plans))
+
+    task = asyncio.create_task(_run())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 async def research_idea(request: IdeaRequest) -> AnalysisResponse:
     """Plain async helper — run the full research pipeline and return AnalysisResponse.
 
@@ -162,27 +193,37 @@ async def research_idea(request: IdeaRequest) -> AnalysisResponse:
         corpus_service = CorpusService()
         index_started = perf_counter()
         indexed_repositories = []
+        cache_hit_repositories = []
         inline_plans = []
 
         snapshot_pairs = await _fetch_selected_snapshots(selected)
         for repository, snapshot in snapshot_pairs:
             shallow = selected_evidence_map.get(repository.full_name)
             plan = build_repo_fetch_plan(snapshot, keywords, shallow)
+            if _skip_if_not_indexable(plan):
+                continue
             cached_repository = corpus_service.load_indexed_repository(plan.repository)
             if cached_repository is not None:
-                indexed_repositories.append(_merge_ranked_repository_metrics(cached_repository, plan.repository))
+                merged = _merge_ranked_repository_metrics(cached_repository, plan.repository)
+                indexed_repositories.append(merged)
+                cache_hit_repositories.append(merged)
                 continue
 
             inline_plans.append(plan)
 
         if inline_plans:
-            newly_indexed = await _index_selected_plans(corpus_service, inline_plans)
-            indexed_repositories.extend(newly_indexed)
+            # Fire-and-forget: don't block report generation on fresh embedding
+            # (see _fire_and_forget_indexing docstring). These repos still carry
+            # real fit_summary/description/reference_type from shallow rerank,
+            # so generation grounds them meaningfully even without deep hits yet.
+            _fire_and_forget_indexing(corpus_service, inline_plans)
+            indexed_repositories.extend(plan.repository for plan in inline_plans)
 
         logger.info(
-            "Deep index preparation completed in %.2fs; %d repos ready",
+            "Deep index preparation completed in %.2fs; %d repos ready (%d indexing in background)",
             budget.record_stage("snapshot_and_index_stage", index_started),
             len(indexed_repositories),
+            len(inline_plans),
         )
 
         if not indexed_repositories:
@@ -196,15 +237,22 @@ async def research_idea(request: IdeaRequest) -> AnalysisResponse:
             return analysis
 
         section_hits = {}
-        if budget.has_time_for(settings.PIPELINE_RETRIEVAL_MIN_BUDGET_SECONDS):
+        # Only repos already indexed under this exact commit/model/chunking-version
+        # combo (cache hits) have any chunks to search yet — freshly-dispatched
+        # repos are still embedding in the background. Skip retrieval entirely
+        # when there's nothing to retrieve against; it would just pay the
+        # embedding-provider dispatch cost for guaranteed zero hits.
+        if cache_hit_repositories and budget.has_time_for(settings.PIPELINE_RETRIEVAL_MIN_BUDGET_SECONDS):
             retrieval_plan_started = perf_counter()
-            retrieval_plan = await plan_retrieval_queries(request.idea, keywords, indexed_repositories)
+            retrieval_plan = await plan_retrieval_queries(request.idea, keywords, cache_hit_repositories)
             logger.info("Retrieval plan completed in %.2fs", budget.record_stage("retrieval_planning", retrieval_plan_started))
 
             retrieval_started = perf_counter()
             retrieval_service = RetrievalService()
-            section_hits = await retrieval_service.retrieve(retrieval_plan, indexed_repositories)
+            section_hits = await retrieval_service.retrieve(retrieval_plan, cache_hit_repositories)
             logger.info("Retrieval completed in %.2fs", budget.record_stage("retrieval", retrieval_started))
+        elif not cache_hit_repositories:
+            logger.info("Skipping retrieval: all %d selected repos are still indexing in background", len(inline_plans))
         else:
             logger.info(
                 "Skipping deep retrieval because only %.2fs remain in the request budget",
@@ -222,6 +270,9 @@ async def research_idea(request: IdeaRequest) -> AnalysisResponse:
 
         for repository in analysis.repositories:
             repository.files = []
+
+        if analysis.status == "complete" and not analysis.error:
+            analysis.error = _low_confidence_caveat(analysis.repositories)
 
         logger.info(
             "Research completed in %.2fs with stage timings: %s",
@@ -328,34 +379,36 @@ async def _research_sse_generator(request: IdeaRequest, http_request: Request):
         corpus_service = CorpusService()
         index_started = perf_counter()
         indexed_repositories = []
+        cache_hit_repositories = []
         inline_plans = []
 
         snapshot_pairs = await _fetch_selected_snapshots(selected)
         for repository, snapshot in snapshot_pairs:
             shallow = selected_evidence_map.get(repository.full_name)
             plan = build_repo_fetch_plan(snapshot, keywords, shallow)
+            if _skip_if_not_indexable(plan):
+                continue
             cached_repository = corpus_service.load_indexed_repository(plan.repository)
             if cached_repository is not None:
-                indexed_repositories.append(_merge_ranked_repository_metrics(cached_repository, plan.repository))
+                merged = _merge_ranked_repository_metrics(cached_repository, plan.repository)
+                indexed_repositories.append(merged)
+                cache_hit_repositories.append(merged)
                 continue
 
             inline_plans.append(plan)
 
         if inline_plans:
-            try:
-                newly_indexed = await asyncio.wait_for(
-                    _index_selected_plans(corpus_service, inline_plans),
-                    timeout=max(1.0, budget.remaining_seconds()),
-                )
-            except asyncio.TimeoutError:
-                logger.warning("Deep indexing exceeded remaining request budget; continuing with repos indexed so far")
-                newly_indexed = []
-            indexed_repositories.extend(newly_indexed)
+            # Fire-and-forget: don't block the SSE stream on fresh embedding.
+            # See _fire_and_forget_indexing docstring for why this is safe —
+            # these repos still ground generation via shallow-rerank metadata.
+            _fire_and_forget_indexing(corpus_service, inline_plans)
+            indexed_repositories.extend(plan.repository for plan in inline_plans)
 
         logger.info(
-            "Deep index preparation completed in %.2fs; %d repos ready",
+            "Deep index preparation completed in %.2fs; %d repos ready (%d indexing in background)",
             budget.record_stage("snapshot_and_index_stage", index_started),
             len(indexed_repositories),
+            len(inline_plans),
         )
 
         if not indexed_repositories:
@@ -374,16 +427,21 @@ async def _research_sse_generator(request: IdeaRequest, http_request: Request):
 
         # Step 5 — retrieval
         section_hits = {}
-        if budget.has_time_for(settings.PIPELINE_RETRIEVAL_MIN_BUDGET_SECONDS):
+        # Same reasoning as the plain research_idea() path: only cache-hit repos
+        # have chunks to search yet, so skip retrieval entirely rather than pay
+        # its dispatch cost for guaranteed zero hits against freshly-dispatched repos.
+        if cache_hit_repositories and budget.has_time_for(settings.PIPELINE_RETRIEVAL_MIN_BUDGET_SECONDS):
             yield _sse({"type": "progress", "message": _PROGRESS_RETRIEVING})
             retrieval_plan_started = perf_counter()
-            retrieval_plan = await plan_retrieval_queries(request.idea, keywords, indexed_repositories)
+            retrieval_plan = await plan_retrieval_queries(request.idea, keywords, cache_hit_repositories)
             logger.info("Retrieval plan completed in %.2fs", budget.record_stage("retrieval_planning", retrieval_plan_started))
 
             retrieval_started = perf_counter()
             retrieval_service = RetrievalService()
-            section_hits = await retrieval_service.retrieve(retrieval_plan, indexed_repositories)
+            section_hits = await retrieval_service.retrieve(retrieval_plan, cache_hit_repositories)
             logger.info("Retrieval completed in %.2fs", budget.record_stage("retrieval", retrieval_started))
+        elif not cache_hit_repositories:
+            logger.info("Skipping retrieval: all %d selected repos are still indexing in background", len(inline_plans))
         else:
             logger.info(
                 "Skipping deep retrieval because only %.2fs remain in the request budget",
@@ -406,6 +464,9 @@ async def _research_sse_generator(request: IdeaRequest, http_request: Request):
 
         for repository in analysis.repositories:
             repository.files = []
+
+        if analysis.status == "complete" and not analysis.error:
+            analysis.error = _low_confidence_caveat(analysis.repositories)
 
         logger.info(
             "Research completed in %.2fs with stage timings: %s",
@@ -569,6 +630,23 @@ def _merge_ranked_repository_metrics(repository: RepoSearchResult, ranked_reposi
     return merged
 
 
+def _skip_if_not_indexable(plan: RepoFetchPlan) -> bool:
+    """True if this repo has no index-eligible files and should be skipped entirely.
+
+    A repo with zero selected_paths (an empty or placeholder repo that only
+    matched on weak metadata similarity) would otherwise be handed to the
+    indexer, produce an empty index, and -- if it was the only repo selected --
+    make the whole request error out with no indication of why.
+    """
+    if plan.selected_paths:
+        return False
+    logger.warning(
+        "Skipping %s: no index-eligible files found (empty or placeholder repo)",
+        plan.repository.full_name,
+    )
+    return True
+
+
 def _apply_baseline_fit_metrics(repository: RepoSearchResult) -> None:
     if repository.fit_score <= 0 and repository.relevance_score > 0:
         repository.fit_score = round(repository.relevance_score, 4)
@@ -580,6 +658,36 @@ def _apply_baseline_fit_metrics(repository: RepoSearchResult) -> None:
             )
         else:
             repository.fit_summary = "Selected from GitHub candidate search based on metadata and query relevance."
+
+
+# Below this, a repo's fit score reflects "the best of a weak pool," not a
+# genuine match -- GitHub's metadata-only search can come back thin for niche
+# ideas whose vocabulary doesn't match how real matching repos describe
+# themselves. Chosen as a floor clearly below the percentile-relative scores
+# normal matches land at, not tuned against a specific dataset.
+_MIN_CONFIDENT_FIT_SCORE = 0.35
+
+
+def _low_confidence_caveat(repositories: list[RepoSearchResult]) -> str | None:
+    """Return a user-facing caveat if the whole repo pool is a weak match.
+
+    Percentile-relative scoring always crowns a "best" candidate even when
+    every candidate is a poor fit -- this catches that case with an absolute
+    floor instead, so a niche idea gets an honest "we didn't find strong
+    references" instead of a confidently-labeled weak match.
+    """
+    if not repositories:
+        return None
+    best_fit = max((repo.fit_score or repo.relevance_score) for repo in repositories)
+    if best_fit >= _MIN_CONFIDENT_FIT_SCORE:
+        return None
+    return (
+        "The repositories found are a weak match for this idea (GitHub's search "
+        "only looks at repo names/descriptions/READMEs, not code content, so niche "
+        "or novel ideas can come back thin). Treat the results below as loose "
+        "inspiration rather than close references, or try rephrasing the idea with "
+        "more specific technical terms."
+    )
 
 
 def _truncate_hit_text(text: str, limit: int = 280) -> str:

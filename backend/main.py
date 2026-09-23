@@ -10,6 +10,7 @@ import asyncio
 from core.config import get_settings
 from routers.research import router as research_router
 from services.github_client_service import close_github_client
+from services.rag.embedding_service import EmbeddingService
 from services.rag.store_service import get_rag_store
 
 logging.basicConfig(
@@ -28,7 +29,12 @@ async def lifespan(app: FastAPI):
     stats = store.get_stats()
     logger.info("%s starting up", settings.APP_NAME)
     logger.info("  LLM model: %s", settings.LLM_MODEL)
-    logger.info("  Embedding model: %s", settings.EMBEDDING_MODEL)
+    embedding_service = EmbeddingService()
+    logger.info(
+        "  Embedding provider: %s (model: %s)",
+        embedding_service.provider,
+        embedding_service.embedding_model_name,
+    )
     logger.info(
         "  RAG store: %s (%d indexed repos, %d chunks)",
         store.backend_name,
