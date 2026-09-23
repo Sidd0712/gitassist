@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from core.config import get_settings
 from models.schemas import (
     AnalysisResponse,
     ChatMessage,
@@ -34,6 +35,7 @@ async def extract_keywords(idea: str, clarification_answers: dict[str, str] | No
 
     cache_key = stable_cache_key(
         {
+            "model": get_settings().LLM_MODEL,
             "idea": " ".join(idea.strip().lower().split()),
             "clarification_answers": compact_mapping(clarification_answers or {}),
         }
@@ -134,6 +136,7 @@ async def plan_retrieval_queries(
     ]
     cache_key = stable_cache_key(
         {
+            "model": get_settings().LLM_MODEL,
             "idea": idea.strip(),
             "keywords": compact_mapping(
                 {

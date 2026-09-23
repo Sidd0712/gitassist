@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     # LLM / Groq API
     GROQ_API_KEY: str = ""  # Groq API key (get from console.groq.com)
     LLM_PROVIDER: str = "groq"
-    LLM_MODEL: str = "llama-3.3-70b-versatile"  # Groq's latest 70B model (3.1 was decommissioned)
+    LLM_MODEL: str = "openai/gpt-oss-120b"  # llama-3.3-70b-versatile was decommissioned 2026-09; verify model availability at console.groq.com before changing
     LLM_TIMEOUT_SECONDS: int = 60
     LLM_MAX_RETRIES: int = 3
     LLM_AUX_TIMEOUT_SECONDS: int = 20

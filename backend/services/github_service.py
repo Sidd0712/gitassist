@@ -366,6 +366,7 @@ async def _build_search_query_specs(keywords: ExtractedKeywords) -> list[SearchQ
     settings = get_settings()
     cache_key = stable_cache_key({
         "v": _SEARCH_CACHE_VERSION,
+        "model": settings.LLM_MODEL,
         "summary": keywords.summary,
         "core_intent": keywords.core_intent,
         "product_type": keywords.product_type,

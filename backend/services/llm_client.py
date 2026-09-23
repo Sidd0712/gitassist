@@ -52,6 +52,8 @@ class LLMClient:
                 extra_kwargs = {"response_format": {"type": "json_object"}} if json_mode else {}
                 if seed is not None:
                     extra_kwargs["seed"] = seed
+                if "gpt-oss" in self.model:
+                    extra_kwargs["reasoning_effort"] = "low"
                 response = await asyncio.wait_for(
                     self.client.chat.completions.create(
                         model=self.model,
@@ -317,7 +319,7 @@ No markdown, just the JSON array."""
         descriptions = await self._call_json_api(
             prompt,
             temperature=0.55,
-            max_tokens=900,
+            max_tokens=1600,
             timeout_seconds=self.settings.LLM_GENERATION_TIMEOUT_SECONDS,
             json_mode=False,
         )
@@ -359,7 +361,7 @@ Generate 5-6 concrete learning steps with milestones. Return JSON array (no mark
         path = await self._call_json_api(
             prompt,
             temperature=0.65,
-            max_tokens=1400,
+            max_tokens=2200,
             timeout_seconds=self.settings.LLM_GENERATION_TIMEOUT_SECONDS,
             json_mode=False,
         )
@@ -406,7 +408,7 @@ Return JSON array (no markdown):
         stack = await self._call_json_api(
             prompt,
             temperature=0.55,
-            max_tokens=1200,
+            max_tokens=2000,
             timeout_seconds=self.settings.LLM_GENERATION_TIMEOUT_SECONDS,
             json_mode=False,
         )
@@ -454,7 +456,7 @@ Return ONLY valid Mermaid code, no markdown blocks, no explanations."""
             response = await self._call_api(
                 prompt,
                 temperature=0.2,
-                max_tokens=700,
+                max_tokens=1100,
                 timeout_seconds=self.settings.LLM_GENERATION_TIMEOUT_SECONDS,
             )
         except Exception as exc:
