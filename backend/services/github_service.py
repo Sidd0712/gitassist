@@ -8,6 +8,7 @@ import io
 import logging
 import math
 import posixpath
+import re
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
@@ -306,6 +307,36 @@ def _deserialize_query_specs(payload: object) -> list[SearchQuerySpec]:
 
 # ── Fallback / composition helpers ────────────────────────────────────────────
 
+# GitHub search qualifiers (repo:, user:, org:, etc.) take exact values, not
+# globs. The LLM occasionally hallucinates wildcard syntax like `repo:*/**`,
+# which GitHub's search API rejects outright with a 422 — the whole query then
+# silently contributes zero candidates (asyncio.gather swallows the exception).
+_INVALID_WILDCARD_QUALIFIER = re.compile(r"\b\w+:\S*\*\S*")
+# The LLM is asked for 2-5 word queries but doesn't reliably comply; long,
+# keyword-stuffed queries match real repo metadata worse than short ones.
+_MAX_QUERY_WORDS = 8
+
+
+def _sanitize_search_query(query: str) -> str:
+    """Fix up an LLM-generated GitHub search query before it's ever sent.
+
+    Strips qualifier tokens with invalid wildcard values and caps free-text
+    length, rather than letting a malformed query fail the whole search call.
+    Valid qualifier tokens (language:python, in:readme, etc.) are always kept
+    regardless of where they fall in the word-count cap — truncating from the
+    end would otherwise silently drop a deliberately appended qualifier.
+    """
+    if not query:
+        return query
+    cleaned = _INVALID_WILDCARD_QUALIFIER.sub("", query)
+    tokens = cleaned.split()
+    qualifiers = [t for t in tokens if ":" in t]
+    free_text = [t for t in tokens if ":" not in t]
+    if len(free_text) > _MAX_QUERY_WORDS:
+        free_text = free_text[:_MAX_QUERY_WORDS]
+    return " ".join(free_text + qualifiers).strip()
+
+
 def _fallback_broad_queries(keywords: ExtractedKeywords) -> list[str]:
     product_type = keywords.product_type or keywords.summary
     domain_cluster = " ".join(keywords.domain_terms[:3])
@@ -394,7 +425,7 @@ async def _build_search_query_specs(keywords: ExtractedKeywords) -> list[SearchQ
     seen: set[str] = set()
 
     def _add(query: str, kind: str, concept_family: str | None = None) -> None:
-        norm = " ".join(query.split()).strip()
+        norm = _sanitize_search_query(" ".join(query.split()).strip())
         if norm and norm.lower() not in seen:
             specs.append(SearchQuerySpec(query=norm, kind=kind, concept_family=concept_family))
             seen.add(norm.lower())
@@ -724,33 +755,70 @@ async def search_repo_candidates(keywords: ExtractedKeywords) -> list[RepoSearch
             _persistent_cache.set_json("github_search", ck, items)
             return spec, items
 
+    def _merge_search_results(results: list) -> None:
+        for result in results:
+            if isinstance(result, Exception):
+                logger.warning("GitHub query failed: %s", result)
+                continue
+            spec, items = result
+            for item in items:
+                repo = RepoSearchResult(
+                    full_name=item["full_name"],
+                    description=item.get("description"),
+                    html_url=item["html_url"],
+                    stars=item.get("stargazers_count", 0),
+                    language=item.get("language"),
+                    topics=item.get("topics", []),
+                    archived=item.get("archived", False),
+                    updated_at=item.get("updated_at"),
+                )
+                existing = merged.get(repo.full_name)
+                if existing is None or repo.stars > existing.stars:
+                    merged[repo.full_name] = repo
+                query_hits[repo.full_name].add(spec.query)
+                if spec.kind in {"broad", "language"}:
+                    broad_hits[repo.full_name].add(spec.query)
+                if spec.concept_family:
+                    concept_hits[repo.full_name].add(spec.concept_family)
+
     results = await asyncio.gather(
         *(fetch_query(s) for s in query_specs), return_exceptions=True
     )
-    for result in results:
-        if isinstance(result, Exception):
-            logger.warning("GitHub query failed: %s", result)
-            continue
-        spec, items = result
-        for item in items:
-            repo = RepoSearchResult(
-                full_name=item["full_name"],
-                description=item.get("description"),
-                html_url=item["html_url"],
-                stars=item.get("stargazers_count", 0),
-                language=item.get("language"),
-                topics=item.get("topics", []),
-                archived=item.get("archived", False),
-                updated_at=item.get("updated_at"),
+    _merge_search_results(results)
+
+    # Low-candidate-pool fallback: GitHub's /search/repositories only matches
+    # metadata (name/description/README-adjacent/topics), so niche ideas whose
+    # targeted queries don't share vocabulary with how real matching repos
+    # describe themselves can come back nearly empty. Retry with a couple of
+    # maximally broad, deterministic (no extra LLM call) queries before
+    # accepting a thin pool -- cheap insurance against confidently selecting
+    # the one unrelated repo that happened to match.
+    _MIN_CANDIDATE_POOL = 5
+    if len(merged) < _MIN_CANDIDATE_POOL:
+        tried = {s.query.lower() for s in query_specs}
+        broadening_specs = [
+            SearchQuerySpec(query=q, kind="broad_fallback")
+            for q in _fallback_broad_queries(keywords) + [keywords.product_type]
+            if q and _sanitize_search_query(q).lower() not in tried
+        ]
+        # Dedupe while preserving order, cap at 2 extra queries to stay cheap.
+        seen_fallback: set[str] = set()
+        deduped_fallback = []
+        for spec in broadening_specs:
+            key = spec.query.lower()
+            if key not in seen_fallback:
+                seen_fallback.add(key)
+                deduped_fallback.append(spec)
+        broadening_specs = deduped_fallback[:2]
+        if broadening_specs:
+            logger.info(
+                "Candidate pool thin (%d repos) after %d queries; firing %d broader fallback queries",
+                len(merged), len(query_specs), len(broadening_specs),
             )
-            existing = merged.get(repo.full_name)
-            if existing is None or repo.stars > existing.stars:
-                merged[repo.full_name] = repo
-            query_hits[repo.full_name].add(spec.query)
-            if spec.kind in {"broad", "language"}:
-                broad_hits[repo.full_name].add(spec.query)
-            if spec.concept_family:
-                concept_hits[repo.full_name].add(spec.concept_family)
+            fallback_results = await asyncio.gather(
+                *(fetch_query(s) for s in broadening_specs), return_exceptions=True
+            )
+            _merge_search_results(fallback_results)
 
     if not merged:
         return []
