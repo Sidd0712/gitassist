@@ -26,7 +26,6 @@ class Settings(BaseSettings):
     # GitHub
     GITHUB_TOKEN: str = ""
     GITHUB_API_BASE: str = "https://api.github.com"
-    GITHUB_SEARCH_LIMIT: int = 5  # top N repos to fetch
 
     # LLM / Groq API
     GROQ_API_KEY: str = ""  # Groq API key (get from console.groq.com)
@@ -37,7 +36,28 @@ class Settings(BaseSettings):
     LLM_AUX_TIMEOUT_SECONDS: int = 20
     LLM_GENERATION_TIMEOUT_SECONDS: int = 35
 
-    # Cohere
+    # Embeddings
+    # "github_actions" dispatches embedding batches to a GitHub Actions workflow
+    # (backend/scripts/gh_embed_worker.py via .github/workflows/embed-worker.yml)
+    # running fastembed locally on the runner — free, no per-minute/monthly cap,
+    # and no RAM cost to this process, at the price of a per-job dispatch/queue/
+    # runner-startup latency (~15-35s measured live 2026-09). "cohere" is kept
+    # as a fallback path.
+    EMBEDDING_PROVIDER: str = "github_actions"
+    LOCAL_EMBEDDING_MODEL: str = "BAAI/bge-small-en-v1.5"  # 384-dim — matches PGVECTOR_DIMENSION, no schema change needed
+
+    GITHUB_ACTIONS_OWNER: str = "Sidd0712"
+    GITHUB_ACTIONS_REPO: str = "gitassist"
+    GITHUB_ACTIONS_WORKFLOW_FILE: str = "embed-worker.yml"
+    # Needs `repo` + `workflow` scopes (a classic PAT, or a fine-grained PAT with
+    # Actions:write + Contents:read on this repo) — separate from GITHUB_TOKEN,
+    # which only needs public_repo/search access for GitHub search and is not
+    # sufficient to dispatch workflows on a private repo.
+    GITHUB_ACTIONS_TRIGGER_TOKEN: str = ""
+    GITHUB_ACTIONS_POLL_INTERVAL_SECONDS: float = 2.0
+    GITHUB_ACTIONS_JOB_TIMEOUT_SECONDS: float = 120.0
+
+    # Cohere (used only when EMBEDDING_PROVIDER=cohere)
     COHERE_API_KEY: str = ""
     EMBEDDING_MODEL: str = "embed-english-light-v3.0"
     PGVECTOR_DIMENSION: int = 384
@@ -82,7 +102,12 @@ class Settings(BaseSettings):
     RAG_MAX_SEARCH_CONCURRENCY: int = 8
     RAG_QUERY_LIMIT: int = 8
     RAG_MAX_PER_LANGUAGE: int = 4
-    RAG_CHUNKING_VERSION: str = "v1"
+    # Bumped v1->v2: restored ingestion depth (RAG_MAX_FILES_PER_REPO,
+    # RAG_MAX_CHARS_PER_REPO, RAG_SHALLOW_CODE_SAMPLE_COUNT) to code defaults
+    # after finding production had drifted to older, more conservative values.
+    # A version bump forces every repo to re-index at the new depth instead of
+    # silently continuing to serve the old, shallower index from cache.
+    RAG_CHUNKING_VERSION: str = "v2"
     RAG_STORE_BACKEND: str = "postgres"
     DATABASE_URL: str = ""
     MAX_INDEXED_REPOS: int = 150  # Oldest-by-last-use repos beyond this cap are evicted at startup

@@ -49,6 +49,7 @@ class RetrievalService:
                     "query": query.query,
                     "top_k": query.top_k,
                     "weights": query.weights.model_dump(),
+                    "preferred_roles": query.preferred_roles,
                 }
             )
             cached = _cache.get_json("retrieval_hits", cache_key)
@@ -66,10 +67,14 @@ class RetrievalService:
 
         for (query, cache_key), query_embedding in zip(pending_queries, query_embeddings):
             hits = self._score_hits(
-                dense_hits=self.store.dense_search(query_embedding, allowed_repos, query.top_k),
+                dense_hits=self.store.dense_search(
+                    query_embedding, allowed_repos, query.top_k,
+                    embedding_model=self.embedding_service.embedding_model_name,
+                ),
                 repo_priors=repo_priors,
                 top_k=query.top_k,
                 weights=query.weights,
+                preferred_roles=query.preferred_roles,
             )
             _cache.set_json("retrieval_hits", cache_key, [hit.model_dump() for hit in hits])
             existing_hits = section_hits.get(query.section, [])
@@ -110,25 +115,40 @@ class RetrievalService:
         repo_priors: dict[str, float],
         top_k: int,
         weights: RetrievalWeights,
+        preferred_roles: list[str] | None = None,
     ) -> list[RetrievalHit]:
+        preferred_roles = preferred_roles or []
         scored: list[RetrievalHit] = []
         for entry in dense_hits:
             repo_prior = repo_priors.get(entry["repo_full_name"], 0.0)
             dense_score = entry.get("dense_score", 0.0)
-            score = weights.dense_weight * dense_score + weights.repo_weight * repo_prior
+            chunk_role = entry["chunk_role"]
+            # Role bonus nudges a chunk toward the caller's declared preferred
+            # roles (e.g. "source" for an implementation question) without
+            # letting role match override genuine semantic relevance: it decays
+            # from 0.15 for the most-preferred role toward ~0 for the least, and
+            # is 0 for a role not in the list at all (== unchanged prior behavior).
+            role_bonus = 0.0
+            if preferred_roles and chunk_role in preferred_roles:
+                role_rank = preferred_roles.index(chunk_role)
+                role_bonus = 0.15 * (1 - role_rank / len(preferred_roles))
+            score = weights.dense_weight * dense_score + weights.repo_weight * repo_prior + role_bonus
+            reason = "strong semantic match" if dense_score >= 0.5 else "semantic relevance score"
+            if role_bonus > 0:
+                reason += f" (preferred role: {chunk_role})"
             scored.append(
                 RetrievalHit(
                     chunk_id=entry["chunk_id"],
                     repo_full_name=entry["repo_full_name"],
                     path=entry["path"],
-                    chunk_role=entry["chunk_role"],
+                    chunk_role=chunk_role,
                     language=entry.get("language"),
                     start_line=entry.get("start_line"),
                     end_line=entry.get("end_line"),
                     score=round(score, 5),
                     dense_score=round(dense_score, 5),
                     repo_prior=round(repo_prior, 5),
-                    reason="strong semantic match" if dense_score >= 0.5 else "semantic relevance score",
+                    reason=reason,
                     text=entry.get("text", ""),
                 )
             )

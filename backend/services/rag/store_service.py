@@ -189,8 +189,34 @@ class RAGStore:
                 ON corpus_chunks USING hnsw (embedding vector_cosine_ops)
                 """
             )
+            # Job queue for the GitHub-Actions-worker embedding provider: the
+            # backend writes pending texts here, a workflow run picks the job
+            # up (using DATABASE_URL as a repo secret), embeds them, and
+            # writes the result back — decoupling embedding compute from this
+            # process's own CPU/RAM budget entirely.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS embedding_jobs (
+                    job_id UUID PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    is_query BOOLEAN NOT NULL DEFAULT FALSE,
+                    input_texts JSONB NOT NULL,
+                    result JSONB,
+                    error TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    completed_at TIMESTAMPTZ
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS embedding_jobs_created_idx
+                ON embedding_jobs (created_at)
+                """
+            )
         self._ready = True
         self._evict_stale_repositories()
+        self._evict_old_embedding_jobs()
 
     @_retry_on_connection_loss
     def _evict_stale_repositories(self) -> None:
@@ -231,6 +257,55 @@ class RAGStore:
                     )
         if stale:
             logger.info("Evicted %d stale indexed repositories beyond MAX_INDEXED_REPOS=%d", len(stale), max_repos)
+
+    @_retry_on_connection_loss
+    def _evict_old_embedding_jobs(self) -> None:
+        """
+        Delete embedding_jobs rows older than 1 day.
+
+        input_texts/result payloads can be several MB each (a full repo's
+        chunk texts); the job row is only needed for the few minutes between
+        dispatch and the worker writing its result, so nothing legitimate is
+        ever this old — only orphans from a worker that crashed or a request
+        that was abandoned before polling picked up the result.
+        """
+
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
+            conn.execute("DELETE FROM embedding_jobs WHERE created_at < NOW() - INTERVAL '1 day'")
+
+    @_retry_on_connection_loss
+    def create_embedding_job(self, job_id: str, texts: list[str], is_query: bool) -> None:
+        self.ensure_ready()
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
+            conn.execute(
+                """
+                INSERT INTO embedding_jobs (job_id, status, is_query, input_texts)
+                VALUES (%s, 'pending', %s, %s::jsonb)
+                """,
+                (job_id, is_query, json.dumps(texts)),
+            )
+
+    @_retry_on_connection_loss
+    def get_embedding_job(self, job_id: str) -> dict[str, Any] | None:
+        self.ensure_ready()
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
+            row = conn.execute(
+                "SELECT status, result, error FROM embedding_jobs WHERE job_id = %s",
+                (job_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "status": row["status"],
+            "result": _load_json(row["result"], None),
+            "error": row["error"],
+        }
+
+    @_retry_on_connection_loss
+    def delete_embedding_job(self, job_id: str) -> None:
+        self.ensure_ready()
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
+            conn.execute("DELETE FROM embedding_jobs WHERE job_id = %s", (job_id,))
 
     def close(self) -> None:
         if self._pool is not None:
@@ -431,6 +506,7 @@ class RAGStore:
         query_embedding: list[float],
         allowed_repos: dict[str, str],
         top_k: int,
+        embedding_model: str | None = None,
     ) -> list[dict[str, Any]]:
         """Dense retrieval directly in Postgres using pgvector cosine distance."""
 
@@ -467,11 +543,15 @@ class RAGStore:
                 query,
                 (
                     _as_vector(query_embedding),
-                    self.settings.EMBEDDING_MODEL,
+                    embedding_model or self.settings.EMBEDDING_MODEL,
                     self.settings.RAG_CHUNKING_VERSION,
                     *params,
                     _as_vector(query_embedding),
-                    max(top_k * 2, top_k),
+                    # Fetch a wider pool than top_k so RetrievalService can re-rank by
+                    # chunk_role (preferred_roles) on top of raw cosine distance —
+                    # a role-preferred chunk ranked just outside a tight top_k*2
+                    # window would otherwise never get the chance to surface.
+                    max(top_k * 4, 20),
                 ),
             ).fetchall()
 
