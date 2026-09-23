@@ -6,7 +6,7 @@ import unittest
 from base64 import b64encode
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import HTTPException
 
@@ -45,8 +45,26 @@ from services.llm_service import (
     plan_retrieval_queries,
 )
 from services.pipeline_cache_service import clear_memory_caches
+from services.rag.embedding_service import EmbeddingService, EmbeddingUnavailable
 from services.rag.ranking_service import rank_repo_evidence
 from services.rag.retrieval_service import RetrievalService
+
+
+class LocalWorkerEmbeddingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_embedding_fails_fast_without_queueing_when_worker_offline(self):
+        service = EmbeddingService()
+        fake_store = MagicMock()
+        fake_store.embedding_worker_alive.return_value = False
+
+        with (
+            patch.object(service, "provider", "local_worker"),
+            patch.object(service, "_worker_alive_checked_at", 0.0),
+            patch("services.rag.store_service.get_rag_store", return_value=fake_store),
+        ):
+            with self.assertRaises(EmbeddingUnavailable):
+                await service.embed_query("find the websocket server")
+
+        fake_store.create_embedding_job.assert_not_called()
 
 
 class FakeEmbeddingService:
@@ -782,6 +800,58 @@ class IntentExtractionTests(HermeticAsyncTestCase):
         self.assertIsNotNone(collab, "collab-board must appear in results")
         self.assertGreater(collab.semantic_meta_score, 0.0)
         self.assertGreaterEqual(collab.query_hit_count, 1)
+
+    async def test_candidate_search_still_ranks_when_embeddings_unavailable(self):
+        """With the local embedding worker offline, candidate search must fall
+        back to non-semantic signals instead of failing the whole request."""
+        keywords = await extract_keywords("an app where friends can draw together online")
+
+        class FakeResponse:
+            def json(self) -> dict:
+                return {
+                    "items": [
+                        {
+                            "full_name": "example/collab-board",
+                            "description": "Collaborative whiteboard with realtime canvas.",
+                            "html_url": "https://github.com/example/collab-board",
+                            "stargazers_count": 120,
+                            "language": "TypeScript",
+                            "topics": ["whiteboard", "canvas"],
+                            "archived": False,
+                            "updated_at": "2026-04-18T10:00:00Z",
+                        }
+                    ]
+                }
+
+            def raise_for_status(self) -> None:
+                return None
+
+        class SearchClient:
+            async def get(self, url: str, headers=None, params=None):
+                return FakeResponse()
+
+        class OfflineEmbeddingService(FakeEmbeddingService):
+            async def embed_documents(self, texts):
+                raise EmbeddingUnavailable("worker offline")
+
+            async def embed_query(self, text):
+                raise EmbeddingUnavailable("worker offline")
+
+            async def embed_queries_batch(self, texts):
+                raise EmbeddingUnavailable("worker offline")
+
+        with (
+            patch("services.github_service.EmbeddingService", OfflineEmbeddingService),
+            patch("services.github_service.get_github_client", return_value=SearchClient()),
+            patch.object(github_service_module._persistent_cache, "get_json", return_value=None),
+            patch.object(github_service_module._persistent_cache, "set_json", return_value=None),
+        ):
+            results = await search_repo_candidates(keywords)
+
+        collab = next((r for r in results if r.full_name == "example/collab-board"), None)
+        self.assertIsNotNone(collab)
+        self.assertEqual(0.0, collab.semantic_meta_score)
+        self.assertGreater(collab.relevance_score, 0.0)
         # Check concept coverage is reported (exact key text may vary by version).
         combined_reasons = " | ".join(collab.rank_reasons).lower()
         self.assertIn("concept", combined_reasons)
@@ -1889,6 +1959,38 @@ class RepoChatRouteTests(HermeticAsyncTestCase):
 
         self.assertEqual(409, ctx.exception.status_code)
         self.assertIn("No indexed repositories", ctx.exception.detail)
+
+    async def test_repo_chat_returns_503_when_embedding_worker_offline(self):
+        indexed_repo = RepoSearchResult(
+            full_name="example/collab-board",
+            html_url="https://github.com/example/collab-board",
+            commit_sha="commit-123",
+        )
+
+        class FakeCorpusService:
+            def load_indexed_repository(self, repo: RepoSearchResult) -> RepoSearchResult | None:
+                return indexed_repo
+
+        class OfflineRetrievalService:
+            async def retrieve(self, plan, repositories) -> dict:
+                raise EmbeddingUnavailable("worker offline")
+
+        with (
+            patch("routers.research.CorpusService", return_value=FakeCorpusService()),
+            patch("routers.research.RetrievalService", return_value=OfflineRetrievalService()),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await chat_about_repositories(
+                    RepoChatRequest(
+                        question="How is realtime sync handled?",
+                        idea_summary="Collaborative whiteboard",
+                        scope_repositories=[{"full_name": indexed_repo.full_name, "commit_sha": indexed_repo.commit_sha}],
+                        messages=[],
+                    )
+                )
+
+        self.assertEqual(503, ctx.exception.status_code)
+        self.assertIn("offline", ctx.exception.detail)
 
     async def test_repo_chat_returns_uncertainty_when_no_evidence_is_found(self):
         indexed_repo = RepoSearchResult(

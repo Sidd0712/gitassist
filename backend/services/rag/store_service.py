@@ -189,11 +189,10 @@ class RAGStore:
                 ON corpus_chunks USING hnsw (embedding vector_cosine_ops)
                 """
             )
-            # Job queue for the GitHub-Actions-worker embedding provider: the
-            # backend writes pending texts here, a workflow run picks the job
-            # up (using DATABASE_URL as a repo secret), embeds them, and
-            # writes the result back — decoupling embedding compute from this
-            # process's own CPU/RAM budget entirely.
+            # Job queue for the local-worker embedding provider: the backend
+            # writes pending texts here, the worker on the developer's machine
+            # claims them, embeds, and writes the result back — keeping
+            # embedding compute off this process's CPU/RAM budget entirely.
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS embedding_jobs (
@@ -212,6 +211,14 @@ class RAGStore:
                 """
                 CREATE INDEX IF NOT EXISTS embedding_jobs_created_idx
                 ON embedding_jobs (created_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS embedding_workers (
+                    worker_id TEXT PRIMARY KEY,
+                    last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
                 """
             )
         self._ready = True
@@ -306,6 +313,86 @@ class RAGStore:
         self.ensure_ready()
         with self._pool.connection() as conn:  # type: ignore[union-attr]
             conn.execute("DELETE FROM embedding_jobs WHERE job_id = %s", (job_id,))
+
+    @_retry_on_connection_loss
+    def claim_embedding_job(self, is_query: bool) -> dict[str, Any] | None:
+        """Atomically take the oldest pending job of one kind, or None if idle.
+
+        SKIP LOCKED lets more than one worker process poll safely without ever
+        handing the same job to two of them.
+        """
+        self.ensure_ready()
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
+            row = conn.execute(
+                """
+                UPDATE embedding_jobs SET status = 'running'
+                WHERE job_id = (
+                    SELECT job_id FROM embedding_jobs
+                    WHERE status = 'pending' AND is_query = %s
+                    ORDER BY created_at
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING job_id, input_texts
+                """,
+                (is_query,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"job_id": str(row["job_id"]), "texts": _load_json(row["input_texts"], [])}
+
+    @_retry_on_connection_loss
+    def complete_embedding_job(self, job_id: str, vectors: list[list[float]]) -> None:
+        self.ensure_ready()
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
+            conn.execute(
+                """
+                UPDATE embedding_jobs
+                SET status = 'complete', result = %s::jsonb, completed_at = NOW()
+                WHERE job_id = %s
+                """,
+                (json.dumps(vectors), job_id),
+            )
+
+    @_retry_on_connection_loss
+    def fail_embedding_job(self, job_id: str, error: str) -> None:
+        self.ensure_ready()
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
+            conn.execute(
+                """
+                UPDATE embedding_jobs
+                SET status = 'failed', error = %s, completed_at = NOW()
+                WHERE job_id = %s
+                """,
+                (error[:2000], job_id),
+            )
+
+    @_retry_on_connection_loss
+    def record_embedding_worker_heartbeat(self, worker_id: str) -> None:
+        self.ensure_ready()
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
+            conn.execute(
+                """
+                INSERT INTO embedding_workers (worker_id, last_seen) VALUES (%s, NOW())
+                ON CONFLICT (worker_id) DO UPDATE SET last_seen = NOW()
+                """,
+                (worker_id,),
+            )
+
+    @_retry_on_connection_loss
+    def embedding_worker_alive(self, max_age_seconds: float) -> bool:
+        self.ensure_ready()
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
+            row = conn.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM embedding_workers
+                    WHERE last_seen > NOW() - make_interval(secs => %s)
+                ) AS alive
+                """,
+                (max_age_seconds,),
+            ).fetchone()
+        return bool(row and row["alive"])
 
     def close(self) -> None:
         if self._pool is not None:

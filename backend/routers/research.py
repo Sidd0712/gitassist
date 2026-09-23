@@ -42,6 +42,7 @@ from services.llm_service import (
 from services.pipeline_budget import RequestBudget
 from services.rag.citation_service import citations_from_hits
 from services.rag.corpus_service import CorpusService
+from services.rag.embedding_service import EmbeddingUnavailable
 from services.rag.ranking_service import rank_repo_evidence
 from services.rag.retrieval_service import RetrievalService
 
@@ -249,7 +250,10 @@ async def research_idea(request: IdeaRequest) -> AnalysisResponse:
 
             retrieval_started = perf_counter()
             retrieval_service = RetrievalService()
-            section_hits = await retrieval_service.retrieve(retrieval_plan, cache_hit_repositories)
+            try:
+                section_hits = await retrieval_service.retrieve(retrieval_plan, cache_hit_repositories)
+            except EmbeddingUnavailable as exc:
+                logger.warning("Skipping retrieval, embeddings unavailable: %s", exc)
             logger.info("Retrieval completed in %.2fs", budget.record_stage("retrieval", retrieval_started))
         elif not cache_hit_repositories:
             logger.info("Skipping retrieval: all %d selected repos are still indexing in background", len(inline_plans))
@@ -438,7 +442,10 @@ async def _research_sse_generator(request: IdeaRequest, http_request: Request):
 
             retrieval_started = perf_counter()
             retrieval_service = RetrievalService()
-            section_hits = await retrieval_service.retrieve(retrieval_plan, cache_hit_repositories)
+            try:
+                section_hits = await retrieval_service.retrieve(retrieval_plan, cache_hit_repositories)
+            except EmbeddingUnavailable as exc:
+                logger.warning("Skipping retrieval, embeddings unavailable: %s", exc)
             logger.info("Retrieval completed in %.2fs", budget.record_stage("retrieval", retrieval_started))
         elif not cache_hit_repositories:
             logger.info("Skipping retrieval: all %d selected repos are still indexing in background", len(inline_plans))
@@ -504,10 +511,17 @@ async def chat_about_repositories(request: RepoChatRequest) -> RepoChatResponse:
         request.messages,
     )
     retrieval_service = RetrievalService()
-    section_hits = await retrieval_service.retrieve(
-        plan=_retrieval_query_to_plan(retrieval_query),
-        repositories=scoped_repositories,
-    )
+    try:
+        section_hits = await retrieval_service.retrieve(
+            plan=_retrieval_query_to_plan(retrieval_query),
+            repositories=scoped_repositories,
+        )
+    except EmbeddingUnavailable as exc:
+        logger.warning("Repo chat unavailable: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Repo chat is temporarily unavailable because the code-search worker is offline. Please try again later.",
+        ) from exc
     hits = section_hits.get("chat_answer", [])
     response_payload = await answer_repo_chat(
         request.question,

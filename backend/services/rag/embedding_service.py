@@ -7,16 +7,24 @@ import uuid
 from collections import deque
 
 import cohere
-import httpx
 
 from core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 # BGE models are asymmetrically trained like Cohere's, but fastembed does NOT apply
-# this automatically. The worker (gh_embed_worker.py) prepends this to query texts
-# only — kept here too as the single source of truth both sides must agree on.
+# this automatically. The worker (local_embed_worker.py) imports this and prepends
+# it to query texts only.
 BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
+
+_SUPPORTED_PROVIDERS = {"local_worker", "cohere"}
+
+
+class EmbeddingUnavailable(RuntimeError):
+    """The embedding backend can't serve this call right now (worker offline or timed out).
+
+    Callers catch this to degrade gracefully instead of failing the whole request.
+    """
 
 # Cohere's batch limit per API call.
 # embed-english-light-v3.0 supports up to 96 texts per call.
@@ -50,20 +58,16 @@ class EmbeddingService:
         query_vec = await service.embed_query("find authentication logic")
 
     Providers:
-      "github_actions" (default) — dispatches the batch to a GitHub Actions
-      workflow (backend/scripts/gh_embed_worker.py) that runs fastembed +
-      BAAI/bge-small-en-v1.5 on a GitHub-hosted runner and writes the result
-      back to a Postgres job row this service polls. No rate limit, no
-      monthly cap, no RAM cost to this process — Cohere's Trial key (5-40
-      calls/min per Cohere's own docs and observed 429 bodies, 1000
-      calls/month) caused real indexing failures under multi-repo/multi-user
-      load; a production Cohere key would cost real money to fix the same
-      problem. Tradeoff: per-job dispatch/queue/runner-startup latency,
-      measured live 2026-09 at ~15-35s beyond the embedding compute itself.
+      "local_worker" (default) — queues the batch as a Postgres job row that a
+      worker on the developer's machine (backend/scripts/local_embed_worker.py)
+      claims, embeds with fastembed + BAAI/bge-small-en-v1.5, and completes.
+      Free and uncapped. If the worker hasn't heartbeated recently, calls
+      raise EmbeddingUnavailable immediately rather than queue work nobody
+      will pick up.
 
-      "cohere" — hosted API, zero dispatch latency, but rate-limited and
-      metered as above. Kept as a fallback path, switchable via
-      EMBEDDING_PROVIDER without a code change.
+      "cohere" — hosted API, but the Trial key is rate-limited (40 calls/min,
+      1000 calls/month) and not licensed for production use. Kept as a
+      fallback path, switchable via EMBEDDING_PROVIDER without a code change.
     """
 
     _instance = None  # class-level, shared across all instantiations
@@ -84,8 +88,14 @@ class EmbeddingService:
 
         self.settings = get_settings()
         self.provider = self.settings.EMBEDDING_PROVIDER
+        if self.provider not in _SUPPORTED_PROVIDERS:
+            raise ValueError(
+                f"Unsupported EMBEDDING_PROVIDER={self.provider!r}; expected one of {sorted(_SUPPORTED_PROVIDERS)}"
+            )
+        self._worker_alive_checked_at = 0.0
+        self._worker_alive = False
 
-        if self.provider != "github_actions":
+        if self.provider == "cohere":
             # AsyncClient is used throughout — Cohere's async client is non-blocking,
             # so embed calls don't hold up the FastAPI event loop while waiting for
             # the HTTP response from Cohere's servers.
@@ -127,7 +137,7 @@ class EmbeddingService:
         this value, which naturally forces every repo to re-index under the new
         vector space instead of silently mixing incompatible vectors.
         """
-        if self.provider == "github_actions":
+        if self.provider == "local_worker":
             return self.settings.LOCAL_EMBEDDING_MODEL
         return self.settings.EMBEDDING_MODEL
 
@@ -153,8 +163,8 @@ class EmbeddingService:
         if not texts:
             return []
 
-        if self.provider == "github_actions":
-            return await self._embed_via_github_actions(texts, is_query=False)
+        if self.provider == "local_worker":
+            return await self._embed_via_local_worker(texts, is_query=False)
         return await self._embed_batched(texts, input_type="search_document")
 
     async def embed_query(self, text: str) -> list[float]:
@@ -176,8 +186,8 @@ class EmbeddingService:
             logger.warning("embed_query() called with empty text — returning zero vector")
             return [0.0] * _EXPECTED_DIM
 
-        if self.provider == "github_actions":
-            results = await self._embed_via_github_actions([text.strip()], is_query=True)
+        if self.provider == "local_worker":
+            results = await self._embed_via_local_worker([text.strip()], is_query=True)
         else:
             results = await self._embed_batched([text.strip()], input_type="search_query")
         return results[0]
@@ -209,62 +219,56 @@ class EmbeddingService:
         """
         if not texts:
             return []
-        if self.provider == "github_actions":
-            return await self._embed_via_github_actions(texts, is_query=True)
+        if self.provider == "local_worker":
+            return await self._embed_via_local_worker(texts, is_query=True)
         return await self._embed_batched(texts, input_type="search_query")
 
     # ------------------------------------------------------------------
-    # Private: GitHub Actions worker dispatch
+    # Private: local worker job queue
     # ------------------------------------------------------------------
 
-    async def _embed_via_github_actions(self, texts: list[str], is_query: bool) -> list[list[float]]:
-        """
-        Runs one full batch (however large) as a single workflow job, rather
-        than splitting into Cohere-style sub-batches — there's no per-call
-        size limit to work around, only a per-job dispatch/queue/startup tax
-        that's cheaper to pay once than N times.
-        """
+    def _local_worker_alive(self, store) -> bool:
+        # Cached briefly: one research request makes several embedding calls
+        # within seconds, and the answer can't meaningfully change that fast.
+        now = time.monotonic()
+        if now - self._worker_alive_checked_at > 5.0:
+            self._worker_alive = store.embedding_worker_alive(self.settings.LOCAL_WORKER_HEARTBEAT_MAX_AGE_SECONDS)
+            self._worker_alive_checked_at = now
+        return self._worker_alive
+
+    async def _embed_via_local_worker(self, texts: list[str], is_query: bool) -> list[list[float]]:
         from services.rag.store_service import get_rag_store
 
         store = get_rag_store()
+        if not self._local_worker_alive(store):
+            raise EmbeddingUnavailable("Local embedding worker is offline")
+
         job_id = str(uuid.uuid4())
         store.create_embedding_job(job_id, texts, is_query)
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.post(
-                f"https://api.github.com/repos/{self.settings.GITHUB_ACTIONS_OWNER}/"
-                f"{self.settings.GITHUB_ACTIONS_REPO}/actions/workflows/"
-                f"{self.settings.GITHUB_ACTIONS_WORKFLOW_FILE}/dispatches",
-                headers={
-                    "Authorization": f"token {self.settings.GITHUB_ACTIONS_TRIGGER_TOKEN}",
-                    "Accept": "application/vnd.github+json",
-                },
-                json={"ref": "main", "inputs": {"job_id": job_id}},
-            )
-            if response.status_code != 204:
-                store.delete_embedding_job(job_id)
-                raise RuntimeError(
-                    f"Failed to dispatch embedding workflow: {response.status_code} {response.text}"
-                )
-
-        deadline = time.monotonic() + self.settings.GITHUB_ACTIONS_JOB_TIMEOUT_SECONDS
-        while time.monotonic() < deadline:
-            await asyncio.sleep(self.settings.GITHUB_ACTIONS_POLL_INTERVAL_SECONDS)
-            job = store.get_embedding_job(job_id)
-            if job is None:
-                continue
-            if job["status"] == "complete":
-                store.delete_embedding_job(job_id)
-                return job["result"]
-            if job["status"] == "failed":
-                store.delete_embedding_job(job_id)
-                raise RuntimeError(f"Embedding worker reported failure: {job['error']}")
-
-        store.delete_embedding_job(job_id)
-        raise TimeoutError(
-            f"Embedding job {job_id} did not complete within "
-            f"{self.settings.GITHUB_ACTIONS_JOB_TIMEOUT_SECONDS}s"
+        timeout = (
+            self.settings.LOCAL_WORKER_QUERY_TIMEOUT_SECONDS
+            if is_query
+            else self.settings.LOCAL_WORKER_DOCUMENT_TIMEOUT_SECONDS
         )
+        deadline = time.monotonic() + timeout
+        try:
+            while time.monotonic() < deadline:
+                await asyncio.sleep(self.settings.LOCAL_WORKER_POLL_INTERVAL_SECONDS)
+                job = store.get_embedding_job(job_id)
+                if job is None:
+                    continue
+                if job["status"] == "complete":
+                    return job["result"]
+                if job["status"] == "failed":
+                    raise EmbeddingUnavailable(f"Embedding worker reported failure: {job['error']}")
+        finally:
+            store.delete_embedding_job(job_id)
+
+        # Force a fresh liveness check next time: a timeout usually means the
+        # worker went away mid-job (PC slept), not that it's merely slow.
+        self._worker_alive_checked_at = 0.0
+        raise EmbeddingUnavailable(f"Embedding job {job_id} did not complete within {timeout}s")
 
     # ------------------------------------------------------------------
     # Private: batching logic (Cohere)

@@ -37,30 +37,27 @@ class Settings(BaseSettings):
     LLM_GENERATION_TIMEOUT_SECONDS: int = 35
 
     # Embeddings
-    # "github_actions" dispatches embedding batches to a GitHub Actions workflow
-    # (backend/scripts/gh_embed_worker.py via .github/workflows/embed-worker.yml)
-    # running fastembed locally on the runner — free, no per-minute/monthly cap,
-    # and no RAM cost to this process, at the price of a per-job dispatch/queue/
-    # runner-startup latency (~15-35s measured live 2026-09). "cohere" is kept
-    # as a fallback path.
-    EMBEDDING_PROVIDER: str = "github_actions"
+    # "local_worker": the backend queues texts in Postgres (embedding_jobs) and
+    # a worker on the developer's own machine (backend/scripts/local_embed_worker.py)
+    # embeds them with fastembed and writes the vectors back. Free, uncapped,
+    # and within every provider's terms — GitHub Actions was dropped because its
+    # terms prohibit use "as part of a serverless application". When the worker
+    # is offline, embedding calls fail fast with EmbeddingUnavailable and every
+    # caller degrades (reports still work; indexing/chat pause). "cohere" is
+    # kept as a fallback path.
+    EMBEDDING_PROVIDER: str = "local_worker"
     LOCAL_EMBEDDING_MODEL: str = "BAAI/bge-small-en-v1.5"  # 384-dim — matches PGVECTOR_DIMENSION, no schema change needed
 
-    GITHUB_ACTIONS_OWNER: str = "Sidd0712"
-    GITHUB_ACTIONS_REPO: str = "gitassist"
-    GITHUB_ACTIONS_WORKFLOW_FILE: str = "embed-worker.yml"
-    # Needs `repo` + `workflow` scopes (a classic PAT, or a fine-grained PAT with
-    # Actions:write + Contents:read on this repo) — separate from GITHUB_TOKEN,
-    # which only needs public_repo/search access for GitHub search and is not
-    # sufficient to dispatch workflows on a private repo.
-    GITHUB_ACTIONS_TRIGGER_TOKEN: str = ""
-    GITHUB_ACTIONS_POLL_INTERVAL_SECONDS: float = 2.0
-    # Indexing now runs fire-and-forget in the background (no request waits on
-    # it), so this can afford real headroom: measured real-world embed time
-    # alone was 156.95s for a 978-chunk repo at ~6.2 chunks/sec. 120s was
-    # timing out most repos above ~700 chunks before they ever got a chance
-    # to finish.
-    GITHUB_ACTIONS_JOB_TIMEOUT_SECONDS: float = 600.0
+    LOCAL_WORKER_POLL_INTERVAL_SECONDS: float = 0.5
+    # The worker heartbeats every ~5s; a quiet period longer than this means it's
+    # offline (PC asleep/off), so callers fail fast instead of queueing a job
+    # nobody will pick up.
+    LOCAL_WORKER_HEARTBEAT_MAX_AGE_SECONDS: float = 20.0
+    LOCAL_WORKER_QUERY_TIMEOUT_SECONDS: float = 60.0
+    # A repo's full chunk set runs ~4-5 chunks/sec on the dev machine (measured
+    # 2026-09); the largest indexed repo so far is 841 chunks, and document jobs
+    # queue behind each other on the worker's single document lane.
+    LOCAL_WORKER_DOCUMENT_TIMEOUT_SECONDS: float = 1200.0
 
     # Cohere (used only when EMBEDDING_PROVIDER=cohere)
     COHERE_API_KEY: str = ""

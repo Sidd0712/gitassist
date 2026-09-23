@@ -63,7 +63,9 @@ class RetrievalService:
         if not pending_queries:
             return section_hits
 
-        query_embeddings = await self.embedding_service.embed_documents([query.query for query, _cache_key in pending_queries])
+        query_embeddings = await self.embedding_service.embed_queries_batch(
+            [query.query for query, _cache_key in pending_queries]
+        )
 
         for (query, cache_key), query_embedding in zip(pending_queries, query_embeddings):
             hits = self._score_hits(

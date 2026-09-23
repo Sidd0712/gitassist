@@ -27,7 +27,7 @@ from models.schemas import (
 )
 from services.github_client_service import get_github_client
 from services.pipeline_cache_service import PipelineCacheService, stable_cache_key
-from services.rag.embedding_service import EmbeddingService
+from services.rag.embedding_service import EmbeddingService, EmbeddingUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -835,13 +835,21 @@ async def search_repo_candidates(keywords: ExtractedKeywords) -> list[RepoSearch
         1, len({s.concept_family for s in query_specs if s.concept_family})
     )
 
-    intent_embedding, concept_embeddings = await asyncio.gather(
-        embedding_service.embed_query(intent_text),
-        _compute_concept_family_embeddings(concept_families, embedding_service),
-    )
-    metadata_embeddings = await embedding_service.embed_documents(
-        [_repo_metadata_text(r) for r in candidates]
-    )
+    try:
+        intent_embedding, concept_embeddings = await asyncio.gather(
+            embedding_service.embed_query(intent_text),
+            _compute_concept_family_embeddings(concept_families, embedding_service),
+        )
+        metadata_embeddings = await embedding_service.embed_documents(
+            [_repo_metadata_text(r) for r in candidates]
+        )
+    except EmbeddingUnavailable as exc:
+        # Semantic scores fall to 0 and ranking leans on stars, query hits,
+        # query-derived concept coverage, and domain alignment — weaker, but a
+        # report beats an error when the embedding worker is offline.
+        logger.warning("Candidate scoring without embeddings: %s", exc)
+        intent_embedding, concept_embeddings = [], {}
+        metadata_embeddings = [[] for _ in candidates]
 
     weights = dict(_SEARCH_RANKING_WEIGHTS)
     broad_query_scores: dict[str, float] = {}
