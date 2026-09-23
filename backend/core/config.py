@@ -55,7 +55,12 @@ class Settings(BaseSettings):
     # sufficient to dispatch workflows on a private repo.
     GITHUB_ACTIONS_TRIGGER_TOKEN: str = ""
     GITHUB_ACTIONS_POLL_INTERVAL_SECONDS: float = 2.0
-    GITHUB_ACTIONS_JOB_TIMEOUT_SECONDS: float = 120.0
+    # Indexing now runs fire-and-forget in the background (no request waits on
+    # it), so this can afford real headroom: measured real-world embed time
+    # alone was 156.95s for a 978-chunk repo at ~6.2 chunks/sec. 120s was
+    # timing out most repos above ~700 chunks before they ever got a chance
+    # to finish.
+    GITHUB_ACTIONS_JOB_TIMEOUT_SECONDS: float = 600.0
 
     # Cohere (used only when EMBEDDING_PROVIDER=cohere)
     COHERE_API_KEY: str = ""
