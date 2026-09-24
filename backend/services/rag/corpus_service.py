@@ -88,8 +88,16 @@ class CorpusService:
         self.store.evict_to_budget(len(chunks), keep=(repository.full_name, repository.commit_sha))
         self.store.begin_repository_index(repository, model, version)
 
-        # Writes to Neon take ~40% as long as embedding, so each batch is
-        # written while the next one embeds.
+        # Every chunk's TEXT lands right away (embedding=NULL), in priority
+        # order (README, manifests, source, ... tests, scripts — see
+        # select_index_paths). The repo is keyword-searchable in chat within
+        # seconds, long before embedding — the slow part — has run at all.
+        await asyncio.to_thread(self.store.insert_chunk_texts, repository, chunks, model, version)
+
+        # Writes to Neon take ~40% as long as embedding, so each backfill
+        # batch is written while the next one embeds. Chunks stay in the
+        # same priority order, so dense search fills in for the
+        # highest-value files first.
         pending_write: asyncio.Task | None = None
         for offset in range(0, len(chunks), _WRITE_BATCH):
             batch = chunks[offset : offset + _WRITE_BATCH]
@@ -99,7 +107,7 @@ class CorpusService:
             if pending_write is not None:
                 await pending_write
             pending_write = asyncio.create_task(
-                asyncio.to_thread(self.store.append_chunks, repository, batch, vectors, model, version)
+                asyncio.to_thread(self.store.backfill_embeddings, [c.chunk_id for c in batch], vectors)
             )
             logger.info(
                 "%s: %d/%d chunks embedded (%.1f chunks/s)",

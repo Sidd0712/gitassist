@@ -176,11 +176,15 @@ class RAGStore:
                     repo_score DOUBLE PRECISION NOT NULL,
                     content_hash TEXT NOT NULL,
                     text TEXT NOT NULL,
-                    embedding VECTOR({self.dimension}) NOT NULL,
+                    embedding VECTOR({self.dimension}),
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
                 """
             )
+            # Chat is the product; a repo becomes keyword-searchable the moment
+            # its chunk text lands (see insert_chunk_texts), well before every
+            # vector is computed. NULL here just means "not embedded yet".
+            conn.execute("ALTER TABLE corpus_chunks ALTER COLUMN embedding DROP NOT NULL")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS repo_indexes_state_idx
@@ -742,19 +746,23 @@ class RAGStore:
             )
 
     @_retry_on_connection_loss
-    def append_chunks(
+    def insert_chunk_texts(
         self,
         repository: RepoSearchResult,
         chunks: list[Any],
-        embeddings: list[list[float]],
         embedding_model: str,
         chunking_version: str,
     ) -> None:
-        """Insert one batch of chunks and mark the repo searchable ('partial')."""
+        """Insert chunk rows with no vector yet and mark the repo searchable ('partial').
+
+        Full-text search reads `text` directly, so this alone makes the whole
+        repo keyword-searchable in chat within seconds of chunking — well
+        before embedding (the slow part) has touched a single chunk.
+        `backfill_embeddings` fills in `embedding` afterwards, in the same
+        priority order these rows were written in.
+        """
 
         self.ensure_ready()
-        if len(chunks) != len(embeddings):
-            raise ValueError("Each chunk must have a matching embedding vector.")
         if not chunks:
             return
 
@@ -786,9 +794,8 @@ class RAGStore:
                         chunk.repo_score,
                         chunk.content_hash,
                         chunk.text,
-                        _as_vector(embedding),
                     )
-                    for chunk, embedding in zip(chunks, embeddings)
+                    for chunk in chunks
                 ]
                 with conn.cursor() as cursor:
                     cursor.executemany(
@@ -796,12 +803,27 @@ class RAGStore:
                         INSERT INTO corpus_chunks (
                             chunk_id, full_name, commit_sha, embedding_model, chunking_version,
                             path, chunk_role, language, symbol, heading, start_line, end_line,
-                            token_count, repo_score, content_hash, text, embedding
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            token_count, repo_score, content_hash, text
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (chunk_id) DO NOTHING
                         """,
                         rows,
                     )
+
+    @_retry_on_connection_loss
+    def backfill_embeddings(self, chunk_ids: list[str], embeddings: list[list[float]]) -> None:
+        """Fill in the vector for chunk rows whose text is already stored."""
+
+        self.ensure_ready()
+        if len(chunk_ids) != len(embeddings):
+            raise ValueError("Each chunk_id must have a matching embedding vector.")
+        if not chunk_ids:
+            return
+
+        rows = [(_as_vector(embedding), chunk_id) for chunk_id, embedding in zip(chunk_ids, embeddings)]
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
+            with conn.cursor() as cursor:
+                cursor.executemany("UPDATE corpus_chunks SET embedding = %s WHERE chunk_id = %s", rows)
 
     # ── Retrieval ────────────────────────────────────────────────────────────
 
@@ -847,7 +869,8 @@ class RAGStore:
             """
             SELECT {columns}, 1 - (embedding <=> %s) AS dense_score
             FROM corpus_chunks
-            WHERE embedding_model = %s
+            WHERE embedding IS NOT NULL
+              AND embedding_model = %s
               AND chunking_version = %s
               AND ({allowed_clause})
             ORDER BY embedding <=> %s

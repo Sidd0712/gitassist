@@ -148,12 +148,15 @@ def main() -> int:
 
     # Separate model instances per lane. Queries are one or two texts; the
     # document lane sits on the research request's critical path (candidate
-    # search embeds ~60 repo descriptions), so it gets half the cores; the
-    # repo lane gets the rest of the machine.
+    # search embeds ~60 repo descriptions), so it gets half the cores.
+    # The repo lane is left unpinned: a sustained 400-chunk sweep on this
+    # 2P+8E chip (i7-1355U) showed ORT's own thread heuristic beating every
+    # manual pin (7.4 vs 6.5 chunks/s at threads=10, 4.2 at threads=2) —
+    # oversubscription wasn't the bottleneck advisors assumed it was.
     cpus = os.cpu_count() or 4
     query_model = TextEmbedding(model_name=settings.LOCAL_EMBEDDING_MODEL, threads=2)
     document_model = TextEmbedding(model_name=settings.LOCAL_EMBEDDING_MODEL, threads=max(2, cpus // 2))
-    repo_model = TextEmbedding(model_name=settings.LOCAL_EMBEDDING_MODEL, threads=max(1, cpus - 2))
+    repo_model = TextEmbedding(model_name=settings.LOCAL_EMBEDDING_MODEL)
 
     lanes = [
         threading.Thread(target=_run_embedding_lane, args=(True, query_model, stop), daemon=True),
