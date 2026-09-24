@@ -110,6 +110,47 @@ class LocalWorkerEmbeddingTests(unittest.IsolatedAsyncioTestCase):
         fake_store.create_embedding_job.assert_not_called()
 
 
+class ArchiveDownloadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_oversized_archive_aborts_early_and_falls_back_to_raw_files(self):
+        chunks_sent = 0
+
+        async def endless_zip():
+            nonlocal chunks_sent
+            for _ in range(10_000):
+                chunks_sent += 1
+                yield b"x" * 1024
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "/zipball/" in request.url.path:
+                return httpx.Response(200, content=endless_zip())
+            if request.url.host == "raw.githubusercontent.com":
+                return httpx.Response(200, text=f"# {request.url.path.rsplit('/', 1)[-1]}\n")
+            return httpx.Response(404)
+
+        settings = github_service_module.get_settings().model_copy(update={"RAG_ARCHIVE_MAX_BYTES": 8 * 1024})
+        plan = RepoFetchPlan(
+            repository=RepoSearchResult(
+                full_name="huge/archive-repo",
+                html_url="https://github.com/huge/archive-repo",
+                commit_sha="abc123",
+            ),
+            selected_paths=["src/app.py", "src/routes.py"],
+            skipped_paths=[],
+            estimated_chars=0,
+            rationale=[],
+        )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with (
+                patch.object(github_service_module, "get_github_client", return_value=client),
+                patch.object(github_service_module, "get_settings", return_value=settings),
+            ):
+                files = await github_service_module.fetch_repo_files_for_indexing(plan)
+
+        self.assertEqual(["src/app.py", "src/routes.py"], [f.path for f in files])
+        self.assertLess(chunks_sent, 20, "archive download should stop once it passes the size cap")
+
+
 class FakeEmbeddingService:
     """Fast deterministic embedding service for tests."""
 

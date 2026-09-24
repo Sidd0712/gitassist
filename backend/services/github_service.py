@@ -1361,17 +1361,17 @@ async def fetch_repo_files_for_indexing(plan: RepoFetchPlan) -> list[RepoFile]:
     settings = get_settings()
     client = get_github_client()
     archive_ref = plan.repository.commit_sha or plan.repository.default_branch or "HEAD"
-    response = await client.get(
+    archive_bytes = await _download_archive_capped(
+        client,
         f"{settings.GITHUB_API_BASE}/repos/{plan.repository.full_name}/zipball/{archive_ref}",
-        headers=_headers("application/vnd.github+json"),
+        settings.RAG_ARCHIVE_MAX_BYTES,
     )
-    response.raise_for_status()
-
-    archive_bytes = response.content
-    if len(archive_bytes) > settings.RAG_ARCHIVE_MAX_BYTES:
-        raise ValueError(
-            f"Archive for {plan.repository.full_name} exceeded {settings.RAG_ARCHIVE_MAX_BYTES} bytes."
+    if archive_bytes is None:
+        logger.info(
+            "Archive for %s exceeds %d bytes; fetching %d planned files individually",
+            plan.repository.full_name, settings.RAG_ARCHIVE_MAX_BYTES, len(plan.selected_paths),
         )
+        return await _fetch_planned_files_raw(client, plan, archive_ref)
 
     selected_lookup = {
         path.replace("\\", "/"): idx for idx, path in enumerate(plan.selected_paths)
@@ -1416,6 +1416,46 @@ async def fetch_repo_files_for_indexing(plan: RepoFetchPlan) -> list[RepoFile]:
 
     ordered = [files_by_index[i] for i in sorted(files_by_index)]
     logger.info("Fetched %d files for %s", len(ordered), plan.repository.full_name)
+    return ordered
+
+
+async def _download_archive_capped(client, url: str, max_bytes: int) -> bytes | None:
+    """Stream an archive, returning None as soon as it exceeds max_bytes.
+
+    Buffering the whole response before checking its size let a single 600 MB
+    repo zip OOM-kill the 512 MB Render instance mid-request.
+    """
+
+    async with client.stream("GET", url, headers=_headers("application/vnd.github+json")) as response:
+        response.raise_for_status()
+        declared = response.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > max_bytes:
+            return None
+        buffer = bytearray()
+        async for chunk in response.aiter_bytes():
+            buffer.extend(chunk)
+            if len(buffer) > max_bytes:
+                return None
+    return bytes(buffer)
+
+
+async def _fetch_planned_files_raw(client, plan: RepoFetchPlan, ref: str) -> list[RepoFile]:
+    """Fallback for oversized repos: download only the planned files."""
+
+    settings = get_settings()
+    semaphore = asyncio.Semaphore(settings.RAG_MAX_SEARCH_CONCURRENCY)
+    paths = plan.selected_paths[: settings.RAG_MAX_FILES_PER_REPO]
+
+    async def fetch(path: str) -> RepoFile | None:
+        async with semaphore:
+            content = await _fetch_file_content(client, plan.repository.full_name, path, ref)
+        if content is None:
+            return None
+        return RepoFile(path=path, content=content, size=len(content))
+
+    results = await asyncio.gather(*(fetch(path) for path in paths))
+    ordered = [item for item in results if item is not None]
+    logger.info("Fetched %d files for %s via raw downloads", len(ordered), plan.repository.full_name)
     return ordered
 
 
