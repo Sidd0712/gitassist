@@ -3,7 +3,6 @@ import hashlib
 import re
 import sys
 import unittest
-from base64 import b64encode
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -50,6 +49,48 @@ from services.pipeline_cache_service import clear_memory_caches
 from services.rag.embedding_service import EmbeddingService, EmbeddingUnavailable
 from services.rag.ranking_service import rank_repo_evidence
 from services.rag.retrieval_service import RetrievalService
+
+
+class LLMFallbackTests(unittest.IsolatedAsyncioTestCase):
+    def _client(self):
+        from services.llm_client import LLMClient
+
+        client = LLMClient()
+        client.settings = client.settings.model_copy(
+            update={"GOOGLE_API_KEY": "test-key", "LLM_FALLBACK_MODEL": "gemini-test"}
+        )
+        return client
+
+    async def test_retired_groq_model_falls_back_and_parks_groq(self):
+        import groq
+
+        client = self._client()
+        request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+        not_found = groq.NotFoundError(
+            "model_not_found", response=httpx.Response(404, request=request), body=None
+        )
+        with (
+            patch.object(client, "_call_groq", AsyncMock(side_effect=not_found)) as groq_call,
+            patch.object(client, "_call_gemini", AsyncMock(return_value='{"ok": true}')) as gemini_call,
+        ):
+            first = await client._call_api("prompt", json_mode=True)
+            second = await client._call_api("prompt", json_mode=True)
+
+        self.assertEqual('{"ok": true}', first)
+        self.assertEqual('{"ok": true}', second)
+        self.assertEqual(1, groq_call.await_count, "Groq should be parked after a 404, not retried per call")
+        self.assertEqual(2, gemini_call.await_count)
+
+    async def test_no_fallback_when_gemini_not_configured(self):
+        import groq
+
+        client = self._client()
+        client.settings = client.settings.model_copy(update={"GOOGLE_API_KEY": ""})
+        request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+        rate_limited = groq.RateLimitError("rate limited", response=httpx.Response(429, request=request), body=None)
+        with patch.object(client, "_call_groq", AsyncMock(side_effect=rate_limited)):
+            with self.assertRaises(groq.RateLimitError):
+                await client._call_api("prompt")
 
 
 class LocalWorkerEmbeddingTests(unittest.IsolatedAsyncioTestCase):
@@ -1520,10 +1561,7 @@ class CacheAndFallbackTests(HermeticAsyncTestCase):
             language="TypeScript",
             updated_at="2026-04-18T10:00:00Z",
         )
-        package_payload = {
-            "encoding": "base64",
-            "content": b64encode(b'{"name":"collab-board"}').decode("ascii"),
-        }
+        package_payload = '{"name":"collab-board"}'
 
         class FakeResponse:
             def __init__(self, *, status_code: int = 200, json_data: dict | None = None, text: str = "") -> None:
@@ -1542,8 +1580,8 @@ class CacheAndFallbackTests(HermeticAsyncTestCase):
                 self.calls.append(url)
                 if url.endswith("/readme"):
                     return FakeResponse(status_code=200, text="Collaborative whiteboard README")
-                if url.endswith("/contents/package.json"):
-                    return FakeResponse(status_code=200, json_data=package_payload)
+                if url.startswith("https://raw.githubusercontent.com/") and url.endswith("/package.json"):
+                    return FakeResponse(status_code=200, text=package_payload)
                 return FakeResponse(status_code=404, json_data={})
 
         # Use an in-memory dict to simulate _persistent_cache so the second

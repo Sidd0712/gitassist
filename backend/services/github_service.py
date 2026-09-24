@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import io
 import logging
 import math
@@ -32,6 +31,7 @@ from services.rag.embedding_service import EmbeddingService, EmbeddingUnavailabl
 logger = logging.getLogger(__name__)
 
 _cache: TTLCache = TTLCache(maxsize=512, ttl=get_settings().GITHUB_CACHE_TTL)
+_RAW_BASE = "https://raw.githubusercontent.com"
 _persistent_cache = PipelineCacheService()
 
 # ── Ranking weights ────────────────────────────────────────────────────────────
@@ -1091,7 +1091,7 @@ async def _fetch_sampled_code_files(
     paths = _sampled_code_paths(snapshot, keywords, limit=settings.RAG_SHALLOW_CODE_SAMPLE_COUNT)
     files: list[RepoFile] = []
     for path in paths:
-        content = await _fetch_file_content(client, repository.full_name, path)
+        content = await _fetch_file_content(client, repository.full_name, path, snapshot.commit_sha or "HEAD")
         if not content:
             continue
         truncated = content[: settings.RAG_SHALLOW_CODE_SAMPLE_MAX_CHARS]
@@ -1350,27 +1350,26 @@ async def fetch_repo_files_for_indexing(plan: RepoFetchPlan) -> list[RepoFile]:
     return ordered
 
 
-async def _fetch_file_content(client, full_name: str, path: str) -> str | None:
-    """Fetch and decode a single file via the GitHub contents API."""
+async def _fetch_file_content(client, full_name: str, path: str, ref: str = "HEAD") -> str | None:
+    """Fetch a single file from raw.githubusercontent.com.
 
-    ck = f"file:{full_name}:{path}"
+    Raw downloads don't count against the 5,000/hour REST quota, which the
+    contents API was burning ~125 calls per research request on. The token
+    is still sent because GitHub rate-limits unauthenticated raw requests.
+    """
+
+    ck = f"file:{full_name}:{ref}:{path}"
     if ck in _cache:
         return _cache[ck]
 
     settings = get_settings()
-    resp = await client.get(
-        f"{settings.GITHUB_API_BASE}/repos/{full_name}/contents/{path}",
-        headers=_headers(),
-    )
+    headers = {"Authorization": f"token {settings.GITHUB_TOKEN}"} if settings.GITHUB_TOKEN else {}
+    resp = await client.get(f"{_RAW_BASE}/{full_name}/{ref}/{path}", headers=headers)
     if resp.status_code != 200:
         return None
 
-    data = resp.json()
-    if data.get("encoding") != "base64" or not data.get("content"):
-        return None
-    try:
-        content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
-    except Exception:
+    content = resp.text
+    if not content or "\x00" in content or len(content) > settings.RAG_MAX_FILE_SIZE:
         return None
     _cache[ck] = content
     return content

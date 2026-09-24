@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     LLM_MODEL: str = "openai/gpt-oss-120b"  # llama-3.3-70b-versatile was decommissioned 2026-09; verify model availability at console.groq.com before changing
     LLM_TIMEOUT_SECONDS: int = 60
     LLM_MAX_RETRIES: int = 3
+    # Used only when Groq itself fails (rate limit, outage, retired model).
+    # Free AI Studio tier, no card: 15 requests/min, 500/day for this model.
+    # Empty either one to disable the fallback.
+    GOOGLE_API_KEY: str = ""
+    LLM_FALLBACK_MODEL: str = "gemini-3.5-flash-lite"
     LLM_AUX_TIMEOUT_SECONDS: int = 20
     LLM_GENERATION_TIMEOUT_SECONDS: int = 35
 

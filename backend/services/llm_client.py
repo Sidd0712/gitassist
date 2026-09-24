@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 
+import httpx
 from groq import APIError, AsyncGroq, RateLimitError
 
 from core.config import get_settings
@@ -23,7 +25,16 @@ class LLMClient:
             logger.warning("Get your free API key at: https://console.groq.com")
         self.client = AsyncGroq(api_key=self.settings.GROQ_API_KEY)
         self.model = self.settings.LLM_MODEL
-        logger.info("Groq API client initialized (model: %s)", self.model)
+        self._groq_unavailable_until = 0.0
+        logger.info(
+            "Groq API client initialized (model: %s, fallback: %s)",
+            self.model,
+            self.settings.LLM_FALLBACK_MODEL if self._fallback_enabled else "disabled",
+        )
+
+    @property
+    def _fallback_enabled(self) -> bool:
+        return bool(self.settings.GOOGLE_API_KEY and self.settings.LLM_FALLBACK_MODEL)
 
     async def _call_api(
         self,
@@ -35,10 +46,98 @@ class LLMClient:
         json_mode: bool = False,
         seed: int | None = None,
     ) -> str:
+        """Call Groq, falling back to Gemini when Groq itself is failing.
+
+        Only provider failures (rate limits, outages, a retired model) fall
+        back — a bad response from a healthy Groq is the caller's problem. A
+        failure also parks Groq for a cooldown so every other in-flight or
+        upcoming call doesn't pay the same failure first.
+        """
+
+        timeout_seconds = timeout_seconds or self.settings.LLM_TIMEOUT_SECONDS
+        if self._fallback_enabled and time.monotonic() < self._groq_unavailable_until:
+            return await self._call_gemini(prompt, temperature, max_tokens, timeout_seconds, json_mode)
+
+        try:
+            return await self._call_groq(
+                prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout_seconds=timeout_seconds,
+                json_mode=json_mode,
+                seed=seed,
+            )
+        except (APIError, TimeoutError) as exc:
+            if not self._fallback_enabled:
+                raise
+            status = getattr(exc, "status_code", None)
+            if isinstance(exc, RateLimitError):
+                cooldown = 60.0
+            elif status in (401, 403, 404):
+                cooldown = 600.0  # bad key or retired model — won't fix itself soon
+            elif isinstance(exc, TimeoutError):
+                cooldown = 0.0
+            else:
+                cooldown = 30.0
+            self._groq_unavailable_until = max(self._groq_unavailable_until, time.monotonic() + cooldown)
+            logger.warning(
+                "Groq failed (%s: %s); falling back to %s",
+                type(exc).__name__, status or "-", self.settings.LLM_FALLBACK_MODEL,
+            )
+            return await self._call_gemini(prompt, temperature, max_tokens, timeout_seconds, json_mode)
+
+    async def _call_gemini(
+        self,
+        prompt: str,
+        temperature: float,
+        max_tokens: int,
+        timeout_seconds: int,
+        json_mode: bool,
+    ) -> str:
+        generation_config: dict = {
+            "temperature": temperature,
+            # Thinking tokens count against maxOutputTokens; "low" keeps them
+            # small, and the headroom stops them from truncating the answer.
+            "maxOutputTokens": max_tokens + 1024,
+            "thinkingConfig": {"thinkingLevel": "low"},
+        }
+        if json_mode:
+            generation_config["responseMimeType"] = "application/json"
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            response = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{self.settings.LLM_FALLBACK_MODEL}:generateContent",
+                headers={"x-goog-api-key": self.settings.GOOGLE_API_KEY},
+                json={
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generationConfig": generation_config,
+                },
+            )
+        if response.status_code != 200:
+            raise RuntimeError(f"Gemini fallback failed: {response.status_code} {response.text[:300]}")
+        candidates = response.json().get("candidates") or []
+        if not candidates:
+            raise RuntimeError("Gemini fallback returned no candidates")
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text = "".join(part.get("text", "") for part in parts if not part.get("thought"))
+        if not text:
+            raise RuntimeError(f"Gemini fallback returned no text (finishReason={candidates[0].get('finishReason')})")
+        logger.info("Served by Gemini fallback (%s): %d chars", self.settings.LLM_FALLBACK_MODEL, len(text))
+        return text
+
+    async def _call_groq(
+        self,
+        prompt: str,
+        *,
+        temperature: float,
+        max_tokens: int,
+        timeout_seconds: int,
+        json_mode: bool,
+        seed: int | None,
+    ) -> str:
         """Make async API call to Groq with retry logic."""
 
         max_retries = self.settings.LLM_MAX_RETRIES
-        timeout_seconds = timeout_seconds or self.settings.LLM_TIMEOUT_SECONDS
 
         for attempt in range(max_retries):
             try:
