@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import math
 import posixpath
 import re
+import tomllib
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
 
+import yaml
 from cachetools import TTLCache
 
 from core.config import get_settings
@@ -1012,6 +1015,72 @@ async def fetch_repo_snapshot(repo: RepoSearchResult) -> RepoSnapshot:
 
 # ── Shallow evidence ───────────────────────────────────────────────────────────
 
+_MAX_DEPENDENCIES = 40
+
+
+def _requirement_name(spec: str) -> str:
+    return re.split(r"[<>=!~\[;@\s]", spec.strip(), maxsplit=1)[0]
+
+
+def _parse_manifest_dependencies(path: str, content: str) -> list[str]:
+    """Pull declared package/image names out of one root manifest.
+
+    Lockfiles are skipped on purpose: they list every transitive package,
+    which buries the handful of choices the repo's author actually made.
+    """
+    name = posixpath.basename(path).lower()
+    deps: list[str] = []
+    try:
+        if name == "package.json":
+            data = json.loads(content)
+            for section in ("dependencies", "devDependencies"):
+                deps.extend((data.get(section) or {}).keys())
+        elif name == "requirements.txt":
+            for line in content.splitlines():
+                line = line.split("#", 1)[0].strip()
+                if line and not line.startswith("-"):
+                    deps.append(_requirement_name(line))
+        elif name == "pyproject.toml":
+            data = tomllib.loads(content)
+            deps.extend(_requirement_name(s) for s in data.get("project", {}).get("dependencies", []))
+            poetry = data.get("tool", {}).get("poetry", {}).get("dependencies", {})
+            deps.extend(k for k in poetry if k.lower() != "python")
+        elif name == "cargo.toml":
+            deps.extend(tomllib.loads(content).get("dependencies", {}).keys())
+        elif name == "go.mod":
+            for match in re.finditer(r"^\s*(?:require\s+)?([\w.\-]+(?:/[\w.\-]+)+)\s+v[\w.\-+]+", content, re.M):
+                deps.append(match.group(1))
+        elif name == "pom.xml":
+            deps.extend(re.findall(r"<dependency>.*?<artifactId>\s*([^<\s]+)\s*</artifactId>", content, re.S))
+        elif name in ("build.gradle", "build.gradle.kts"):
+            deps.extend(
+                m.group(1)
+                for m in re.finditer(
+                    r"(?:implementation|api|compileOnly|runtimeOnly)\s*\(?\s*['\"][^:'\"]+:([^:'\"]+)", content
+                )
+            )
+        elif name == "dockerfile":
+            for match in re.finditer(r"^\s*FROM\s+(?:--\S+\s+)*([^\s:@]+)", content, re.M | re.I):
+                if match.group(1).lower() != "scratch":
+                    deps.append(match.group(1))
+        elif name in ("docker-compose.yml", "docker-compose.yaml"):
+            services = (yaml.safe_load(content) or {}).get("services") or {}
+            for service in services.values():
+                if isinstance(service, dict) and isinstance(service.get("image"), str):
+                    deps.append(re.split(r"[:@]", service["image"], maxsplit=1)[0])
+    except (ValueError, TypeError, AttributeError, tomllib.TOMLDecodeError, yaml.YAMLError):
+        return []
+    return [d for d in deps if isinstance(d, str) and d]
+
+
+def _with_manifest_dependencies(evidence: ShallowRepoEvidence) -> ShallowRepoEvidence:
+    deps: list[str] = []
+    for manifest in evidence.manifest_files:
+        deps.extend(_parse_manifest_dependencies(manifest.path, manifest.content))
+    evidence.repository.dependencies = list(dict.fromkeys(deps))[:_MAX_DEPENDENCIES]
+    return evidence
+
+
 def _root_manifest_candidates(language: str | None) -> list[str]:
     base = [
         "package.json", "pyproject.toml", "requirements.txt", "go.mod",
@@ -1119,7 +1188,7 @@ async def fetch_shallow_repo_evidence(
     })
     cached = _persistent_cache.get_json("github_shallow", cache_key)
     if isinstance(cached, dict):
-        return ShallowRepoEvidence(**cached)
+        return _with_manifest_dependencies(ShallowRepoEvidence(**cached))
 
     client = get_github_client()
     readme_text = ""
@@ -1179,7 +1248,7 @@ async def fetch_shallow_repo_evidence(
         highlighted_paths=highlighted_paths[:10],
     )
     _persistent_cache.set_json("github_shallow", cache_key, evidence.model_dump())
-    return evidence
+    return _with_manifest_dependencies(evidence)
 
 
 async def fetch_shallow_repo_evidence_batch(

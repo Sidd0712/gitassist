@@ -503,6 +503,12 @@ For each major layer (frontend, backend, database, realtime, deployment), provid
 3. Pros for this specific use case
 4. Cons/tradeoffs to consider
 
+Each repository in the Evidence lists its "declared_dependencies" (real
+packages/images parsed from its manifests). Prefer technologies that appear
+there, and in "supported_by" name the repositories that actually declare
+them. Only list a repository in "supported_by" if its evidence backs the
+choice.
+
 Return JSON array (no markdown):
 [
   {{

@@ -1095,6 +1095,24 @@ class RankingAndGenerationTests(HermeticAsyncTestCase):
         self.assertNotIn("https://fake.example/nonexistent-page", cleaned[1][0])
         self.assertIn("Fabricated guide", cleaned[1][0])
 
+    def test_manifest_dependencies_are_parsed_per_ecosystem(self):
+        from services.github_service import _parse_manifest_dependencies
+
+        cases = {
+            "package.json": ('{"dependencies": {"yjs": "^13"}, "devDependencies": {"vite": "^5"}}', ["yjs", "vite"]),
+            "requirements.txt": ("fastapi>=0.110\n# comment\n-r base.txt\nuvicorn[standard]==0.29\n", ["fastapi", "uvicorn"]),
+            "pyproject.toml": ('[project]\ndependencies = ["httpx<0.28", "pydantic"]\n', ["httpx", "pydantic"]),
+            "go.mod": ("module x\n\nrequire (\n\tgithub.com/gorilla/websocket v1.5.1\n)\n", ["github.com/gorilla/websocket"]),
+            "Dockerfile": ("FROM node:20-alpine AS build\nFROM --platform=linux/amd64 nginx:1.27\n", ["node", "nginx"]),
+            "docker-compose.yml": ("services:\n  db:\n    image: postgres:16\n  cache:\n    image: redis\n", ["postgres", "redis"]),
+        }
+        for path, (content, expected) in cases.items():
+            with self.subTest(manifest=path):
+                self.assertEqual(expected, _parse_manifest_dependencies(path, content))
+
+        self.assertEqual([], _parse_manifest_dependencies("package.json", "{not json"))
+        self.assertEqual([], _parse_manifest_dependencies("package-lock.json", '{"dependencies": {"a": {}}}'))
+
     async def test_link_check_never_requests_internal_addresses(self):
         cleaned = await _validate_resource_links(
             [["Metadata - http://169.254.169.254/latest/meta-data/", "Local - http://127.0.0.1:8000/admin"]]

@@ -640,6 +640,7 @@ def _merge_ranked_repository_metrics(repository: RepoSearchResult, ranked_reposi
     merged.fit_summary = ranked_repository.fit_summary
     merged.covered_primary = ranked_repository.covered_primary[:]
     merged.missing_primary = ranked_repository.missing_primary[:]
+    merged.dependencies = ranked_repository.dependencies[:] or merged.dependencies
     _apply_baseline_fit_metrics(merged)
     return merged
 

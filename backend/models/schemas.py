@@ -120,6 +120,7 @@ class RepoSearchResult(BaseModel):
     missing_primary: list[str] = Field(default_factory=list)
     files: list[RepoFile] = Field(default_factory=list, description="Fetched source files")
     evidence_type: Literal["deep_retrieval", "shallow_evidence", "no_evidence"] = "shallow_evidence"
+    dependencies: list[str] = Field(default_factory=list, description="Packages/images declared in root manifests")
 
 
 class RepoSnapshot(RepoSearchResult):

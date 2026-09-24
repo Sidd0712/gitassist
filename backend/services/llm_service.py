@@ -483,6 +483,7 @@ def _build_generation_evidence(
             "fit_summary": repo.fit_summary,
             "score": round(repo.relevance_score, 4),
             "description": (repo.description or "")[:220],
+            "declared_dependencies": repo.dependencies[:25],
         }
         for repo in repositories[:5]
     ]
