@@ -145,7 +145,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const { result, chatMessages } = get();
     const scopeRepositories = getChatScope(result);
     if (!result || result.status !== 'complete' || scopeRepositories.length === 0) {
-      set({ chatError: 'Repo chat is only available after indexed repositories are ready.' });
+      set({ chatError: 'Repo chat is available once a report has repositories to search.' });
       return;
     }
 
@@ -167,10 +167,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         question: trimmedQuestion,
         idea_summary: result.idea_summary,
         scope_repositories: scopeRepositories,
-        messages: chatMessages.map((message) => ({
-          role: message.role,
-          content: message.content,
-        })),
+        // The canned intro isn't part of the real conversation.
+        messages: chatMessages
+          .filter((message) => !message.isIntro)
+          .map((message) => ({ role: message.role, content: message.content })),
       });
 
       const assistantMessage: RepoChatMessage = {
@@ -361,18 +361,18 @@ function buildIntroMessage(result: AnalysisResponse): RepoChatMessage {
     role: 'assistant',
     content:
       repoCount > 0
-        ? `I can answer grounded questions over ${repoCount} indexed repo${repoCount === 1 ? '' : 's'} for this analysis${repoNames ? `, including ${repoNames}` : ''}. Ask about architecture, files, setup, dependencies, or how the repos implement a feature.`
-        : 'Repo chat will appear here once indexed repositories are available for this analysis.',
+        ? `Ask me anything about the code in these ${repoCount} repos${repoNames ? ` (${repoNames}…)` : ''}: how a feature is implemented, how to run them, how they're structured, or how you could adapt their approach for your project. I'll quote the actual code and link to the lines.`
+        : 'Repo chat will appear here once repositories are available for this analysis.',
     follow_up_suggestions: [
-      'Which repository is the best end-to-end reference?',
-      'Show me the most relevant files for the core architecture.',
-      'What dependencies define the stack in these repos?',
+      'Which repository is the best end-to-end reference, and why?',
+      'Show me the code that implements the core feature.',
+      'How would I adapt the closest repo for my project?',
     ],
     isIntro: true,
   };
 }
 
-function getChatScope(result: AnalysisResponse | null): RepoChatScopeRepository[] {
+export function getChatScope(result: AnalysisResponse | null): RepoChatScopeRepository[] {
   if (!result || result.status !== 'complete') return [];
   return result.repositories
     .filter((repo) => Boolean(repo.full_name && repo.commit_sha))

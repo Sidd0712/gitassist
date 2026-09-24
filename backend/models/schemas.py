@@ -223,6 +223,25 @@ class Citation(BaseModel):
     start_line: int | None = None
     end_line: int | None = None
     reason: str = ""
+    commit_sha: str | None = None  # lets the UI link to the exact indexed lines on GitHub
+
+
+class IndexStatusRequest(BaseModel):
+    """Repos whose indexing progress the chat panel wants to show."""
+
+    repositories: list[RepoChatScopeRepository] = Field(default_factory=list, max_length=10)
+
+
+class RepoIndexStatus(BaseModel):
+    full_name: str
+    state: Literal["not_queued", "queued", "indexing", "partial", "completed", "failed"]
+    chunk_count: int = 0
+    error: str | None = None
+
+
+class IndexStatusResponse(BaseModel):
+    worker_online: bool
+    repositories: list[RepoIndexStatus] = Field(default_factory=list)
 
 
 class RepoChatEvidenceHit(BaseModel):

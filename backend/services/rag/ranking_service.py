@@ -42,6 +42,7 @@ async def rank_repo_evidence(
     by_name = {evidence.repository.full_name: evidence for evidence in evidence_items}
     primary_capabilities = set(keywords.primary_capabilities or keywords.capabilities[:3])
     selected = _apply_judged_ranking(judged, by_name, primary_capabilities, settings.RAG_MAX_PER_LANGUAGE)
+    selected = _prefer_domain_matches(selected, judged, settings.RAG_OUTPUT_REPO_LIMIT)
 
     if not selected:
         selected = _fallback_ranking(evidence_items, settings.RAG_MAX_PER_LANGUAGE)
@@ -51,15 +52,36 @@ async def rank_repo_evidence(
     return selected
 
 
+def _prefer_domain_matches(selected: list[ShallowRepoEvidence], judged: list[dict], limit: int) -> list[ShallowRepoEvidence]:
+    """Keep domain-matching repos first; technique-only ones only fill leftover slots.
+
+    The model judges a few more candidates than we show, so a famous
+    technique-only library (e.g. a generic time-series toolkit for a job-skills
+    idea) can't crowd out smaller projects that work on the actual domain.
+    Order within the kept set follows the model's ranking.
+    """
+
+    flags = {str(item.get("full_name", "")).strip(): item.get("domain_match") for item in judged}
+    if not any(isinstance(flag, bool) for flag in flags.values()):
+        return selected  # model didn't report domain_match; nothing to enforce
+    domain = [e for e in selected if flags.get(e.repository.full_name) is True]
+    other = [e for e in selected if flags.get(e.repository.full_name) is not True]
+    keep_domain = domain[:limit]
+    keep = {e.repository.full_name for e in keep_domain + other[: limit - len(keep_domain)]}
+    return [e for e in selected if e.repository.full_name in keep]
+
+
 def _build_digest(evidence: ShallowRepoEvidence) -> dict:
     repo = evidence.repository
     return {
         "full_name": repo.full_name,
         "stars": repo.stars,
         "language": repo.language or "",
+        "topics": repo.topics[:8],
         "description": (repo.description or "")[:300],
-        "readme_excerpt": evidence.readme[:800],
+        "readme_excerpt": evidence.readme[:1500],
         "manifest_files": [file.path for file in evidence.manifest_files[:6]],
+        "sampled_paths": evidence.sampled_paths[:8],
     }
 
 

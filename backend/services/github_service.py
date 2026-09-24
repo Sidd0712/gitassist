@@ -50,16 +50,22 @@ _SEARCH_RANKING_WEIGHTS = {
 # Invalidates all cached github_search and llm_search_query_specs entries.
 _SEARCH_CACHE_VERSION = 5
 
-SKIP_PATH_PARTS = {
-    "node_modules", "vendor", ".git", "dist", "build", "coverage",
-    # NOTE: "test" and "tests" intentionally omitted — integration test files
-    # often contain real feature demonstrations that are valuable for chat retrieval.
-    # The chunker classifies them as role="test" and _path_priority gives them the
-    # lowest priority score (20), so they only fill budget after all implementation
-    # files are already selected.
-    "__pycache__", ".next", ".nuxt", "target",
-    "bin", "obj", "packages", ".vscode", ".idea",
+# Matched against whole directory names, never substrings: substring matching
+# used to drop every monorepo's packages/ dir, combine.py ("bin"), distance.py
+# ("dist") and objects/ ("obj"). Tests are kept on purpose — they're ranked
+# low but often show real usage, which chat questions benefit from.
+SKIP_DIRS = {
+    "node_modules", "vendor", ".git", "dist", "build", "coverage", "__pycache__",
+    ".next", ".nuxt", ".svelte-kit", "target", "bin", "obj", ".vscode", ".idea",
+    ".venv", "venv", "site-packages", ".tox", ".mypy_cache", ".pytest_cache",
+    "bower_components", ".gradle", ".cache", "__snapshots__",
 }
+SKIP_FILENAMES = {
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "cargo.lock",
+    "composer.lock", "gemfile.lock", "go.sum", "uv.lock", "pipfile.lock", "bun.lockb",
+}
+_GENERATED_SUFFIXES = (".min.js", ".min.css", ".map", "_pb2.py", "_pb2_grpc.py", ".pb.go", ".d.ts.map", ".bundle.js")
+_DATA_EXTENSIONS = {".json", ".yaml", ".yml", ".xml", ".csv", ".tsv"}
 
 IMPORTANT_FILENAMES = {
     "package.json", "requirements.txt", "cargo.toml", "go.mod",
@@ -74,8 +80,19 @@ SOURCE_EXTENSIONS = {
     ".kt", ".scala", ".r", ".m", ".vue", ".svelte", ".dart",
     ".sh", ".bash", ".sql", ".graphql", ".proto", ".yaml", ".yml",
     ".json", ".xml", ".md", ".txt", ".toml", ".ini", ".cfg",
-    ".html", ".css", ".scss", ".less",
+    ".html", ".css", ".scss", ".less", ".rst", ".ipynb", ".lua", ".ex", ".exs",
+    ".clj", ".hs", ".ml", ".zig", ".jl", ".tf", ".prisma",
 }
+_CODE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs", ".rb", ".php", ".c", ".cpp",
+    ".h", ".hpp", ".cs", ".swift", ".kt", ".scala", ".r", ".m", ".vue", ".svelte", ".dart",
+    ".sql", ".graphql", ".proto", ".ipynb", ".lua", ".ex", ".exs", ".clj", ".hs", ".ml",
+    ".zig", ".jl", ".tf", ".prisma",
+}
+_TEST_DIRS = {"test", "tests", "__tests__", "spec", "specs", "e2e", "testing"}
+_EXAMPLE_DIRS = {"example", "examples", "demo", "demos", "sample", "samples", "playground", "benchmarks"}
+_DOC_DIRS = {"docs", "doc", "documentation", "website"}
+_SCRIPT_DIRS = {"scripts", "script", "tools", ".github", "ci"}
 
 _IMPL_ROUTE_TOKENS = (
     "router", "route", "service", "controller", "handler", "middleware", "resolver"
@@ -115,53 +132,66 @@ def _headers(accept: str = "application/vnd.github+json") -> dict[str, str]:
     return headers
 
 
+def _extension(filename: str) -> str:
+    return "." + filename.rsplit(".", 1)[-1] if "." in filename else ""
+
+
+def _max_file_size(path: str) -> int:
+    # Notebooks carry saved outputs (often base64 plots); only their cells get indexed.
+    limit = get_settings().RAG_MAX_FILE_SIZE
+    return limit * 10 if path.lower().endswith(".ipynb") else limit
+
+
 def _should_fetch(path: str, size: int) -> bool:
     settings = get_settings()
-    lowered = path.lower()
-    if any(token in lowered for token in SKIP_PATH_PARTS):
+    parts = path.lower().split("/")
+    filename = parts[-1]
+    if any(part in SKIP_DIRS for part in parts[:-1]) or filename in SKIP_FILENAMES:
         return False
-    if size > settings.RAG_MAX_FILE_SIZE:
+    if size > _max_file_size(path) or filename.endswith(_GENERATED_SUFFIXES):
         return False
-    filename = lowered.rsplit("/", 1)[-1]
     if filename in IMPORTANT_FILENAMES or filename.startswith("readme"):
         return True
-    extension = "." + filename.rsplit(".", 1)[-1] if "." in filename else ""
+    extension = _extension(filename)
+    if extension in _DATA_EXTENSIONS and size > settings.RAG_MAX_DATA_FILE_SIZE:
+        return False
     return extension in SOURCE_EXTENSIONS
 
 
 def _path_priority(path: str, idea_terms: set[str]) -> int:
-    """
-    Score files so implementation code is fetched before documentation.
+    """Order files for whole-repo indexing; higher is indexed first.
 
-    Tiers (highest first):
-      routes/services/controllers → entrypoints → idea-term matched source →
-      README → manifests → docs/examples → tests
+    Indexing is progressive and capped (RAG_REPO_MAX_CHUNKS), so this order
+    decides what chat can see first and what survives the cap for huge repos:
+    root README → root manifests → source → docs → config → examples → tests
+    → scripts. Idea-term matches and shallower paths win within a tier.
     """
     lowered = path.lower()
-    filename = lowered.rsplit("/", 1)[-1]
-    score = 0
+    parts = lowered.split("/")
+    filename, dirs = parts[-1], set(parts[:-1])
+    extension = _extension(filename)
 
-    if any(token in lowered for token in _IMPL_ROUTE_TOKENS):
-        score += 100
-    if any(token in lowered for token in _IMPL_ENTRY_TOKENS):
-        score += 90
+    if len(parts) == 1 and filename.startswith("readme"):
+        tier = 1000
+    elif len(parts) <= 2 and filename in IMPORTANT_FILENAMES:
+        tier = 900
+    elif dirs & _TEST_DIRS or ".test." in filename or ".spec." in filename or filename.startswith("test_"):
+        tier = 200
+    elif dirs & _EXAMPLE_DIRS:
+        tier = 250
+    elif dirs & _SCRIPT_DIRS or extension in {".sh", ".bash"}:
+        tier = 150
+    elif extension in _CODE_EXTENSIONS:
+        tier = 600
+        if any(token in lowered for token in _IMPL_ROUTE_TOKENS) or filename.startswith(_IMPL_ENTRY_TOKENS):
+            tier += 50
+    elif extension in {".md", ".rst", ".txt"} or dirs & _DOC_DIRS:
+        tier = 400
+    else:
+        tier = 300
 
-    is_source = any(
-        path.endswith(ext)
-        for ext in (".py", ".ts", ".js", ".tsx", ".jsx", ".go", ".rb", ".java", ".rs", ".php")
-    )
-    score += sum(15 if is_source else 5 for term in idea_terms if term in lowered)
-
-    if filename.startswith("readme"):
-        score += 70
-    if filename in IMPORTANT_FILENAMES:
-        score += 60
-    if any(token in lowered for token in _DOC_TOKENS):
-        score += 50
-    if any(token in lowered for token in ("test", "spec")):
-        score += 20
-
-    return score
+    idea_bonus = min(90, 30 * sum(1 for term in idea_terms if term in lowered))
+    return tier + idea_bonus - 5 * min(len(parts) - 1, 10)
 
 
 def _normalize_archive_path(member_name: str) -> str:
@@ -1285,52 +1315,8 @@ def build_repo_fetch_plan(
     if not isinstance(intent, ExtractedKeywords):
         raise TypeError("build_repo_fetch_plan expects ExtractedKeywords as the resolved intent.")
 
-    settings = get_settings()
-    idea_terms = _idea_terms_from_keywords(
-        intent,
-        matched_capabilities=shallow.matched_capabilities[:4] if shallow else None,
-    )
-    total_blobs = sum(1 for e in snapshot.tree if e.type == "blob")
-    prioritized = sorted(
-        (
-            e for e in snapshot.tree
-            if e.type == "blob" and _should_fetch(e.path, e.size)
-        ),
-        key=lambda e: (_path_priority(e.path, idea_terms), e.size * -1),
-        reverse=True,
-    )
-    logger.info(
-        "%s: %d/%d files in tree are index-eligible (extension/path/size filters)",
-        snapshot.full_name, len(prioritized), total_blobs,
-    )
-
-    selected_paths: list[str] = []
-    skipped_paths: list[str] = []
-    estimated_chars = 0
-    selected_set: set[str] = set()
-
-    for entry in prioritized:
-        if entry.path in selected_set:
-            continue
-        if len(selected_paths) >= settings.RAG_MAX_FILES_PER_REPO:
-            skipped_paths.append(entry.path)
-            continue
-        if estimated_chars + entry.size > settings.RAG_MAX_CHARS_PER_REPO:
-            skipped_paths.append(entry.path)
-            continue
-        selected_paths.append(entry.path)
-        selected_set.add(entry.path)
-        estimated_chars += entry.size
-
-    if skipped_paths:
-        logger.warning(
-            "%s: fetch plan truncated by budget — indexed %d/%d eligible files "
-            "(%d chars/%d budget); %d files skipped, e.g. %s",
-            snapshot.full_name,
-            len(selected_paths), len(selected_paths) + len(skipped_paths),
-            estimated_chars, settings.RAG_MAX_CHARS_PER_REPO,
-            len(skipped_paths), skipped_paths[:5],
-        )
+    path_terms = path_terms_for_intent(intent, shallow.matched_capabilities if shallow else None)
+    selected_paths, skipped_paths, estimated_chars = select_index_paths(snapshot.full_name, snapshot.tree, path_terms)
 
     repo_payload = snapshot.model_dump(exclude={"tree", "search_queries", "files"})
     ranked_overrides = shallow.repository.model_dump(
@@ -1348,11 +1334,88 @@ def build_repo_fetch_plan(
         skipped_paths=skipped_paths[:20],
         estimated_chars=estimated_chars,
         rationale=[
-            "Routes/services/controllers prioritised first; entrypoints second; idea-matched source third.",
-            "README and manifests included after implementation files to preserve char budget for code.",
-            "Char and file limits applied after priority ordering.",
+            "Whole repo minus vendored, generated, lock and oversized data files.",
+            "Order: root README, manifests, source, docs, config, examples, tests, scripts.",
+            "Only the chunk budget (RAG_REPO_MAX_CHUNKS) truncates, from the lowest priority up.",
         ],
     )
+
+
+def path_terms_for_intent(keywords: ExtractedKeywords, matched_capabilities: list[str] | None = None) -> list[str]:
+    """Single words from the idea that can boost matching file paths during indexing."""
+
+    return sorted(_path_terms(_idea_terms_from_keywords(keywords, (matched_capabilities or [])[:4])))
+
+
+def select_index_paths(
+    full_name: str, tree: list[RepoTreeEntry], path_terms: list[str] | set[str]
+) -> tuple[list[str], list[str], int]:
+    """Whole repo, in priority order, until the chunk budget is spent.
+
+    Returns (selected, skipped, estimated_chars). Budget is ~1 chunk per
+    RAG_CHUNK_TARGET_CHARS of source, so only huge repos lose their
+    lowest-priority files (tests, scripts) to the cap.
+    """
+
+    settings = get_settings()
+    terms = set(path_terms)
+    total_blobs = sum(1 for e in tree if e.type == "blob")
+    prioritized = sorted(
+        (e for e in tree if e.type == "blob" and _should_fetch(e.path, e.size)),
+        key=lambda e: (_path_priority(e.path, terms), -e.size),
+        reverse=True,
+    )
+
+    char_budget = settings.RAG_REPO_MAX_CHUNKS * settings.RAG_CHUNK_TARGET_CHARS
+    selected: list[str] = []
+    skipped: list[str] = []
+    estimated_chars = 0
+    for entry in prioritized:
+        if estimated_chars + entry.size > char_budget:
+            skipped.append(entry.path)
+            continue
+        selected.append(entry.path)
+        estimated_chars += entry.size
+
+    logger.info(
+        "%s: indexing %d/%d files (%d eligible, %d over the %d-chunk budget)",
+        full_name, len(selected), total_blobs, len(prioritized), len(skipped), settings.RAG_REPO_MAX_CHUNKS,
+    )
+    return selected, skipped, estimated_chars
+
+
+async def fetch_repo_tree(full_name: str, ref: str) -> list[RepoTreeEntry]:
+    """The file tree at an exact commit, so the worker indexes what Render queued."""
+
+    settings = get_settings()
+    response = await get_github_client().get(
+        f"{settings.GITHUB_API_BASE}/repos/{full_name}/git/trees/{ref}",
+        headers=_headers(),
+        params={"recursive": 1},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("truncated"):
+        logger.warning("Tree for %s@%s is truncated by GitHub; indexing the part that was returned", full_name, ref[:8])
+    return [
+        RepoTreeEntry(path=item["path"], type="blob", size=item.get("size", 0))
+        for item in payload.get("tree", [])
+        if item.get("type") == "blob"
+    ]
+
+
+_PATH_TERM_STOPWORDS = {"with", "from", "that", "this", "into", "user", "users", "data", "based", "using", "system", "management"}
+
+
+def _path_terms(idea_terms: set[str]) -> set[str]:
+    """Split idea phrases into single words that can plausibly appear in a file path."""
+
+    return {
+        word
+        for term in idea_terms
+        for word in re.split(r"[^a-z0-9]+", term.lower())
+        if len(word) >= 4 and word not in _PATH_TERM_STOPWORDS
+    }
 
 
 async def fetch_repo_files_for_indexing(plan: RepoFetchPlan) -> list[RepoFile]:
@@ -1376,8 +1439,6 @@ async def fetch_repo_files_for_indexing(plan: RepoFetchPlan) -> list[RepoFile]:
     selected_lookup = {
         path.replace("\\", "/"): idx for idx, path in enumerate(plan.selected_paths)
     }
-    extracted_bytes = 0
-    extracted_files = 0
     files_by_index: dict[int, RepoFile] = {}
 
     with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
@@ -1389,30 +1450,17 @@ async def fetch_repo_files_for_indexing(plan: RepoFetchPlan) -> list[RepoFile]:
                 continue
             norm = rel.replace("\\", "/")
             idx = selected_lookup.get(norm)
-            if idx is None:
+            if idx is None or member.file_size > _max_file_size(norm):
                 continue
-            if member.file_size > settings.RAG_MAX_FILE_SIZE:
-                continue
-
-            extracted_files += 1
-            if extracted_files > settings.RAG_ARCHIVE_MAX_FILES:
-                break
 
             with archive.open(member) as fh:
                 raw = fh.read()
-
-            extracted_bytes += len(raw)
-            if extracted_bytes > settings.RAG_ARCHIVE_MAX_EXTRACTED_BYTES:
-                logger.warning(
-                    "Stopped extracting %s after %d bytes",
-                    plan.repository.full_name, extracted_bytes,
-                )
-                break
             if _looks_binary(raw):
                 continue
 
-            content = raw.decode("utf-8", errors="replace")
-            files_by_index[idx] = RepoFile(path=norm, content=content, size=len(content))
+            content = _readable_content(norm, raw.decode("utf-8", errors="replace"))
+            if content:
+                files_by_index[idx] = RepoFile(path=norm, content=content, size=len(content))
 
     ordered = [files_by_index[i] for i in sorted(files_by_index)]
     logger.info("Fetched %d files for %s", len(ordered), plan.repository.full_name)
@@ -1444,31 +1492,57 @@ async def _fetch_planned_files_raw(client, plan: RepoFetchPlan, ref: str) -> lis
 
     settings = get_settings()
     semaphore = asyncio.Semaphore(settings.RAG_MAX_SEARCH_CONCURRENCY)
-    paths = plan.selected_paths[: settings.RAG_MAX_FILES_PER_REPO]
 
     async def fetch(path: str) -> RepoFile | None:
         async with semaphore:
-            content = await _fetch_file_content(client, plan.repository.full_name, path, ref)
-        if content is None:
+            content = await _fetch_file_content(client, plan.repository.full_name, path, ref, cache=False)
+        content = _readable_content(path, content) if content else None
+        if not content:
             return None
         return RepoFile(path=path, content=content, size=len(content))
 
-    results = await asyncio.gather(*(fetch(path) for path in paths))
+    results = await asyncio.gather(*(fetch(path) for path in plan.selected_paths))
     ordered = [item for item in results if item is not None]
     logger.info("Fetched %d files for %s via raw downloads", len(ordered), plan.repository.full_name)
     return ordered
 
 
-async def _fetch_file_content(client, full_name: str, path: str, ref: str = "HEAD") -> str | None:
+def _readable_content(path: str, content: str) -> str:
+    """Turn a fetched file into indexable text; notebooks become their cells."""
+
+    if not path.lower().endswith(".ipynb"):
+        return content
+    try:
+        cells = json.loads(content).get("cells", [])
+    except (ValueError, AttributeError):
+        return ""
+    blocks = []
+    for cell in cells:
+        source = cell.get("source", "")
+        source = "".join(source) if isinstance(source, list) else str(source)
+        if not source.strip():
+            continue
+        # Markdown cells become comments so the result still reads as one Python file.
+        if cell.get("cell_type") == "markdown":
+            source = "\n".join(f"# {line}" for line in source.splitlines())
+        blocks.append(source.rstrip())
+    return "\n\n".join(blocks)
+
+
+async def _fetch_file_content(
+    client, full_name: str, path: str, ref: str = "HEAD", *, cache: bool = True
+) -> str | None:
     """Fetch a single file from raw.githubusercontent.com.
 
     Raw downloads don't count against the 5,000/hour REST quota, which the
     contents API was burning ~125 calls per research request on. The token
     is still sent because GitHub rate-limits unauthenticated raw requests.
+    Whole-repo indexing passes cache=False so thousands of files don't pile
+    up in the shared in-memory cache.
     """
 
     ck = f"file:{full_name}:{ref}:{path}"
-    if ck in _cache:
+    if cache and ck in _cache:
         return _cache[ck]
 
     settings = get_settings()
@@ -1480,5 +1554,6 @@ async def _fetch_file_content(client, full_name: str, path: str, ref: str = "HEA
     content = resp.text
     if not content or "\x00" in content or len(content) > settings.RAG_MAX_FILE_SIZE:
         return None
-    _cache[ck] = content
+    if cache:
+        _cache[ck] = content
     return content

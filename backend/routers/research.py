@@ -16,35 +16,37 @@ from fastapi.responses import StreamingResponse
 from core.config import get_settings
 from models.schemas import (
     AnalysisResponse,
+    Citation,
     IdeaRequest,
+    IndexStatusRequest,
+    IndexStatusResponse,
     RepoChatEvidenceHit,
     RepoChatRequest,
     RepoChatResponse,
     RepoFetchPlan,
+    RepoIndexStatus,
     RepoSearchResult,
     RepoSnapshot,
-    RetrievalPlan,
 )
 from services.github_service import (
     build_repo_fetch_plan,
     fetch_shallow_repo_evidence_batch,
     fetch_repo_snapshot,
+    path_terms_for_intent,
     search_repo_candidates,
 )
 from services.llm_service import (
     answer_repo_chat,
     build_clarification_questions,
-    build_repo_chat_retrieval_query,
     extract_keywords,
     generate_analysis,
     plan_retrieval_queries,
 )
 from services.pipeline_budget import RequestBudget
-from services.rag.citation_service import citations_from_hits
 from services.rag.corpus_service import CorpusService
 from services.rag.embedding_service import EmbeddingUnavailable
 from services.rag.ranking_service import rank_repo_evidence
-from services.rag.retrieval_service import RetrievalService
+from services.rag.retrieval_service import ChatRetriever, RetrievalService
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +69,7 @@ def _sse(event: dict) -> str:
 # counter is enough to stop a leaked URL from running up GitHub/Groq/Cohere
 # usage. Neither is meant to hold up under multi-instance/multi-tenant load.
 
-_rate_limit_buckets: dict[str, list[float]] = defaultdict(list)
+_rate_limit_buckets: dict[tuple[str, str], list[float]] = defaultdict(list)
 
 
 def _require_api_key(x_api_key: str | None = Header(default=None)) -> None:
@@ -78,50 +80,46 @@ def _require_api_key(x_api_key: str | None = Header(default=None)) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing API key.")
 
 
-def _enforce_rate_limit(http_request: Request) -> None:
-    settings = get_settings()
-    client_ip = http_request.client.host if http_request.client else "unknown"
-    now = time.monotonic()
-    window_start = now - 3600
-    bucket = _rate_limit_buckets[client_ip]
-    while bucket and bucket[0] < window_start:
-        bucket.pop(0)
-    if len(bucket) >= settings.RATE_LIMIT_PER_HOUR:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again later.")
-    bucket.append(now)
+def _rate_limiter(bucket_name: str, limit_setting: str):
+    """Per-IP rolling-hour limit, with a separate bucket per route family."""
+
+    def enforce(http_request: Request) -> None:
+        limit = getattr(get_settings(), limit_setting)
+        client_ip = http_request.client.host if http_request.client else "unknown"
+        now = time.monotonic()
+        bucket = _rate_limit_buckets[(bucket_name, client_ip)]
+        while bucket and bucket[0] < now - 3600:
+            bucket.pop(0)
+        if len(bucket) >= limit:
+            raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again later.")
+        bucket.append(now)
+
+    return enforce
 
 
-_guarded = [Depends(_require_api_key), Depends(_enforce_rate_limit)]
+_guarded = [Depends(_require_api_key), Depends(_rate_limiter("research", "RATE_LIMIT_PER_HOUR"))]
+_chat_guarded = [Depends(_require_api_key), Depends(_rate_limiter("chat", "CHAT_RATE_LIMIT_PER_HOUR"))]
 
 
-# ── Background (non-blocking) deep indexing ─────────────────────────────────
-# Council finding (2026-09): deep indexing was being awaited synchronously
-# before generation, but generate_analysis's evidence pack is grounded mainly
-# by repo_dicts (description/fit_summary/reference_type from shallow rerank)
-# with section_hits only adding citations on top — so a repo missing deep
-# hits still gets a real, metadata-grounded description, not a blank one.
-# Given real measured embedding throughput (~6 chunks/sec on realistic code,
-# not the ~56/sec a toy benchmark suggested), blocking the request on fresh
-# indexing could take minutes per repo — the report doesn't need to wait for
-# that. Deep indexing now runs fire-and-forget; repo-chat naturally 409s /
-# returns "no evidence" for a repo until its background job lands, then finds
-# real chunks on the next attempt with no extra plumbing needed.
-_background_tasks: set[asyncio.Task] = set()
+# ── Whole-repo indexing is queued, never run here ───────────────────────────
+# Render has 512 MB; one 604 MB repo zip OOM-killed it mid-request. Repos are
+# now queued in Postgres (repo_index_jobs) and indexed by the worker on the
+# developer's machine. The report never waits: repos still being indexed are
+# grounded by their shallow-rerank evidence, and chat picks them up as soon as
+# the worker marks them 'partial'.
 
 
-def _fire_and_forget_indexing(corpus_service: CorpusService, plans: list) -> None:
-    if not plans:
-        return
-
-    async def _run() -> None:
-        try:
-            await _index_selected_plans(corpus_service, plans)
-        except Exception:
-            logger.exception("Background deep indexing failed for %d plan(s)", len(plans))
-
-    task = asyncio.create_task(_run())
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+def _queue_for_indexing(
+    corpus_service: CorpusService,
+    plan: RepoFetchPlan,
+    keywords,
+    shallow,
+) -> None:
+    try:
+        corpus_service.enqueue(plan.repository, path_terms_for_intent(keywords, shallow.matched_capabilities if shallow else None))
+    except Exception:
+        # A queueing hiccup must never fail the report; the next request re-queues.
+        logger.exception("Could not queue %s for indexing", plan.repository.full_name)
 
 
 async def research_idea(request: IdeaRequest) -> AnalysisResponse:
@@ -210,18 +208,13 @@ async def research_idea(request: IdeaRequest) -> AnalysisResponse:
                 cache_hit_repositories.append(merged)
                 continue
 
+            _queue_for_indexing(corpus_service, plan, keywords, shallow)
             inline_plans.append(plan)
-
-        if inline_plans:
-            # Fire-and-forget: don't block report generation on fresh embedding
-            # (see _fire_and_forget_indexing docstring). These repos still carry
-            # real fit_summary/description/reference_type from shallow rerank,
-            # so generation grounds them meaningfully even without deep hits yet.
-            _fire_and_forget_indexing(corpus_service, inline_plans)
-            indexed_repositories.extend(plan.repository for plan in inline_plans)
+            # Still reported now, grounded by shallow-rerank evidence.
+            indexed_repositories.append(plan.repository)
 
         logger.info(
-            "Deep index preparation completed in %.2fs; %d repos ready (%d indexing in background)",
+            "Deep index preparation completed in %.2fs; %d repos ready (%d queued for the indexing worker)",
             budget.record_stage("snapshot_and_index_stage", index_started),
             len(indexed_repositories),
             len(inline_plans),
@@ -269,6 +262,7 @@ async def research_idea(request: IdeaRequest) -> AnalysisResponse:
             keywords,
             indexed_repositories,
             section_hits,
+            repo_context=_repo_context(selected_evidence_map),
         )
         logger.info("Grounded generation completed in %.2fs", budget.record_stage("generation", generation_started))
 
@@ -399,17 +393,12 @@ async def _research_sse_generator(request: IdeaRequest, http_request: Request):
                 cache_hit_repositories.append(merged)
                 continue
 
+            _queue_for_indexing(corpus_service, plan, keywords, shallow)
             inline_plans.append(plan)
-
-        if inline_plans:
-            # Fire-and-forget: don't block the SSE stream on fresh embedding.
-            # See _fire_and_forget_indexing docstring for why this is safe —
-            # these repos still ground generation via shallow-rerank metadata.
-            _fire_and_forget_indexing(corpus_service, inline_plans)
-            indexed_repositories.extend(plan.repository for plan in inline_plans)
+            indexed_repositories.append(plan.repository)
 
         logger.info(
-            "Deep index preparation completed in %.2fs; %d repos ready (%d indexing in background)",
+            "Deep index preparation completed in %.2fs; %d repos ready (%d queued for the indexing worker)",
             budget.record_stage("snapshot_and_index_stage", index_started),
             len(indexed_repositories),
             len(inline_plans),
@@ -466,6 +455,7 @@ async def _research_sse_generator(request: IdeaRequest, http_request: Request):
             keywords,
             indexed_repositories,
             section_hits,
+            repo_context=_repo_context(selected_evidence_map),
         )
         logger.info("Grounded generation completed in %.2fs", budget.record_stage("generation", generation_started))
 
@@ -500,21 +490,18 @@ async def research_idea_stream(request: IdeaRequest, http_request: Request) -> S
     )
 
 
-@router.post("/research/chat", response_model=RepoChatResponse, dependencies=_guarded)
+@router.post("/research/chat", response_model=RepoChatResponse, dependencies=_chat_guarded)
 async def chat_about_repositories(request: RepoChatRequest) -> RepoChatResponse:
-    """Answer a grounded chat question using only the indexed repositories in scope."""
+    """Answer a chat question grounded in the scoped repos' indexed code."""
 
+    settings = get_settings()
     scoped_repositories = _load_scoped_repositories(request)
-    retrieval_query = build_repo_chat_retrieval_query(
-        request.question,
-        request.idea_summary,
-        request.messages,
-    )
-    retrieval_service = RetrievalService()
     try:
-        section_hits = await retrieval_service.retrieve(
-            plan=_retrieval_query_to_plan(retrieval_query),
-            repositories=scoped_repositories,
+        evidence = await ChatRetriever().retrieve(
+            request.question,
+            request.messages,
+            scoped_repositories,
+            context_chars=settings.CHAT_CONTEXT_CHARS,
         )
     except EmbeddingUnavailable as exc:
         logger.warning("Repo chat unavailable: %s", exc)
@@ -522,18 +509,29 @@ async def chat_about_repositories(request: RepoChatRequest) -> RepoChatResponse:
             status_code=503,
             detail="Repo chat is temporarily unavailable because the code-search worker is offline. Please try again later.",
         ) from exc
-    hits = section_hits.get("chat_answer", [])
-    response_payload = await answer_repo_chat(
-        request.question,
-        request.idea_summary,
-        request.messages,
-        scoped_repositories,
-        hits,
-    )
+
+    response_payload = await answer_repo_chat(request.question, request.idea_summary, request.messages, evidence)
+    commits = {repo.full_name: repo.commit_sha for repo in scoped_repositories}
+    answer_text = str(response_payload.get("answer", ""))
+    retrieved = [segment for segment in evidence.segments if segment["repo_full_name"] in commits]
+    # Sources = the files the answer actually cites; fall back to the top
+    # retrieved sections when it cites none (e.g. an overview answer).
+    cited = [segment for segment in retrieved if segment["path"] in answer_text]
+    sources = (cited or retrieved[:4])[:8]
 
     return RepoChatResponse(
         answer=str(response_payload.get("answer", "")).strip(),
-        citations=citations_from_hits(hits, limit=6),
+        citations=[
+            Citation(
+                repo_full_name=segment["repo_full_name"],
+                path=segment["path"],
+                start_line=segment["start_line"],
+                end_line=segment["end_line"],
+                reason="retrieved for this answer",
+                commit_sha=commits[segment["repo_full_name"]],
+            )
+            for segment in sources
+        ],
         evidence_hits=[
             RepoChatEvidenceHit(
                 repo_full_name=hit.repo_full_name,
@@ -544,14 +542,30 @@ async def chat_about_repositories(request: RepoChatRequest) -> RepoChatResponse:
                 snippet=_truncate_hit_text(hit.text),
                 score=round(hit.score, 5),
             )
-            for hit in hits[:6]
+            for hit in evidence.hits[:6]
         ],
-        follow_up_suggestions=[
-            suggestion
-            for suggestion in response_payload.get("follow_up_suggestions", [])
-            if isinstance(suggestion, str) and suggestion.strip()
-        ][:3],
+        follow_up_suggestions=response_payload.get("follow_up_suggestions", [])[:3],
         scoped_repo_count=len(scoped_repositories),
+    )
+
+
+@router.post("/research/index-status", response_model=IndexStatusResponse, dependencies=[Depends(_require_api_key)])
+async def index_status(request: IndexStatusRequest) -> IndexStatusResponse:
+    """Per-repo indexing progress, polled by the chat panel (not rate-limited)."""
+
+    settings = get_settings()
+    corpus_service = CorpusService()
+    repos = [(repo.full_name, repo.commit_sha) for repo in request.repositories[:10]]
+    statuses = await asyncio.to_thread(corpus_service.index_status, repos)
+    worker_online = await asyncio.to_thread(
+        corpus_service.store.embedding_worker_alive, settings.LOCAL_WORKER_HEARTBEAT_MAX_AGE_SECONDS
+    )
+    return IndexStatusResponse(
+        worker_online=worker_online,
+        repositories=[
+            RepoIndexStatus(full_name=name, **statuses.get(name, {"state": "not_queued", "chunk_count": 0}))
+            for name, _sha in repos
+        ],
     )
 
 
@@ -571,52 +585,36 @@ async def _fetch_selected_snapshots(
     return pairs
 
 
-async def _index_selected_plans(corpus_service: CorpusService, plans) -> list[RepoSearchResult]:
-    if not plans:
-        return []
-
-    settings = get_settings()
-    semaphore = asyncio.Semaphore(max(1, min(settings.INDEXER_MAX_CONCURRENCY, len(plans))))
-
-    async def run(plan):
-        async with semaphore:
-            try:
-                return await corpus_service.index_repository_plan(plan)
-            except Exception as exc:
-                logger.warning("Deep indexing failed for %s: %s", plan.repository.full_name, exc)
-                return None
-
-    results = await asyncio.gather(*(run(plan) for plan in plans))
-    return [repository for repository in results if repository is not None]
-
-
 def _load_scoped_repositories(request: RepoChatRequest) -> list[RepoSearchResult]:
     if not request.scope_repositories:
         raise HTTPException(status_code=400, detail="At least one scoped repository is required for repo chat.")
 
     corpus_service = CorpusService()
-    scoped_repositories: list[RepoSearchResult] = []
-    for scoped_repo in request.scope_repositories:
-        repository = RepoSearchResult(
-            full_name=scoped_repo.full_name,
-            commit_sha=scoped_repo.commit_sha,
-            html_url=f"https://github.com/{scoped_repo.full_name}",
-        )
-        indexed = corpus_service.load_indexed_repository(repository)
-        if indexed is not None:
-            scoped_repositories.append(indexed)
-
+    scoped_repositories = corpus_service.store.load_repositories(
+        [(repo.full_name, repo.commit_sha) for repo in request.scope_repositories],
+        corpus_service.embedding_model_name,
+        corpus_service.chunking_version,
+    )
     if not scoped_repositories:
         raise HTTPException(
             status_code=409,
-            detail="No indexed repositories were available for the current repo chat scope.",
+            detail="None of these repositories are searchable yet. They are queued for indexing; try again shortly.",
         )
-
     return scoped_repositories
 
 
-def _retrieval_query_to_plan(query) -> RetrievalPlan:
-    return RetrievalPlan(queries=[query])
+def _repo_context(evidence_map: dict) -> dict[str, dict]:
+    """README excerpt and known file paths per repo, from shallow rerank evidence."""
+
+    return {
+        name: {
+            "readme_excerpt": evidence.readme[:1500],
+            "paths": list(dict.fromkeys(
+                [*evidence.highlighted_paths, *evidence.sampled_paths, *(f.path for f in evidence.manifest_files)]
+            )),
+        }
+        for name, evidence in evidence_map.items()
+    }
 
 
 def _merge_ranked_repository_metrics(repository: RepoSearchResult, ranked_repository: RepoSearchResult) -> RepoSearchResult:

@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     # Auth
     API_KEY: str = ""  # If set, required via X-API-Key header on /research and /research/chat
     RATE_LIMIT_PER_HOUR: int = 20  # Max /research calls per IP per rolling hour
+    CHAT_RATE_LIMIT_PER_HOUR: int = 60  # Separate bucket: chat is the main feature
 
     # GitHub
     GITHUB_TOKEN: str = ""
@@ -38,8 +39,19 @@ class Settings(BaseSettings):
     # Empty either one to disable the fallback.
     GOOGLE_API_KEY: str = ""
     LLM_FALLBACK_MODEL: str = "gemini-3.5-flash-lite"
+    # Same free limits (15 RPM / 250K TPM / 500 RPD) on a separate quota, tried
+    # when the first Gemini model is rate-limited. Empty to disable.
+    LLM_SECONDARY_GEMINI_MODEL: str = "gemini-3.1-flash-lite"
     LLM_AUX_TIMEOUT_SECONDS: int = 20
     LLM_GENERATION_TIMEOUT_SECONDS: int = 35
+
+    # Repo chat. Groq's free tier is 8K tokens/min per model, far too small for
+    # real code context, so chat goes Gemini-first (250K TPM) and only falls
+    # back to Groq with a trimmed context.
+    CHAT_CONTEXT_CHARS: int = 60_000
+    CHAT_FALLBACK_CONTEXT_CHARS: int = 10_000
+    CHAT_MAX_OUTPUT_TOKENS: int = 2500
+    CHAT_TIMEOUT_SECONDS: int = 45
 
     # Embeddings
     # "local_worker": the backend queues texts in Postgres (embedding_jobs) and
@@ -59,10 +71,9 @@ class Settings(BaseSettings):
     # nobody will pick up.
     LOCAL_WORKER_HEARTBEAT_MAX_AGE_SECONDS: float = 20.0
     LOCAL_WORKER_QUERY_TIMEOUT_SECONDS: float = 60.0
-    # A repo's full chunk set runs ~4-5 chunks/sec on the dev machine (measured
-    # 2026-09); the largest indexed repo so far is 841 chunks, and document jobs
-    # queue behind each other on the worker's single document lane.
-    LOCAL_WORKER_DOCUMENT_TIMEOUT_SECONDS: float = 1200.0
+    # Document jobs are now only short repo-metadata batches from candidate
+    # search; whole repos are indexed by the worker's own repo lane.
+    LOCAL_WORKER_DOCUMENT_TIMEOUT_SECONDS: float = 120.0
 
     # Cohere (used only when EMBEDDING_PROVIDER=cohere)
     COHERE_API_KEY: str = ""
@@ -81,44 +92,35 @@ class Settings(BaseSettings):
     RAG_OUTPUT_REPO_LIMIT: int = 5
     RAG_SEARCH_PER_QUERY: int = 20
     RAG_DEEP_INDEX_REPO_LIMIT: int = 5
-    # RAG limits — right-sized for what generation actually reads, not for
-    # hypothetical "ingest everything" completeness.
-    #
-    # Measured (2026-08-07): the 4 generation calls only ever read hits[:6] truncated
-    # to ~900 chars each per section (_build_generation_evidence in llm_service.py) —
-    # a few thousand characters total, regardless of how much is indexed. Indexing
-    # depth beyond that exists purely to make repo-chat's open-ended questions answerable
-    # later, which is a real but genuinely smaller need than "ingest every eligible file."
-    # Single-provider (Cohere only, 1000 calls/month, call-metered):
-    # 150 files × ~5 avg chunks × 5 repos = 3,750 chunks ÷ 96 batch ≈ 40 embed calls
-    # + ~11 other calls ≈ 51/request ≈ 19-20 full requests/month on the free tier.
-    # Watch the "N/M files in tree are index-eligible" log line for real per-repo usage.
     RAG_SHALLOW_CODE_SAMPLE_COUNT: int = 8  # was 5; more diverse ranking signal
     RAG_SHALLOW_CODE_SAMPLE_MAX_CHARS: int = 6_000
     RAG_SEMANTIC_MIN_RELEVANCE: float = 0.30
-    RAG_MAX_FILES_PER_REPO: int = 150
-    RAG_MAX_CHARS_PER_REPO: int = 1_800_000
-    RAG_MAX_FILE_SIZE: int = 80_000
-    RAG_ARCHIVE_MAX_BYTES: int = 25_000_000
-    RAG_ARCHIVE_MAX_EXTRACTED_BYTES: int = 20_000_000
-    RAG_ARCHIVE_MAX_FILES: int = 500  # was 400 — wider scan window before zip cutoff
-    RAG_CHUNK_TOKENS: int = 300
-    RAG_CHUNK_OVERLAP: int = 60
+    # Whole-repo indexing runs on the developer's machine (repo lane of
+    # scripts/local_embed_worker.py), so these caps protect Neon's 0.5 GB
+    # free tier (~4.6 KB/chunk incl. indexes), not Render's RAM. Files are
+    # indexed in priority order, so a capped repo keeps its most useful files.
+    RAG_REPO_MAX_CHUNKS: int = 8000
+    RAG_CORPUS_MAX_CHUNKS: int = 60_000
+    RAG_MAX_FILE_SIZE: int = 150_000
+    RAG_MAX_DATA_FILE_SIZE: int = 20_000  # JSON/YAML/CSV-like files above this are data, not config
+    RAG_ARCHIVE_MAX_BYTES: int = 300_000_000  # worker-side; larger repos fall back to raw file downloads
+    # Chunk size in characters. bge-small reads at most 512 tokens (~1,600
+    # chars of code); anything past that is silently never embedded.
+    RAG_CHUNK_TARGET_CHARS: int = 1200
+    RAG_CHUNK_MAX_CHARS: int = 1600
+    RAG_CHUNK_OVERLAP_LINES: int = 3
+    INDEX_JOB_MAX_RETRIES: int = 3
+    INDEX_JOB_STALE_MINUTES: int = 30  # a 'running' job older than this belonged to a dead worker
     RAG_SECTION_TOP_K: int = 8
     RAG_SECTION_CONTEXT_CHARS: int = 14_000
     RAG_MAX_SEARCH_CONCURRENCY: int = 8
     RAG_QUERY_LIMIT: int = 8
     RAG_MAX_PER_LANGUAGE: int = 4
-    # Bumped v1->v2: restored ingestion depth (RAG_MAX_FILES_PER_REPO,
-    # RAG_MAX_CHARS_PER_REPO, RAG_SHALLOW_CODE_SAMPLE_COUNT) to code defaults
-    # after finding production had drifted to older, more conservative values.
-    # A version bump forces every repo to re-index at the new depth instead of
-    # silently continuing to serve the old, shallower index from cache.
-    RAG_CHUNKING_VERSION: str = "v2"
+    # v3: whole-repo indexing, top-level-only JS/TS boundaries, merged small
+    # spans, char-bounded chunks. Chunks from other versions are purged at startup.
+    RAG_CHUNKING_VERSION: str = "v3"
     RAG_STORE_BACKEND: str = "postgres"
     DATABASE_URL: str = ""
-    MAX_INDEXED_REPOS: int = 150  # Oldest-by-last-use repos beyond this cap are evicted at startup
-    INDEXER_MAX_CONCURRENCY: int = 3  # Bounds concurrent inline indexing within one request
     RAG_DB_POOL_MIN_SIZE: int = 1
     RAG_DB_POOL_MAX_SIZE: int = 4
     PIPELINE_REQUEST_BUDGET_SECONDS: int = 150  # was 110 — accommodates deeper indexing

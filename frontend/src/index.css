@@ -236,3 +236,49 @@ textarea.input { min-height: 90px; resize: vertical; font-family: inherit; }
 }
 
 .diagram-canvas > svg { max-width: 100%; height: auto; }
+
+/* ── Code chat ─────────────────────────────────────────────────────────── */
+.md { line-height: 1.5; overflow-wrap: anywhere; }
+.md > * + * { margin-top: 8px; }
+.md p, .md ul, .md ol { margin: 0; }
+.md ul, .md ol { padding-left: 18px; }
+.md li + li { margin-top: 3px; }
+.md-h { font-weight: 600; }
+.md-h1, .md-h2 { font-size: 14px; }
+.md-code {
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-divider);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+  overflow-x: auto;
+  white-space: pre;
+}
+.md-inline-code {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  padding: 0 3px;
+  background: color-mix(in srgb, var(--color-text) 8%, transparent);
+}
+.md a, .chat-source { color: var(--color-accent); }
+
+.chat-status { display: flex; flex-wrap: wrap; gap: 4px; padding: 6px 0; border-bottom: 1px solid var(--color-divider); }
+.chat-status-chip {
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border: 1px solid var(--color-divider);
+  color: var(--color-neutral-600);
+}
+.chat-status-chip.state-completed { border-color: var(--color-accent); color: var(--color-accent); }
+.chat-status-chip.state-partial,
+.chat-status-chip.state-indexing { border-style: dashed; color: var(--color-text); }
+.chat-status-chip.state-failed { border-color: #b5493b; color: #b5493b; }
+.chat-status-note { flex-basis: 100%; font-size: 11px; opacity: 0.75; }
+
+.chat-sources { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--color-divider); display: flex; flex-direction: column; gap: 2px; }
+.chat-sources-label { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; opacity: 0.6; }
+.chat-source { font-family: var(--font-mono); font-size: 11px; text-decoration: none; overflow-wrap: anywhere; }
+.chat-source:hover { text-decoration: underline; }
+.md-code-caption { font-family: var(--font-mono); font-size: 10.5px; opacity: 0.7; margin-bottom: 2px; overflow-wrap: anywhere; }

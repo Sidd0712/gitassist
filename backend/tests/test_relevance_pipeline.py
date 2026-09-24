@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import re
 import sys
 import unittest
@@ -91,6 +92,23 @@ class LLMFallbackTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(client, "_call_groq", AsyncMock(side_effect=rate_limited)):
             with self.assertRaises(groq.RateLimitError):
                 await client._call_api("prompt")
+
+
+class GeminiFirstRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_heavy_calls_try_gemini_first_and_fall_back_to_groq(self):
+        from services.llm_client import LLMClient
+
+        client = LLMClient()
+        client.settings = client.settings.model_copy(update={"GOOGLE_API_KEY": "test-key"})
+        with (
+            patch.object(client, "_call_gemini", AsyncMock(side_effect=RuntimeError("Gemini x failed: 429"))) as gemini,
+            patch.object(client, "_call_groq", AsyncMock(return_value="groq answer")) as groq_call,
+        ):
+            result = await client._call_api("prompt", prefer="gemini")
+
+        self.assertEqual("groq answer", result)
+        self.assertEqual(2, gemini.await_count, "both Gemini models (separate quotas) are tried first")
+        groq_call.assert_awaited_once()
 
 
 class LocalWorkerEmbeddingTests(unittest.IsolatedAsyncioTestCase):
@@ -499,17 +517,17 @@ class FakeLLMClient:
         repositories: list[dict],
         evidence: dict | None = None,
     ) -> dict:
-        hits = (evidence or {}).get("hits", [])
-        if not hits:
+        segments = (evidence or {}).get("segments", [])
+        if not segments:
             return {
-                "answer": "I do not have enough indexed evidence in the current repo scope to answer that yet.",
+                "answer": "The retrieved sections don't cover that; see the repository map for where to look.",
                 "follow_up_suggestions": ["Ask about a specific file or repository."],
             }
 
-        first_hit = hits[0]
+        first = segments[0]
         return {
             "answer": (
-                f"Based on {first_hit.get('repo')} and {first_hit.get('path')}, "
+                f"Based on {first['repo_full_name']} and {first['path']}, "
                 f"the indexed repos suggest: {question[:80]}"
             ),
             "follow_up_suggestions": [
@@ -1739,19 +1757,14 @@ class ResearchPipelineOrchestrationTests(HermeticAsyncTestCase):
             status="complete",
         )
 
+        queued: list[str] = []
+
         class FakeCorpusService:
-            indexed: list[str] = []
-
-            def __init__(self) -> None:
-                self.indexed = []
-                type(self).indexed = self.indexed
-
             def load_indexed_repository(self, repo: RepoSearchResult) -> RepoSearchResult | None:
                 return None
 
-            async def index_repository_plan(self, plan: RepoFetchPlan) -> RepoSearchResult:
-                self.indexed.append(f"{plan.repository.full_name}@{plan.repository.commit_sha}")
-                return plan.repository
+            def enqueue(self, repository: RepoSearchResult, path_terms: list[str]) -> None:
+                queued.append(f"{repository.full_name}@{repository.commit_sha}")
 
         class FakeRetrievalService:
             async def retrieve(self, plan, repositories) -> dict:
@@ -1765,7 +1778,6 @@ class ResearchPipelineOrchestrationTests(HermeticAsyncTestCase):
                     RAG_DEEP_INDEX_REPO_LIMIT=5,
                     RAG_README_RERANK_LIMIT=5,
                     PIPELINE_RETRIEVAL_MIN_BUDGET_SECONDS=25,
-                    INDEXER_MAX_CONCURRENCY=3,
                 ),
             ),
             patch("routers.research.extract_keywords", AsyncMock(return_value=keywords)),
@@ -1777,26 +1789,18 @@ class ResearchPipelineOrchestrationTests(HermeticAsyncTestCase):
             patch("routers.research.CorpusService", FakeCorpusService),
             patch("routers.research.plan_retrieval_queries", AsyncMock(return_value=RetrievalPlan(queries=[]))),
             patch("routers.research.RetrievalService", return_value=FakeRetrievalService()),
-            patch("routers.research.generate_analysis", AsyncMock(return_value=generated_analysis)),
+            patch("routers.research.generate_analysis", AsyncMock(return_value=generated_analysis)) as generate_mock,
         ):
             response = await research_idea(IdeaRequest(idea="an app where friends can draw together online"))
 
-            # The response must not block on deep indexing (council finding,
-            # 2026-09: real embedding throughput makes synchronous indexing take
-            # minutes per repo) — it returns immediately with FakeCorpusService
-            # still empty, then the fire-and-forget background task catches up.
-            self.assertEqual("complete", response.status)
-            self.assertEqual([], FakeCorpusService.indexed)
-
-            from routers.research import _background_tasks
-
-            self.assertEqual(1, len(_background_tasks))
-            await asyncio.gather(*_background_tasks)
-
-        self.assertEqual(
-            {f"example/collab-board-{index}@commit-{index}" for index in range(5)},
-            set(FakeCorpusService.indexed),
-        )
+        # Render never indexes (a 604 MB zip OOM-killed it): every fresh repo is
+        # queued for the worker at its exact commit, and the report still
+        # covers all five, grounded by their README context.
+        self.assertEqual("complete", response.status)
+        self.assertEqual({f"example/collab-board-{index}@commit-{index}" for index in range(5)}, set(queued))
+        self.assertEqual(5, len(generate_mock.await_args.args[2]))
+        repo_context = generate_mock.await_args.kwargs["repo_context"]
+        self.assertIn("realtime collaboration", repo_context["example/collab-board-0"]["readme_excerpt"])
 
     async def test_research_request_merges_fresh_fit_metrics_into_cached_repositories(self):
         keywords = ExtractedKeywords(
@@ -1977,182 +1981,260 @@ class ResearchPipelineOrchestrationTests(HermeticAsyncTestCase):
         self.assertEqual([], index_calls, "Should never attempt to index a repo with zero eligible files")
 
 
+def _fake_corpus_with(repos: list[RepoSearchResult]):
+    """A CorpusService stand-in whose store returns the given searchable repos."""
+
+    class FakeStore:
+        def load_repositories(self, pairs, embedding_model, chunking_version):
+            wanted = set(pairs)
+            return [repo for repo in repos if (repo.full_name, repo.commit_sha) in wanted]
+
+    class FakeCorpusService:
+        store = FakeStore()
+        embedding_model_name = "fake-embedding"
+        chunking_version = "test"
+
+    return FakeCorpusService
+
+
+def _chat_request(question: str, repo: RepoSearchResult) -> RepoChatRequest:
+    return RepoChatRequest(
+        question=question,
+        idea_summary="Collaborative whiteboard",
+        scope_repositories=[{"full_name": repo.full_name, "commit_sha": repo.commit_sha}],
+        messages=[],
+    )
+
+
 class RepoChatRouteTests(HermeticAsyncTestCase):
-    async def test_repo_chat_returns_grounded_answer_with_citations(self):
-        indexed_repo = RepoSearchResult(
-            full_name="example/collab-board",
-            description="Collaborative whiteboard",
-            html_url="https://github.com/example/collab-board",
-            stars=120,
-            language="TypeScript",
-            commit_sha="commit-123",
-            relevance_score=0.92,
-        )
+    indexed_repo = RepoSearchResult(
+        full_name="example/collab-board",
+        description="Collaborative whiteboard",
+        html_url="https://github.com/example/collab-board",
+        stars=120,
+        language="TypeScript",
+        commit_sha="commit-123",
+        relevance_score=0.92,
+    )
+
+    def _evidence(self, segments: list[dict], file_count: int = 12):
+        from services.rag.retrieval_service import ChatEvidence
+
         hits = [
             RetrievalHit(
-                chunk_id="chunk-1",
-                repo_full_name="example/collab-board",
-                path="README.md",
-                chunk_role="documentation",
-                start_line=10,
-                end_line=24,
-                score=0.88,
-                dense_score=0.7,
-                repo_prior=1.0,
-                reason="strong semantic match",
-                text="Architecture overview and realtime collaboration flow.",
+                chunk_id=f"chunk-{i}",
+                repo_full_name=seg["repo_full_name"],
+                path=seg["path"],
+                chunk_role="source",
+                start_line=seg["start_line"],
+                end_line=seg["end_line"],
+                score=0.03,
+                reason="hybrid match (code)",
+                text=seg["text"],
             )
+            for i, seg in enumerate(segments)
         ]
+        repo_maps = [{"full_name": self.indexed_repo.full_name, "file_count": file_count}]
+        return ChatEvidence(segments=segments, hits=hits, repo_maps=repo_maps, intent="code")
 
-        class FakeCorpusService:
-            def load_indexed_repository(self, repo: RepoSearchResult) -> RepoSearchResult | None:
-                if repo.full_name == indexed_repo.full_name and repo.commit_sha == indexed_repo.commit_sha:
-                    return indexed_repo
-                return None
-
-        class FakeRetrievalService:
-            async def retrieve(self, plan, repositories) -> dict:
-                return {"chat_answer": hits}
-
+    async def test_repo_chat_returns_grounded_answer_with_linkable_citations(self):
+        segment = {
+            "repo_full_name": "example/collab-board",
+            "path": "src/sync/server.ts",
+            "language": "TypeScript",
+            "start_line": 10,
+            "end_line": 24,
+            "text": "io.on('connection', socket => socket.join(room))",
+        }
+        retriever = MagicMock()
+        retriever.retrieve = AsyncMock(return_value=self._evidence([segment]))
         with (
-            patch("routers.research.CorpusService", return_value=FakeCorpusService()),
-            patch("routers.research.RetrievalService", return_value=FakeRetrievalService()),
+            patch("routers.research.CorpusService", _fake_corpus_with([self.indexed_repo])),
+            patch("routers.research.ChatRetriever", return_value=retriever),
         ):
-            response = await chat_about_repositories(
-                RepoChatRequest(
-                    question="How is realtime sync handled?",
-                    idea_summary="Collaborative whiteboard",
-                    scope_repositories=[{"full_name": indexed_repo.full_name, "commit_sha": indexed_repo.commit_sha}],
-                    messages=[],
-                )
-            )
+            response = await chat_about_repositories(_chat_request("How is realtime sync handled?", self.indexed_repo))
 
         self.assertIn("example/collab-board", response.answer)
-        self.assertEqual(1, len(response.citations))
-        self.assertEqual("README.md", response.citations[0].path)
+        self.assertEqual(["src/sync/server.ts"], [c.path for c in response.citations])
+        self.assertEqual("commit-123", response.citations[0].commit_sha)
+        self.assertEqual((10, 24), (response.citations[0].start_line, response.citations[0].end_line))
         self.assertEqual(1, response.scoped_repo_count)
         self.assertEqual(1, len(response.evidence_hits))
 
     async def test_repo_chat_only_searches_repositories_in_request_scope(self):
-        scoped_repo = RepoSearchResult(
-            full_name="example/scoped",
-            description="Scoped repo",
-            html_url="https://github.com/example/scoped",
-            commit_sha="commit-scoped",
-            relevance_score=0.8,
-        )
-
-        class FakeCorpusService:
-            def load_indexed_repository(self, repo: RepoSearchResult) -> RepoSearchResult | None:
-                if repo.full_name == scoped_repo.full_name and repo.commit_sha == scoped_repo.commit_sha:
-                    return scoped_repo
-                return None
-
-        class FakeRetrievalService:
-            async def retrieve(self, plan, repositories) -> dict:
-                self.seen_repositories = repositories
-                return {"chat_answer": []}
-
-        retrieval_service = FakeRetrievalService()
+        other = self.indexed_repo.model_copy(update={"full_name": "example/other", "commit_sha": "commit-other"})
+        retriever = MagicMock()
+        retriever.retrieve = AsyncMock(return_value=self._evidence([]))
         with (
-            patch("routers.research.CorpusService", return_value=FakeCorpusService()),
-            patch("routers.research.RetrievalService", return_value=retrieval_service),
+            patch("routers.research.CorpusService", _fake_corpus_with([self.indexed_repo, other])),
+            patch("routers.research.ChatRetriever", return_value=retriever),
         ):
-            await chat_about_repositories(
-                RepoChatRequest(
-                    question="Which files matter most?",
-                    idea_summary="Collaborative whiteboard",
-                    scope_repositories=[{"full_name": scoped_repo.full_name, "commit_sha": scoped_repo.commit_sha}],
-                    messages=[],
-                )
-            )
+            await chat_about_repositories(_chat_request("Which files matter most?", self.indexed_repo))
 
-        self.assertEqual(["example/scoped"], [repo.full_name for repo in retrieval_service.seen_repositories])
+        searched = retriever.retrieve.await_args.args[2]
+        self.assertEqual(["example/collab-board"], [repo.full_name for repo in searched])
 
     async def test_repo_chat_returns_clear_error_when_scope_has_no_indexed_repositories(self):
-        class FakeCorpusService:
-            def load_indexed_repository(self, repo: RepoSearchResult) -> RepoSearchResult | None:
-                return None
-
-        with patch("routers.research.CorpusService", return_value=FakeCorpusService()):
+        with patch("routers.research.CorpusService", _fake_corpus_with([])):
             with self.assertRaises(HTTPException) as ctx:
-                await chat_about_repositories(
-                    RepoChatRequest(
-                        question="What architecture does this use?",
-                        idea_summary="Collaborative whiteboard",
-                        scope_repositories=[{"full_name": "example/missing", "commit_sha": "missing"}],
-                        messages=[],
-                    )
-                )
+                await chat_about_repositories(_chat_request("What architecture does this use?", self.indexed_repo))
 
         self.assertEqual(409, ctx.exception.status_code)
-        self.assertIn("No indexed repositories", ctx.exception.detail)
+        self.assertIn("queued for indexing", ctx.exception.detail)
 
     async def test_repo_chat_returns_503_when_embedding_worker_offline(self):
-        indexed_repo = RepoSearchResult(
-            full_name="example/collab-board",
-            html_url="https://github.com/example/collab-board",
-            commit_sha="commit-123",
-        )
-
-        class FakeCorpusService:
-            def load_indexed_repository(self, repo: RepoSearchResult) -> RepoSearchResult | None:
-                return indexed_repo
-
-        class OfflineRetrievalService:
-            async def retrieve(self, plan, repositories) -> dict:
-                raise EmbeddingUnavailable("worker offline")
-
+        retriever = MagicMock()
+        retriever.retrieve = AsyncMock(side_effect=EmbeddingUnavailable("worker offline"))
         with (
-            patch("routers.research.CorpusService", return_value=FakeCorpusService()),
-            patch("routers.research.RetrievalService", return_value=OfflineRetrievalService()),
+            patch("routers.research.CorpusService", _fake_corpus_with([self.indexed_repo])),
+            patch("routers.research.ChatRetriever", return_value=retriever),
         ):
             with self.assertRaises(HTTPException) as ctx:
-                await chat_about_repositories(
-                    RepoChatRequest(
-                        question="How is realtime sync handled?",
-                        idea_summary="Collaborative whiteboard",
-                        scope_repositories=[{"full_name": indexed_repo.full_name, "commit_sha": indexed_repo.commit_sha}],
-                        messages=[],
-                    )
-                )
+                await chat_about_repositories(_chat_request("How is realtime sync handled?", self.indexed_repo))
 
         self.assertEqual(503, ctx.exception.status_code)
         self.assertIn("offline", ctx.exception.detail)
 
-    async def test_repo_chat_returns_uncertainty_when_no_evidence_is_found(self):
-        indexed_repo = RepoSearchResult(
-            full_name="example/collab-board",
-            description="Collaborative whiteboard",
-            html_url="https://github.com/example/collab-board",
-            commit_sha="commit-123",
-            relevance_score=0.92,
-        )
-
-        class FakeCorpusService:
-            def load_indexed_repository(self, repo: RepoSearchResult) -> RepoSearchResult | None:
-                return indexed_repo
-
-        class FakeRetrievalService:
-            async def retrieve(self, plan, repositories) -> dict:
-                return {"chat_answer": []}
-
+    async def test_repo_chat_still_answers_from_repo_map_when_no_sections_match(self):
+        retriever = MagicMock()
+        retriever.retrieve = AsyncMock(return_value=self._evidence([], file_count=40))
         with (
-            patch("routers.research.CorpusService", return_value=FakeCorpusService()),
-            patch("routers.research.RetrievalService", return_value=FakeRetrievalService()),
+            patch("routers.research.CorpusService", _fake_corpus_with([self.indexed_repo])),
+            patch("routers.research.ChatRetriever", return_value=retriever),
         ):
             response = await chat_about_repositories(
-                RepoChatRequest(
-                    question="What database migration strategy is used?",
-                    idea_summary="Collaborative whiteboard",
-                    scope_repositories=[{"full_name": indexed_repo.full_name, "commit_sha": indexed_repo.commit_sha}],
-                    messages=[],
-                )
+                _chat_request("What database migration strategy is used?", self.indexed_repo)
             )
 
-        self.assertIn("do not have enough indexed evidence", response.answer.lower())
+        self.assertIn("repository map", response.answer)
         self.assertEqual([], response.citations)
-        self.assertEqual([], response.evidence_hits)
+
+    async def test_repo_chat_says_indexing_is_pending_when_nothing_is_indexed_yet(self):
+        retriever = MagicMock()
+        retriever.retrieve = AsyncMock(return_value=self._evidence([], file_count=0))
+        with (
+            patch("routers.research.CorpusService", _fake_corpus_with([self.indexed_repo])),
+            patch("routers.research.ChatRetriever", return_value=retriever),
+        ):
+            response = await chat_about_repositories(_chat_request("How does auth work?", self.indexed_repo))
+
+        self.assertIn("finished indexing", response.answer)
+
+
+class WholeRepoIndexingTests(unittest.TestCase):
+    def test_skip_rules_match_directory_names_not_substrings(self):
+        from services.github_service import _should_fetch
+
+        kept = ["packages/editor/src/index.ts", "src/combine.py", "lib/distance.py", "src/objects/shape.ts", "nbs/encoder.ipynb"]
+        dropped = ["node_modules/react/index.js", "dist/app.js", "package-lock.json", "web/app.min.js", "proto/api_pb2.py"]
+        for path in kept:
+            self.assertTrue(_should_fetch(path, 2_000), path)
+        for path in dropped:
+            self.assertFalse(_should_fetch(path, 2_000), path)
+        self.assertFalse(_should_fetch("data/listings.json", 500_000), "large data files are not config")
+
+    def test_priority_puts_readme_and_source_before_tests_and_scripts(self):
+        from services.github_service import select_index_paths
+
+        tree = [RepoTreeEntry(path=p, size=1_000) for p in (
+            "scripts/run_all.sh", "tests/test_model.py", "src/skills/trends.py", "README.md", "docs/guide.md",
+        )]
+        selected, skipped, _ = select_index_paths("example/repo", tree, ["skills"])
+        self.assertEqual([], skipped)
+        self.assertEqual("README.md", selected[0])
+        self.assertLess(selected.index("src/skills/trends.py"), selected.index("tests/test_model.py"))
+        self.assertEqual("scripts/run_all.sh", selected[-1])
+
+    def test_notebooks_are_indexed_as_their_cells(self):
+        from services.github_service import _readable_content
+
+        notebook = json.dumps({"cells": [
+            {"cell_type": "markdown", "source": ["# Encoder\n", "Builds embeddings"]},
+            {"cell_type": "code", "source": ["def encode(x):\n", "    return x"], "outputs": [{"data": "A" * 5000}]},
+        ]})
+        text = _readable_content("nbs/encoder.ipynb", notebook)
+        self.assertIn("def encode(x):", text)
+        self.assertIn("# # Encoder", text)
+        self.assertNotIn("AAAA", text)
+
+
+class ChunkerV3Tests(unittest.TestCase):
+    def _chunks(self, path: str, content: str):
+        from services.rag.chunking_service import ChunkingService
+
+        repo = RepoSearchResult(full_name="example/repo", html_url="https://github.com/example/repo", commit_sha="sha")
+        return ChunkingService().chunk_file(repo, RepoFile(path=path, content=content))
+
+    def test_indented_consts_do_not_start_new_chunks(self):
+        body = "\n".join(f"  const value{i} = compute({i});" for i in range(20))
+        source = f"async function run() {{\n{body}\n}}\n\nexport function helper() {{\n  return 1;\n}}\n"
+        chunks = self._chunks("index.js", source)
+        self.assertEqual(1, len(chunks), [c.symbol for c in chunks])
+        self.assertIn("run", chunks[0].symbol)
+
+    def test_chunks_stay_within_the_embedding_window_and_map_to_exact_lines(self):
+        source = "\n".join(f"def f{i}(x):\n    return x * {i}  # " + "pad " * 40 + "\n" for i in range(60))
+        content = "\n\n" + source
+        chunks = self._chunks("pkg/ops.py", content)
+        lines = content.strip("\n").split("\n")
+        self.assertGreater(len(chunks), 5)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk.text), 1700)
+            self.assertEqual(chunk.text, "\n".join(lines[chunk.start_line - 1 : chunk.end_line]))
+
+    def test_large_python_classes_split_per_method(self):
+        methods = "\n".join(f"    def step_{i}(self):\n        " + "x = 1; " * 60 + "\n" for i in range(6))
+        chunks = self._chunks("core/model.py", f"class Model:\n{methods}")
+        self.assertTrue(any(c.symbol and "Model.step_0" in c.symbol for c in chunks), [c.symbol for c in chunks])
+
+
+class ChatRetrievalHelperTests(unittest.TestCase):
+    def test_lexical_terms_keep_identifiers_and_split_camel_case(self):
+        from services.rag.retrieval_service import lexical_terms
+
+        terms = lexical_terms("Where is verifyToken implemented and how does the code use JWT?")
+        self.assertIn("verifytoken", terms)
+        self.assertIn("verify", terms)
+        self.assertIn("token", terms)
+        self.assertIn("jwt", terms)
+        self.assertNotIn("where", terms)
+        self.assertTrue(all(re.fullmatch(r"[a-z0-9_]+", t) for t in terms))
+
+    def test_overlapping_chunks_stitch_into_one_segment_without_duplicate_lines(self):
+        from services.rag.retrieval_service import _stitch_segments
+
+        def chunk(cid, start, end):
+            return {
+                "chunk_id": cid, "repo_full_name": "r/x", "path": "a.py", "language": "Python",
+                "start_line": start, "end_line": end, "text": "\n".join(f"line{n}" for n in range(start, end + 1)),
+            }
+
+        segments = _stitch_segments([chunk("b", 8, 14), chunk("a", 1, 10), chunk("c", 30, 31)], {"a": 0.1, "b": 0.2})
+        self.assertEqual(2, len(segments))
+        first = segments[0]
+        self.assertEqual((1, 14), (first["start_line"], first["end_line"]))
+        self.assertEqual([f"line{n}" for n in range(1, 15)], first["text"].split("\n"))
+
+    def test_follow_ups_are_split_from_the_markdown_answer(self):
+        from services.llm_client import LLMClient
+
+        parsed = LLMClient._split_follow_ups("Answer with `code`.\n\nFOLLOW_UPS:\n- First?\n- Second?\n3. Third?")
+        self.assertEqual("Answer with `code`.", parsed["answer"])
+        self.assertEqual(["First?", "Second?", "Third?"], parsed["follow_up_suggestions"])
+
+
+class DomainFirstRankingTests(unittest.TestCase):
+    def test_technique_only_libraries_only_fill_leftover_slots(self):
+        from services.rag.ranking_service import _prefer_domain_matches
+
+        names = ["lib/ts-a", "jobs/skills-1", "lib/ts-b", "lib/ts-c", "jobs/skills-2", "lib/ts-d", "jobs/skills-3"]
+        evidence = [
+            ShallowRepoEvidence(repository=RepoSearchResult(full_name=n, html_url=f"https://github.com/{n}"))
+            for n in names
+        ]
+        judged = [{"full_name": n, "domain_match": n.startswith("jobs/")} for n in names]
+        kept = [e.repository.full_name for e in _prefer_domain_matches(evidence, judged, limit=5)]
+        self.assertEqual(["lib/ts-a", "jobs/skills-1", "lib/ts-b", "jobs/skills-2", "jobs/skills-3"], kept)
 
 
 class StreamingRouteTests(HermeticAsyncTestCase):

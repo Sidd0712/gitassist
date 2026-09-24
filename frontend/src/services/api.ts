@@ -1,4 +1,10 @@
-import type { AnalysisResponse, RepoChatRequest, RepoChatResponse } from '../types';
+import type {
+  AnalysisResponse,
+  IndexStatusResponse,
+  RepoChatRequest,
+  RepoChatResponse,
+  RepoChatScopeRepository,
+} from '../types';
 
 const API_KEY: string = (import.meta.env.VITE_API_KEY as string) ?? '';
 const BASE_URL: string = (import.meta.env.VITE_API_URL as string) ?? '';
@@ -118,6 +124,16 @@ export async function chatAboutRepos(payload: RepoChatRequest): Promise<RepoChat
       ...authHeaders(),
     },
     body: JSON.stringify(payload),
+  });
+  if (!response.ok) throw new Error(await parseErrorResponse(response));
+  return response.json();
+}
+
+export async function fetchIndexStatus(repositories: RepoChatScopeRepository[]): Promise<IndexStatusResponse> {
+  const response = await fetch(`${BASE_URL}/research/index-status`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ repositories }),
   });
   if (!response.ok) throw new Error(await parseErrorResponse(response));
   return response.json();

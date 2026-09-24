@@ -87,6 +87,21 @@ export interface Citation {
   start_line: number | null;
   end_line: number | null;
   reason: string;
+  commit_sha?: string | null;
+}
+
+export type RepoIndexState = 'not_queued' | 'queued' | 'indexing' | 'partial' | 'completed' | 'failed';
+
+export interface RepoIndexStatus {
+  full_name: string;
+  state: RepoIndexState;
+  chunk_count: number;
+  error: string | null;
+}
+
+export interface IndexStatusResponse {
+  worker_online: boolean;
+  repositories: RepoIndexStatus[];
 }
 
 export interface RepoChatScopeRepository {

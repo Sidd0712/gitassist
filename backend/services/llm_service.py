@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+from typing import TYPE_CHECKING
 import logging
 import re
 from urllib.parse import urljoin, urlparse
@@ -28,6 +29,9 @@ from services.llm_client import get_llm_client
 from services.pipeline_cache_service import PipelineCacheService, compact_mapping, stable_cache_key
 from services.rag.citation_service import build_analysis_evidence
 from services.rag.query_planning_service import build_default_retrieval_plan
+
+if TYPE_CHECKING:
+    from services.rag.retrieval_service import ChatEvidence
 
 logger = logging.getLogger(__name__)
 
@@ -172,119 +176,46 @@ async def plan_retrieval_queries(
     return _retrieval_plan_from_dict(plan_dict, keywords, idea)
 
 
-def build_repo_chat_retrieval_query(
-    question: str,
-    idea_summary: str,
-    messages: list[ChatMessage],
-) -> RetrievalQuery:
-    """Build a deterministic retrieval query for repo-scoped chat."""
-
-    recent_context: list[str] = []
-    for message in messages[-4:]:
-        role = "User" if message.role == "user" else "Assistant"
-        recent_context.append(f"{role}: {message.content.strip()[:240]}")
-
-    query_parts: list[str] = []
-    if idea_summary.strip():
-        query_parts.append(f"Idea: {idea_summary.strip()}")
-    if recent_context:
-        query_parts.append("Recent context:\n" + "\n".join(recent_context))
-    query_parts.append(f"Question: {question.strip()}")
-
-    return RetrievalQuery(
-        section="chat_answer",
-        query="\n".join(query_parts),
-        preferred_roles=_chat_preferred_roles(question),
-        top_k=6,
-        weights=RetrievalWeights(dense_weight=0.85, repo_weight=0.15),
-    )
-
-
 async def answer_repo_chat(
     question: str,
     idea_summary: str,
     messages: list[ChatMessage],
-    repositories: list[RepoSearchResult],
-    hits: list[RetrievalHit],
+    evidence: "ChatEvidence",
 ) -> dict[str, object]:
-    """Generate a grounded chat answer over the indexed repo scope."""
+    """Generate a grounded Markdown chat answer from stitched code and repo maps."""
 
-    if not hits:
+    if not evidence.segments and not any(repo_map.get("file_count") for repo_map in evidence.repo_maps):
         return {
             "answer": (
-                "I do not have enough indexed evidence in the current repo scope to answer that yet. "
-                "Try asking about a specific repository, file, architecture area, or dependency."
+                "These repositories haven't finished indexing yet, so I can't search their code. "
+                "Try again in a minute, or ask about one that's already marked ready."
             ),
-            "follow_up_suggestions": [
-                "Which repo is closest to the core architecture?",
-                "Show me the most relevant files for this feature.",
-                "What dependencies define the stack in these repos?",
-            ],
+            "follow_up_suggestions": [],
         }
 
     llm = get_llm_client()
-    repo_dicts = [
-        {
-            "full_name": repo.full_name,
-            "description": repo.description or "",
-            "fit_summary": repo.fit_summary,
-            "reference_type": repo.reference_type,
-        }
-        for repo in repositories[:6]
-    ]
-    evidence = {
-        "repositories": repo_dicts,
-        "hits": [
-            {
-                "repo": hit.repo_full_name,
-                "path": hit.path,
-                "lines": [hit.start_line, hit.end_line],
-                "reason": hit.reason,
-                "snippet": _truncate_text(hit.text, 600),
-            }
-            for hit in hits[:8]
-        ],
-    }
-
     try:
         result = await llm.answer_repo_chat(
             question,
             idea_summary,
             [message.model_dump() for message in messages],
-            repo_dicts,
-            evidence,
+            [{"full_name": repo_map["full_name"]} for repo_map in evidence.repo_maps],
+            {"segments": evidence.segments, "repo_maps": evidence.repo_maps, "intent": evidence.intent},
         )
     except Exception as exc:
-        logger.warning("Repo chat generation failed, falling back to a conservative answer: %s", exc)
-        first_hit = hits[0]
+        logger.warning("Repo chat generation failed: %s", exc)
+        top = evidence.segments[0] if evidence.segments else None
+        where = f" The closest match was {top['repo_full_name']} · {top['path']}." if top else ""
         return {
-            "answer": (
-                f"I found relevant indexed evidence in {first_hit.repo_full_name} ({first_hit.path}), "
-                "but I could not complete a full grounded answer right now."
-            ),
-            "follow_up_suggestions": [
-                "Summarize the architecture from the top retrieved files.",
-                "Which files should I inspect first?",
-            ],
+            "answer": f"I couldn't generate an answer right now (the language model is unavailable).{where} Please try again.",
+            "follow_up_suggestions": [],
         }
 
-    answer = str(result.get("answer", "")).strip()
-    if not answer:
-        answer = (
-            "I found relevant indexed evidence, but the answer was not confident enough to return cleanly. "
-            "Please ask a narrower repo or file-specific question."
-        )
-
-    follow_up_suggestions = [
-        suggestion.strip()
-        for suggestion in result.get("follow_up_suggestions", [])
-        if isinstance(suggestion, str) and suggestion.strip()
-    ][:3]
-
-    return {
-        "answer": answer,
-        "follow_up_suggestions": follow_up_suggestions,
-    }
+    answer = str(result.get("answer", "")).strip() or (
+        "I found relevant code but couldn't form a confident answer. Try a narrower question about one repo or file."
+    )
+    follow_ups = [s.strip() for s in result.get("follow_up_suggestions", []) if isinstance(s, str) and s.strip()][:3]
+    return {"answer": answer, "follow_up_suggestions": follow_ups}
 
 
 async def generate_analysis(
@@ -292,8 +223,14 @@ async def generate_analysis(
     keywords: ExtractedKeywords,
     repositories: list[RepoSearchResult],
     section_hits: dict[str, list[RetrievalHit]],
+    repo_context: dict[str, dict] | None = None,
 ) -> AnalysisResponse:
-    """Generate the final analysis using compact evidence packs and parallel sections."""
+    """Generate the final analysis using compact evidence packs and parallel sections.
+
+    `repo_context` maps full_name -> {"readme_excerpt", "paths"} from shallow
+    rerank. It grounds repos whose code isn't indexed yet, so descriptions
+    come from what the repo actually contains instead of its name.
+    """
 
     llm = get_llm_client()
     repo_dicts = [
@@ -307,7 +244,7 @@ async def generate_analysis(
         }
         for repo in repositories[:8]
     ]
-    evidence_pack = _build_generation_evidence(repositories, section_hits)
+    evidence_pack = _build_generation_evidence(repositories, section_hits, repo_context or {})
 
     repo_descriptions_data, learning_path_data, architecture_diagram, tech_stack_data = await asyncio.gather(
         llm.generate_repo_descriptions(
@@ -475,7 +412,9 @@ def _retrieval_plan_from_dict(plan_dict: dict, keywords: ExtractedKeywords, idea
 def _build_generation_evidence(
     repositories: list[RepoSearchResult],
     section_hits: dict[str, list[RetrievalHit]],
+    repo_context: dict[str, dict] | None = None,
 ) -> dict[str, dict]:
+    repo_context = repo_context or {}
     shared_repositories = [
         {
             "full_name": repo.full_name,
@@ -484,6 +423,8 @@ def _build_generation_evidence(
             "score": round(repo.relevance_score, 4),
             "description": (repo.description or "")[:220],
             "declared_dependencies": repo.dependencies[:25],
+            "readme_excerpt": repo_context.get(repo.full_name, {}).get("readme_excerpt", "")[:1200],
+            "file_paths": repo_context.get(repo.full_name, {}).get("paths", [])[:15],
         }
         for repo in repositories[:5]
     ]
@@ -497,7 +438,7 @@ def _build_generation_evidence(
                     "repo": hit.repo_full_name,
                     "path": hit.path,
                     "reason": hit.reason,
-                    "snippet": _truncate_text(hit.text, 900),
+                    "snippet": hit.text[:900],
                 }
                 for hit in hits[:6]
             ],
@@ -649,22 +590,3 @@ async def _check_urls(urls: list[str]) -> dict[str, bool]:
     if dropped:
         logger.info("Resource link validation: dropped %d/%d unresolved URLs", dropped, len(urls))
     return results
-
-
-def _truncate_text(text: str, limit: int) -> str:
-    collapsed = " ".join(text.split())
-    if len(collapsed) <= limit:
-        return collapsed
-    return collapsed[: limit - 3].rstrip() + "..."
-
-
-def _chat_preferred_roles(question: str) -> list[str]:
-    lowered = question.lower()
-
-    if any(token in lowered for token in ("dependency", "dependencies", "package", "packages", "requirements", "env", "config")):
-        return ["config", "documentation", "entrypoint", "source"]
-    if any(token in lowered for token in ("architecture", "flow", "service", "router", "api", "component")):
-        return ["entrypoint", "source", "config", "documentation"]
-    if any(token in lowered for token in ("setup", "install", "run", "usage", "example", "examples", "how do i")):
-        return ["documentation", "config", "entrypoint", "example"]
-    return ["documentation", "entrypoint", "source", "config"]
