@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 from fastapi import HTTPException
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +39,7 @@ from services.github_service import (
     search_repo_candidates,
 )
 from services.llm_service import (
+    _check_urls,
     _validate_resource_links,
     build_clarification_questions,
     extract_keywords,
@@ -1051,6 +1053,35 @@ class RankingAndGenerationTests(HermeticAsyncTestCase):
         self.assertEqual(["Official docs - https://real.example/docs", "Plain text resource, no URL"], cleaned[0])
         self.assertNotIn("https://fake.example/nonexistent-page", cleaned[1][0])
         self.assertIn("Fabricated guide", cleaned[1][0])
+
+    async def test_link_check_never_requests_internal_addresses(self):
+        cleaned = await _validate_resource_links(
+            [["Metadata - http://169.254.169.254/latest/meta-data/", "Local - http://127.0.0.1:8000/admin"]]
+        )
+        self.assertNotIn("169.254.169.254", cleaned[0][0])
+        self.assertNotIn("127.0.0.1", cleaned[0][1])
+
+    async def test_link_check_rejects_redirect_into_internal_address(self):
+        requested: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested.append(str(request.url))
+            if request.url.host == "public.example":
+                return httpx.Response(302, headers={"location": "http://10.0.0.5/secret"})
+            return httpx.Response(200)
+
+        real_client = httpx.AsyncClient
+        with (
+            patch("services.llm_service._is_public_http_url", AsyncMock(side_effect=lambda url: "10.0.0.5" not in url)),
+            patch(
+                "services.llm_service.httpx.AsyncClient",
+                lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+            ),
+        ):
+            results = await _check_urls(["https://public.example/guide"])
+
+        self.assertFalse(results["https://public.example/guide"])
+        self.assertFalse(any("10.0.0.5" in url for url in requested))
 
     async def test_meal_prep_generation_does_not_default_to_ai_stack(self):
         keywords = await extract_keywords(

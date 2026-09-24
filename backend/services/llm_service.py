@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import re
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -575,24 +577,66 @@ async def _validate_resource_links(resource_lists: list[list[str]]) -> list[list
     return [[clean(resource) for resource in resources] for resources in resource_lists]
 
 
+_MAX_LINK_REDIRECTS = 5
+
+
+async def _is_public_http_url(url: str) -> bool:
+    """Reject URLs that would make this server request its own network.
+
+    Resource links are LLM output shaped by untrusted README text, so a
+    hostile repo could plant e.g. a cloud-metadata or localhost URL; every
+    address the hostname resolves to must be globally routable.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(parsed.hostname, parsed.port or None)
+    except OSError:
+        return False
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%", 1)[0])
+        if ip.version == 6 and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        if not ip.is_global:
+            return False
+    return bool(infos)
+
+
 async def _check_urls(urls: list[str]) -> dict[str, bool]:
     results: dict[str, bool] = {}
+
+    async def fetch_status(client: httpx.AsyncClient, url: str, method: str) -> int | None:
+        # Redirects are followed by hand so every hop is re-checked; a public
+        # URL could otherwise 302 to an internal address.
+        for _ in range(_MAX_LINK_REDIRECTS + 1):
+            if not await _is_public_http_url(url):
+                return None
+            response = await client.request(method, url, timeout=2.5)
+            location = response.headers.get("location")
+            if response.status_code in (301, 302, 303, 307, 308) and location:
+                url = urljoin(url, location)
+                continue
+            return response.status_code
+        return None
 
     async def check(client: httpx.AsyncClient, url: str) -> None:
         for method in ("HEAD", "GET"):
             try:
-                response = await client.request(method, url, timeout=2.5)
-                if response.status_code == 405 and method == "HEAD":
-                    continue
-                results[url] = response.status_code < 400
-                return
+                status = await fetch_status(client, url, method)
             except httpx.HTTPError:
                 continue
+            if status is None:
+                break
+            if status == 405 and method == "HEAD":
+                continue
+            results[url] = status < 400
+            return
         results[url] = False
 
     try:
         async with httpx.AsyncClient(
-            follow_redirects=True,
+            follow_redirects=False,
             headers={"User-Agent": "GitAssistAI-LinkValidator/1.0"},
         ) as client:
             await asyncio.gather(*(check(client, url) for url in urls))
