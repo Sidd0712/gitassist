@@ -237,6 +237,12 @@ class RepoIndexStatus(BaseModel):
     state: Literal["not_queued", "queued", "indexing", "partial", "completed", "failed"]
     chunk_count: int = 0
     error: str | None = None
+    # Only set while state == "indexing": e.g. ("fetching", 2340, 5028). Lets
+    # the UI show real progress instead of a static label for the multi-minute
+    # fetch of an oversized repo's files.
+    progress_stage: str | None = None
+    progress_current: int | None = None
+    progress_total: int | None = None
 
 
 class IndexStatusResponse(BaseModel):

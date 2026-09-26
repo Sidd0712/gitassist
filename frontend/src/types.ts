@@ -97,6 +97,10 @@ export interface RepoIndexStatus {
   state: RepoIndexState;
   chunk_count: number;
   error: string | null;
+  // Only set while state === 'indexing': e.g. ('fetching', 2340, 5028).
+  progress_stage: string | null;
+  progress_current: number | null;
+  progress_total: number | null;
 }
 
 export interface IndexStatusResponse {
@@ -145,6 +149,11 @@ export interface RepoChatMessage {
   evidence_hits?: RepoChatEvidenceHit[];
   follow_up_suggestions?: string[];
   isIntro?: boolean;
+  // How many repos were actually searchable when this answer was generated,
+  // out of how many are in scope now. Lets the UI flag an older answer as
+  // partial if more repos have finished indexing since it was given.
+  scoped_repo_count?: number;
+  scope_size?: number;
 }
 
 export interface AnalysisEvidence {

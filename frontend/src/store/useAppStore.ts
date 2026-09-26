@@ -180,6 +180,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         citations: response.citations,
         evidence_hits: response.evidence_hits,
         follow_up_suggestions: response.follow_up_suggestions,
+        scoped_repo_count: response.scoped_repo_count,
+        scope_size: scopeRepositories.length,
       };
 
       set((state) => ({

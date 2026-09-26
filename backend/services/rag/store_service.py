@@ -258,6 +258,13 @@ class RAGStore:
             )
             conn.execute("ALTER TABLE repo_index_jobs ADD COLUMN IF NOT EXISTS repo_json JSONB")
             conn.execute("ALTER TABLE repo_index_jobs ADD COLUMN IF NOT EXISTS path_terms JSONB")
+            # Progress within a claimed job (fetching files, then embedding
+            # chunks) — the UI would otherwise show "queued" for the entire
+            # multi-minute fetch of an oversized repo's files, indistinguishable
+            # from stuck. See update_index_job_progress().
+            conn.execute("ALTER TABLE repo_index_jobs ADD COLUMN IF NOT EXISTS progress_stage TEXT")
+            conn.execute("ALTER TABLE repo_index_jobs ADD COLUMN IF NOT EXISTS progress_current INTEGER")
+            conn.execute("ALTER TABLE repo_index_jobs ADD COLUMN IF NOT EXISTS progress_total INTEGER")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS repo_index_jobs_status_idx ON repo_index_jobs (status, updated_at)"
             )
@@ -642,6 +649,7 @@ class RAGStore:
                 SET status = %s,
                     retry_count = retry_count + %s,
                     last_error = %s,
+                    progress_stage = NULL, progress_current = NULL, progress_total = NULL,
                     updated_at = NOW()
                 WHERE full_name = %s AND commit_sha = %s AND embedding_model = %s AND chunking_version = %s
                 """,
@@ -657,6 +665,29 @@ class RAGStore:
             )
 
     @_retry_on_connection_loss
+    def update_index_job_progress(
+        self, full_name: str, commit_sha: str, embedding_model: str, chunking_version: str,
+        stage: str, current: int, total: int,
+    ) -> None:
+        """Report progress within a claimed job — e.g. ("fetching", 2340, 5028).
+
+        Without this, a repo whose files are being fetched one-by-one (the
+        oversized-archive fallback) reports "queued" with 0 chunks for the
+        entire multi-minute fetch, indistinguishable from a stuck job.
+        """
+
+        self.ensure_ready()
+        with self._pool.connection() as conn:  # type: ignore[union-attr]
+            conn.execute(
+                """
+                UPDATE repo_index_jobs
+                SET progress_stage = %s, progress_current = %s, progress_total = %s, updated_at = NOW()
+                WHERE full_name = %s AND commit_sha = %s AND embedding_model = %s AND chunking_version = %s
+                """,
+                (stage, current, total, full_name, commit_sha, embedding_model, chunking_version),
+            )
+
+    @_retry_on_connection_loss
     def index_status(self, repos: list[tuple[str, str]], embedding_model: str, chunking_version: str) -> dict[str, dict]:
         """Per-repo index progress for the UI, keyed by full_name."""
 
@@ -667,7 +698,7 @@ class RAGStore:
             rows = conn.execute(
                 """
                 SELECT r.full_name, i.index_state, i.chunk_count, j.status AS job_status,
-                       j.retry_count, j.last_error
+                       j.retry_count, j.last_error, j.progress_stage, j.progress_current, j.progress_total
                 FROM unnest(%s::text[], %s::text[]) AS r(full_name, commit_sha)
                 LEFT JOIN repo_indexes i
                   ON i.full_name = r.full_name AND i.commit_sha = r.commit_sha
@@ -692,7 +723,14 @@ class RAGStore:
             if state not in ("partial", "completed", "indexing"):
                 if row["job_status"] == "failed" and row["retry_count"] >= self.settings.INDEX_JOB_MAX_RETRIES:
                     state = "failed"
-                elif row["job_status"] in ("queued", "running", "failed"):
+                elif row["job_status"] == "running":
+                    # Claimed by the worker and actively fetching/chunking —
+                    # distinct from "queued" (nobody has picked it up yet).
+                    # Without this, an oversized repo whose files are being
+                    # fetched one-by-one reports "queued" for minutes,
+                    # indistinguishable from stuck.
+                    state = "indexing"
+                elif row["job_status"] in ("queued", "failed"):
                     state = "queued"
                 else:
                     state = "not_queued"
@@ -700,6 +738,9 @@ class RAGStore:
                 "state": state,
                 "chunk_count": int(row["chunk_count"] or 0),
                 "error": row["last_error"] if state == "failed" else None,
+                "progress_stage": row["progress_stage"] if state == "indexing" else None,
+                "progress_current": row["progress_current"] if state == "indexing" else None,
+                "progress_total": row["progress_total"] if state == "indexing" else None,
             }
         return status
 

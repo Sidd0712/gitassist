@@ -12,6 +12,7 @@ import re
 import tomllib
 import zipfile
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import yaml
@@ -1418,8 +1419,15 @@ def _path_terms(idea_terms: set[str]) -> set[str]:
     }
 
 
-async def fetch_repo_files_for_indexing(plan: RepoFetchPlan) -> list[RepoFile]:
-    """Fetch planned files via a single archive download."""
+async def fetch_repo_files_for_indexing(
+    plan: RepoFetchPlan, on_progress: Callable[[int, int], None] | None = None
+) -> list[RepoFile]:
+    """Fetch planned files via a single archive download.
+
+    `on_progress(done, total)` is only called on the individual-file fallback
+    below — a zip download has no meaningful sub-progress to report, and
+    finishes quickly enough that it doesn't need any.
+    """
 
     settings = get_settings()
     client = get_github_client()
@@ -1434,7 +1442,7 @@ async def fetch_repo_files_for_indexing(plan: RepoFetchPlan) -> list[RepoFile]:
             "Archive for %s exceeds %d bytes; fetching %d planned files individually",
             plan.repository.full_name, settings.RAG_ARCHIVE_MAX_BYTES, len(plan.selected_paths),
         )
-        return await _fetch_planned_files_raw(client, plan, archive_ref)
+        return await _fetch_planned_files_raw(client, plan, archive_ref, on_progress)
 
     selected_lookup = {
         path.replace("\\", "/"): idx for idx, path in enumerate(plan.selected_paths)
@@ -1487,15 +1495,31 @@ async def _download_archive_capped(client, url: str, max_bytes: int) -> bytes | 
     return bytes(buffer)
 
 
-async def _fetch_planned_files_raw(client, plan: RepoFetchPlan, ref: str) -> list[RepoFile]:
-    """Fallback for oversized repos: download only the planned files."""
+async def _fetch_planned_files_raw(
+    client, plan: RepoFetchPlan, ref: str, on_progress: Callable[[int, int], None] | None = None
+) -> list[RepoFile]:
+    """Fallback for oversized repos: download only the planned files.
+
+    This is the slow path a >300MB archive falls back to (see
+    fetch_repo_files_for_indexing) — thousands of individual HTTP requests
+    that can take minutes. `on_progress` is reported at most every 2% of the
+    total so an oversized repo shows real progress instead of a status
+    endpoint stuck on "queued, 0 chunks" the whole time.
+    """
 
     settings = get_settings()
     semaphore = asyncio.Semaphore(settings.RAG_MAX_SEARCH_CONCURRENCY)
+    total = len(plan.selected_paths)
+    done = 0
+    report_every = max(1, total // 50)
 
     async def fetch(path: str) -> RepoFile | None:
+        nonlocal done
         async with semaphore:
             content = await _fetch_file_content(client, plan.repository.full_name, path, ref, cache=False)
+        done += 1
+        if on_progress and (done % report_every == 0 or done == total):
+            on_progress(done, total)
         content = _readable_content(path, content) if content else None
         if not content:
             return None
@@ -1547,7 +1571,17 @@ async def _fetch_file_content(
 
     settings = get_settings()
     headers = {"Authorization": f"token {settings.GITHUB_TOKEN}"} if settings.GITHUB_TOKEN else {}
-    resp = await client.get(f"{_RAW_BASE}/{full_name}/{ref}/{path}", headers=headers)
+    url = f"{_RAW_BASE}/{full_name}/{ref}/{path}"
+    resp = await client.get(url, headers=headers)
+    # A 429 or transient 5xx from raw.githubusercontent.com under heavy
+    # concurrent load (whole-repo indexing fires thousands of these) used to
+    # be treated identically to "file doesn't exist" — silently dropping a
+    # real file from the index with no signal. Retry those specifically.
+    for delay in (0.5, 1.5):
+        if resp.status_code != 429 and resp.status_code < 500:
+            break
+        await asyncio.sleep(delay)
+        resp = await client.get(url, headers=headers)
     if resp.status_code != 200:
         return None
 

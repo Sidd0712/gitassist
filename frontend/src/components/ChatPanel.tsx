@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { fetchIndexStatus } from '../services/api';
 import { getChatScope, useAppStore } from '../store/useAppStore';
-import type { Citation, IndexStatusResponse, RepoIndexState } from '../types';
+import type { Citation, IndexStatusResponse, RepoIndexState, RepoIndexStatus } from '../types';
 import { Markdown } from './Markdown';
 
 const STATUS_POLL_MS = 5000;
@@ -16,6 +16,15 @@ const STATE_LABEL: Record<RepoIndexState, string> = {
   completed: 'ready',
   failed: 'failed',
 };
+
+function statusLabel(repo: RepoIndexStatus): string {
+  if (repo.state === 'indexing' && repo.progress_stage && repo.progress_total) {
+    // e.g. "fetching 2340/5028" — real progress instead of a static label,
+    // for the multi-minute individual-file fallback on oversized repos.
+    return `${repo.progress_stage} ${repo.progress_current ?? 0}/${repo.progress_total}`;
+  }
+  return STATE_LABEL[repo.state];
+}
 
 function githubLink(citation: Citation): string {
   const ref = citation.commit_sha || 'HEAD';
@@ -140,7 +149,7 @@ export function ChatPanel() {
                   className={`chat-status-chip state-${repo.state}`}
                   title={repo.error ?? `${repo.chunk_count} code sections indexed`}
                 >
-                  {repo.full_name.split('/')[1]} · {STATE_LABEL[repo.state]}
+                  {repo.full_name.split('/')[1]} · {statusLabel(repo)}
                 </span>
               ))}
               {waitingOnWorker && (
@@ -187,6 +196,16 @@ export function ChatPanel() {
                     ))}
                   </div>
                 )}
+                {m.role === 'assistant' &&
+                  m.scoped_repo_count != null &&
+                  m.scope_size != null &&
+                  m.scoped_repo_count < m.scope_size && (
+                    <div className="chat-status-note" style={{ marginTop: 6 }}>
+                      Answered using {m.scoped_repo_count} of {m.scope_size} repos — the rest were still indexing.{' '}
+                      {(status?.repositories.filter((r) => SEARCHABLE.includes(r.state)).length ?? 0) >
+                        m.scoped_repo_count && 'More have finished since — ask again for fuller coverage.'}
+                    </div>
+                  )}
               </div>
             ))}
             {chatPending && (

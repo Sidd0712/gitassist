@@ -73,9 +73,20 @@ class CorpusService:
         settings = get_settings()
         model, version = self.embedding_model_name, self.chunking_version
 
+        job_key = (repository.full_name, repository.commit_sha, model, version)
+
+        def report_progress(stage: str, current: int, total: int) -> None:
+            try:
+                self.store.update_index_job_progress(*job_key, stage, current, total)
+            except Exception:
+                logger.exception("%s: failed to report %s progress", repository.full_name, stage)
+
         tree = await fetch_repo_tree(repository.full_name, repository.commit_sha or repository.default_branch)
         paths, _skipped, _chars = select_index_paths(repository.full_name, tree, path_terms)
-        files = await fetch_repo_files_for_indexing(RepoFetchPlan(repository=repository, selected_paths=paths))
+        files = await fetch_repo_files_for_indexing(
+            RepoFetchPlan(repository=repository, selected_paths=paths),
+            on_progress=lambda done, total: report_progress("fetching", done, total),
+        )
 
         chunks = self.chunker.chunk_repository(repository, files)
         if len(chunks) > settings.RAG_REPO_MAX_CHUNKS:
