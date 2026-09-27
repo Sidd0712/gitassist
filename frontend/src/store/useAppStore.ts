@@ -204,7 +204,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       chatMessages: result && result.status === 'complete' && hasScope ? [buildIntroMessage(result)] : [],
       chatPending: false,
       chatError: null,
-      isChatOpen: result?.status === 'complete' && hasScope,
+      // Chat is ready but stays closed — the freshly-finished report is the payoff
+      // the user waited for; don't cover it with an unrequested panel.
+      isChatOpen: false,
     });
   },
 

@@ -9,7 +9,6 @@ export function ProgressList() {
   return (
     <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '40px 20px' }}>
       <div style={{ width: '100%', maxWidth: 440 }}>
-        <h6 style={{ color: 'var(--color-accent)' }}>researching</h6>
         <h3 style={{ marginBottom: 'var(--space-2)' }}>&ldquo;{trimmedIdea}&rdquo;</h3>
         <div className="card blueprint elev-sm" style={{ padding: 'var(--space-4)', marginTop: 'var(--space-3)' }}>
           <i className="corner tl" /><i className="corner tr" /><i className="corner bl" /><i className="corner br" />

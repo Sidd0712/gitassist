@@ -10,11 +10,28 @@ export function TechStack({ items }: TechStackProps) {
       {items.map((t) => (
         <div key={t.name} className="card blueprint elev-sm" style={{ padding: 14 }}>
           <i className="corner tl" /><i className="corner tr" /><i className="corner bl" /><i className="corner br" />
-          <div className="card-kicker">{t.category}</div>
-          <div className="card-title">{t.name}</div>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
+            <div className="card-title">{t.name}</div>
+            <span className="tag tag-neutral">{t.category}</span>
+          </div>
           <p className="card-body" style={{ marginTop: 4 }}>
             {t.why_recommended}
           </p>
+          {t.supported_by.length > 0 && (
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
+              {t.supported_by.map((s) =>
+                s === 'general recommendation' ? (
+                  <span key={s} className="tag tag-caution" title="Not backed by a specific reference repo — a general best practice">
+                    general recommendation
+                  </span>
+                ) : (
+                  <span key={s} className="tag tag-accent" title="A reference repo declares this dependency">
+                    {s}
+                  </span>
+                ),
+              )}
+            </div>
+          )}
           <div style={{ display: 'flex', gap: 14, marginTop: 8, fontSize: 12 }}>
             <div style={{ flex: 1 }}>
               <div style={{ color: 'var(--color-accent-700)', fontWeight: 600, marginBottom: 2 }}>pros</div>

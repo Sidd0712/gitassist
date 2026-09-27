@@ -1,5 +1,10 @@
 import type { Citation, RepoSearchResult } from '../types';
 
+function humanize(value: string): string {
+  const words = value.split('_');
+  return words.map((word, i) => (i === 0 ? word.charAt(0).toUpperCase() + word.slice(1) : word)).join('-');
+}
+
 interface RepoListProps {
   repositories: RepoSearchResult[];
   descriptions: string[];
@@ -15,7 +20,11 @@ export function RepoList({ repositories, descriptions, citations, onCite }: Repo
         const repoCitations = citations.filter((c) => c.repo_full_name === repo.full_name);
 
         return (
-          <div key={repo.full_name} className="card blueprint elev-sm" style={{ padding: 14 }}>
+          <div
+            key={repo.full_name}
+            className={i === 0 ? 'card blueprint elev-md' : 'card blueprint elev-sm'}
+            style={{ padding: 14 }}
+          >
             <i className="corner tl" /><i className="corner tr" /><i className="corner bl" /><i className="corner br" />
             <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'flex-start' }}>
               <div style={{ minWidth: 0 }}>
@@ -29,13 +38,17 @@ export function RepoList({ repositories, descriptions, citations, onCite }: Repo
                   >
                     {repo.full_name}
                   </a>
-                  {repo.reference_type && <span className="tag tag-accent-2">{repo.reference_type}</span>}
+                  {repo.reference_type && (
+                    <span className="tag tag-accent-2">{humanize(repo.reference_type)}</span>
+                  )}
                   {repo.evidence_type && repo.evidence_type !== 'deep_retrieval' && (
                     <span
-                      className="tag tag-neutral"
-                      title="This repo hasn't finished deep code indexing yet, so its description is based on its overview page only"
+                      className="tag tag-caution"
+                      title="This description is based on the repo's README and manifest only — deep code indexing hasn't finished. Once it does, ask the code chat for answers grounded in the actual source with citations."
                     >
-                      {repo.evidence_type === 'shallow_evidence' ? 'based on repo overview' : 'not yet reviewed'}
+                      {repo.evidence_type === 'shallow_evidence'
+                        ? 'overview only — not fully indexed'
+                        : 'not yet reviewed'}
                     </span>
                   )}
                 </div>
@@ -56,14 +69,19 @@ export function RepoList({ repositories, descriptions, citations, onCite }: Repo
                   ))}
                 </div>
               </div>
-              <div style={{ textAlign: 'right', flex: 'none' }}>
-                <div className="card-meta" style={{ justifyContent: 'flex-end' }}>
-                  ★ {repo.stars.toLocaleString()} {repo.language ? `· ${repo.language}` : ''}
+              <div style={{ textAlign: 'right', flex: 'none', display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
+                <div className="card-meta" style={{ justifyContent: 'flex-end', gap: 8, fontVariantNumeric: 'tabular-nums' }}>
+                  <span>★ {repo.stars.toLocaleString()}</span>
+                  {repo.language && <span className="tag tag-neutral">{repo.language}</span>}
                 </div>
-                {typeof repo.fit_score === 'number' && (
-                  <span className="tag tag-outline" style={{ marginTop: 6 }}>
-                    fit {repo.fit_score.toFixed(2)}
-                  </span>
+                {i === 0 && typeof repo.fit_score === 'number' ? (
+                  <span className="tag tag-accent">best match</span>
+                ) : (
+                  typeof repo.fit_score === 'number' && (
+                    <span className="tag tag-outline" style={{ fontVariantNumeric: 'tabular-nums' }}>
+                      fit {repo.fit_score.toFixed(2)}
+                    </span>
+                  )
                 )}
               </div>
             </div>

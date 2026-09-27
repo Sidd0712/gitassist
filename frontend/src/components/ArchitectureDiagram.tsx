@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import mermaid from 'mermaid';
 import { useAppStore } from '../store/useAppStore';
+import { useOverlayA11y } from '../hooks/useOverlayA11y';
 
 interface ArchitectureDiagramProps {
   chart: string;
@@ -51,6 +52,15 @@ function renderDiagram(container: HTMLDivElement, chart: string) {
     .render(id, cleanChart)
     .then(({ svg }) => {
       container.innerHTML = svg;
+      // Mermaid stamps its own computed max-width as an inline style, which
+      // beats our CSS max-width:100% by specificity and lets wide/tall
+      // diagrams overflow their container uncropped. Override it directly.
+      const svgEl = container.querySelector('svg');
+      if (svgEl) {
+        svgEl.style.maxWidth = '100%';
+        svgEl.style.height = 'auto';
+        svgEl.style.display = 'block';
+      }
     })
     .catch((err) => {
       console.warn('Mermaid render error:', err);
@@ -70,7 +80,7 @@ function DiagramCanvas({ chart, minHeight }: { chart: string; minHeight: number 
   return (
     <div
       ref={containerRef}
-      style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight, overflow: 'auto' }}
+      style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight, maxHeight: 480, overflow: 'auto' }}
       className="diagram-canvas"
     />
   );
@@ -78,6 +88,8 @@ function DiagramCanvas({ chart, minHeight }: { chart: string; minHeight: number 
 
 export function ArchitectureDiagram({ chart }: ArchitectureDiagramProps) {
   const [fullscreen, setFullscreen] = useState(false);
+  const modalRef = useRef<HTMLDivElement>(null);
+  useOverlayA11y(modalRef, () => setFullscreen(false), { active: fullscreen, trapFocus: true });
 
   if (!chart) return null;
 
@@ -86,7 +98,7 @@ export function ArchitectureDiagram({ chart }: ArchitectureDiagramProps) {
       <div className="card blueprint elev-sm" style={{ padding: 14 }}>
         <i className="corner tl" /><i className="corner tr" /><i className="corner bl" /><i className="corner br" />
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
-          <div className="card-kicker">architecture_diagram · mermaid</div>
+          <div className="card-kicker">Architecture diagram</div>
           <button className="btn btn-secondary btn-icon" onClick={() => setFullscreen(true)} aria-label="Expand">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
               <path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M3 16v3a2 2 0 0 0 2 2h3" />
@@ -111,13 +123,24 @@ export function ArchitectureDiagram({ chart }: ArchitectureDiagramProps) {
           onClick={() => setFullscreen(false)}
         >
           <div
+            ref={modalRef}
             className="card blueprint elev-lg"
-            style={{ width: '100%', maxWidth: 900, background: 'var(--color-bg)' }}
+            style={{
+              width: '100%',
+              maxWidth: 900,
+              maxHeight: 'calc(100vh - 80px)',
+              overflowY: 'auto',
+              background: 'var(--color-bg)',
+            }}
             onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="diagram-modal-title"
+            tabIndex={-1}
           >
             <i className="corner tl" /><i className="corner tr" /><i className="corner bl" /><i className="corner br" />
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-              <h4 style={{ margin: 0 }}>Architecture diagram</h4>
+              <h4 style={{ margin: 0 }} id="diagram-modal-title">Architecture diagram</h4>
               <button className="btn btn-icon btn-secondary" onClick={() => setFullscreen(false)} aria-label="Close">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
                   <path d="M6 6l12 12M18 6L6 18" />

@@ -11,6 +11,8 @@ type TabId = 'repos' | 'learning' | 'architecture' | 'stack';
 
 export function ResultsView() {
   const result = useAppStore((s) => s.result);
+  const submitIdea = useAppStore((s) => s.submitIdea);
+  const resetToHome = useAppStore((s) => s.reset);
   const [activeTab, setActiveTab] = useState<TabId>('repos');
   const [activeCitation, setActiveCitation] = useState<CitationDetail | null>(null);
 
@@ -20,9 +22,16 @@ export function ResultsView() {
     return (
       <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '40px 20px' }}>
         <div style={{ width: '100%', maxWidth: 480 }}>
-          <h6 style={{ color: 'var(--color-accent)' }}>research failed</h6>
           <h3 style={{ marginBottom: 'var(--space-2)' }}>Something went wrong</h3>
           <p className="text-muted">{result.error || 'The research pipeline hit an error. Try again with a more specific idea.'}</p>
+          <div style={{ display: 'flex', gap: 8, marginTop: 'var(--space-3)' }}>
+            <button className="btn btn-primary" onClick={submitIdea}>
+              Try again
+            </button>
+            <button className="btn btn-secondary" onClick={resetToHome}>
+              Start over
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -40,11 +49,10 @@ export function ResultsView() {
 
   return (
     <div style={{ flex: 1, padding: '28px 32px 100px', maxWidth: 1180, margin: '0 auto', width: '100%', boxSizing: 'border-box' }}>
-      <h6 style={{ color: 'var(--color-accent)' }}>idea summary</h6>
-      <p style={{ maxWidth: 760, fontSize: 15 }}>{result.idea_summary}</p>
+      <p style={{ maxWidth: 640, fontSize: 16 }}>{result.idea_summary}</p>
 
       {result.error && (
-        <p style={{ color: '#b5493b', fontSize: 13 }} role="alert">
+        <p style={{ color: 'var(--color-danger)', fontSize: 13 }} role="alert">
           {result.error}
         </p>
       )}

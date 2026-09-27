@@ -3,6 +3,7 @@ import { fetchIndexStatus } from '../services/api';
 import { getChatScope, useAppStore } from '../store/useAppStore';
 import type { Citation, IndexStatusResponse, RepoIndexState, RepoIndexStatus } from '../types';
 import { Markdown } from './Markdown';
+import { useOverlayA11y } from '../hooks/useOverlayA11y';
 
 const STATUS_POLL_MS = 5000;
 const SEARCHABLE: RepoIndexState[] = ['partial', 'completed'];
@@ -19,11 +20,15 @@ const STATE_LABEL: Record<RepoIndexState, string> = {
 
 function statusLabel(repo: RepoIndexStatus): string {
   if (repo.state === 'indexing' && repo.progress_stage && repo.progress_total) {
-    // e.g. "fetching 2340/5028" — real progress instead of a static label,
-    // for the multi-minute individual-file fallback on oversized repos.
     return `${repo.progress_stage} ${repo.progress_current ?? 0}/${repo.progress_total}`;
   }
   return STATE_LABEL[repo.state];
+}
+
+/** Real fraction only — never a guessed or fixed percentage for states with no known total. */
+function fetchProgressFraction(repo: RepoIndexStatus): number | null {
+  if (repo.state !== 'indexing' || !repo.progress_total) return null;
+  return Math.min(1, (repo.progress_current ?? 0) / repo.progress_total);
 }
 
 function githubLink(citation: Citation): string {
@@ -48,6 +53,8 @@ export function ChatPanel() {
   const [fullscreen, setFullscreen] = useState(false);
   const [status, setStatus] = useState<IndexStatusResponse | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  useOverlayA11y(panelRef, () => (fullscreen ? setFullscreen(false) : toggleChat()), { active: isChatOpen });
 
   const scope = useMemo(() => getChatScope(result), [result]);
   const scopeKey = scope.map((r) => `${r.full_name}@${r.commit_sha}`).join('|');
@@ -102,7 +109,10 @@ export function ChatPanel() {
     <>
       {isChatOpen ? (
         <div
+          ref={panelRef}
           className="card blueprint elev-lg chat-panel"
+          role="dialog"
+          aria-label="Code chat"
           style={{
             position: 'fixed',
             zIndex: 55,
@@ -124,8 +134,11 @@ export function ChatPanel() {
               paddingBottom: 8,
             }}
           >
-            <div style={{ fontSize: 13, fontWeight: 600 }}>
-              Code chat · {searchableCount ?? '…'}/{scope.length} repos searchable
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+              <span style={{ fontSize: 13, fontWeight: 600 }}>Code chat</span>
+              <span style={{ fontSize: 11, opacity: 0.6, fontVariantNumeric: 'tabular-nums' }}>
+                {searchableCount ?? '…'}/{scope.length} repos searchable
+              </span>
             </div>
             <div style={{ display: 'flex', gap: 4 }}>
               <button className="btn btn-icon btn-ghost" onClick={() => setFullscreen((v) => !v)} aria-label={fullscreen ? 'Shrink chat' : 'Expand chat'}>
@@ -143,17 +156,31 @@ export function ChatPanel() {
 
           {status && (
             <div className="chat-status" aria-live="polite">
-              {status.repositories.map((repo) => (
-                <span
-                  key={repo.full_name}
-                  className={`chat-status-chip state-${repo.state}`}
-                  title={repo.error ?? `${repo.chunk_count} code sections indexed`}
-                >
-                  {repo.full_name.split('/')[1]} · {statusLabel(repo)}
-                </span>
-              ))}
+              {status.repositories.map((repo) => {
+                const fraction = fetchProgressFraction(repo);
+                return (
+                  <div
+                    key={repo.full_name}
+                    className={`chat-status-chip state-${repo.state}`}
+                    title={repo.error ?? `${repo.chunk_count} code sections indexed`}
+                  >
+                    <div className="chat-status-chip-row">
+                      <span>{repo.full_name.split('/')[1]}</span>
+                      <span className="chat-status-chip-state">{statusLabel(repo)}</span>
+                    </div>
+                    {fraction != null && (
+                      <div className="chat-status-bar">
+                        <div className="chat-status-bar-fill" style={{ transform: `scaleX(${fraction})` }} />
+                      </div>
+                    )}
+                    {fraction == null && repo.chunk_count > 0 && (
+                      <div className="chat-status-chip-count">{repo.chunk_count.toLocaleString()} sections indexed</div>
+                    )}
+                  </div>
+                );
+              })}
               {waitingOnWorker && (
-                <div className="chat-status-note">
+                <div className="chat-status-note chat-status-note-degraded">
                   The indexing machine is offline. Repos will be indexed as soon as it's back; chat works for any repo marked ready.
                 </div>
               )}
@@ -190,7 +217,7 @@ export function ChatPanel() {
                         rel="noreferrer noopener"
                         className="chat-source"
                       >
-                        {c.repo_full_name.split('/')[1]} · {c.path}
+                        {c.repo_full_name.split('/')[1]}/{c.path}
                         {c.start_line != null ? `:${c.start_line}-${c.end_line ?? c.start_line}` : ''}
                       </a>
                     ))}
@@ -200,7 +227,7 @@ export function ChatPanel() {
                   m.scoped_repo_count != null &&
                   m.scope_size != null &&
                   m.scoped_repo_count < m.scope_size && (
-                    <div className="chat-status-note" style={{ marginTop: 6 }}>
+                    <div className="chat-status-note" style={{ marginTop: 6, color: 'var(--color-caution)' }}>
                       Answered using {m.scoped_repo_count} of {m.scope_size} repos — the rest were still indexing.{' '}
                       {(status?.repositories.filter((r) => SEARCHABLE.includes(r.state)).length ?? 0) >
                         m.scoped_repo_count && 'More have finished since — ask again for fuller coverage.'}
@@ -214,7 +241,7 @@ export function ChatPanel() {
               </div>
             )}
             {chatError && (
-              <div style={{ fontSize: 12, color: '#b5493b' }} role="alert">
+              <div style={{ fontSize: 12, color: 'var(--color-danger)' }} role="alert">
                 {chatError}
               </div>
             )}
@@ -239,6 +266,8 @@ export function ChatPanel() {
 
           <div style={{ display: 'flex', gap: 6, alignItems: 'flex-end' }}>
             <textarea
+              id="chat-message-input"
+              name="chatMessage"
               className="input"
               rows={2}
               style={{ resize: 'none', minHeight: 40, maxHeight: 120 }}

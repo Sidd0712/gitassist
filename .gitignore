@@ -53,3 +53,5 @@ dist/
 build/
 CLAUDE.md
 .claude/
+.impeccable/
+PRODUCT.md

@@ -26,7 +26,6 @@ export function IdeaForm() {
   return (
     <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '40px 20px' }}>
       <div style={{ width: '100%', maxWidth: 620 }}>
-        <h6 style={{ color: 'var(--color-accent)' }}>describe your idea</h6>
         <h2 style={{ marginBottom: 'var(--space-3)' }}>What are you building?</h2>
         <p className="text-muted" style={{ maxWidth: 480 }}>
           We&rsquo;ll search GitHub for real reference repositories, index the strongest ones, and generate a
@@ -38,6 +37,8 @@ export function IdeaForm() {
           <div className="card blueprint elev-sm" style={{ marginTop: 'var(--space-4)', padding: 'var(--space-4)' }}>
             <i className="corner tl" /><i className="corner tr" /><i className="corner bl" /><i className="corner br" />
             <textarea
+              id="idea-input"
+              name="idea"
               className="input"
               rows={5}
               placeholder="I want to build a realtime collaborative whiteboard where multiple people can draw and sync..."
@@ -61,7 +62,7 @@ export function IdeaForm() {
         </form>
 
         {error && (
-          <p style={{ color: '#b5493b', fontSize: 13, marginTop: 'var(--space-2)' }} role="alert">
+          <p style={{ color: 'var(--color-danger)', fontSize: 13, marginTop: 'var(--space-2)' }} role="alert">
             {error}
           </p>
         )}
