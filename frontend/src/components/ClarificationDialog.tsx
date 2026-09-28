@@ -1,6 +1,7 @@
 import { useRef } from 'react';
 import { useAppStore } from '../store/useAppStore';
 import { useOverlayA11y } from '../hooks/useOverlayA11y';
+import { humanize } from '../utils';
 
 export function ClarificationDialog() {
   const result = useAppStore((s) => s.result);
@@ -17,26 +18,39 @@ export function ClarificationDialog() {
   useOverlayA11y(dialogRef, reset, { active: true, trapFocus: true });
 
   return (
-    <div className="dialog-backdrop">
+    <div className="dialog-backdrop ga-fade-in">
       <div
         ref={dialogRef}
-        className="dialog blueprint elev-lg"
-        style={{ border: '1px solid var(--color-divider)' }}
+        className="card ga-pop-in"
+        style={{ width: 'min(480px, 92vw)', padding: 0 }}
         role="dialog"
         aria-modal="true"
         aria-labelledby="clarify-dialog-title"
         tabIndex={-1}
       >
-        <i className="corner tl" /><i className="corner tr" /><i className="corner bl" /><i className="corner br" />
-        <div className="dialog-title" id="clarify-dialog-title">A couple quick questions</div>
-        <div className="dialog-body">
-          We ground every repo we pick in real evidence, not a guess — a couple more details narrows the search to the right kind of project.
+        <div className="file-head">
+          <span className="fp" id="clarify-dialog-title">
+            +++ b/your-idea.md
+          </span>
+          <span className="stat">clarify</span>
+        </div>
+        <div className="hunk" style={{ padding: '10px 14px 0' }}>
+          @@ narrowing the search @@
+        </div>
+        <div style={{ padding: '4px 14px 12px', fontSize: 13, color: 'var(--color-text-dim)' }}>
+          We ground every repo we pick in real evidence, not a guess &mdash; a couple more details narrows the search
+          to the right kind of project.
         </div>
 
         {questions.map((q) => (
-          <div key={q.key} style={{ marginTop: 'var(--space-3)' }}>
-            <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 8 }}>{q.question}</div>
-            <div className="seg">
+          <div key={q.key} style={{ padding: '0 14px 14px' }}>
+            <div className="dline">
+              <span className="mk">?</span>
+              <span className="tx" style={{ color: 'var(--color-text)', fontWeight: 500 }}>
+                {q.question}
+              </span>
+            </div>
+            <div className="seg" style={{ marginTop: 8, marginLeft: 22 }}>
               {q.options.map((opt) => (
                 <label key={opt} className="seg-opt">
                   <input
@@ -46,7 +60,7 @@ export function ClarificationDialog() {
                     checked={clarificationAnswers[q.key] === opt}
                     onChange={() => setClarificationAnswer(q.key, opt)}
                   />
-                  {opt}
+                  {humanize(opt)}
                 </label>
               ))}
             </div>
@@ -54,14 +68,17 @@ export function ClarificationDialog() {
         ))}
 
         {error && (
-          <p style={{ color: 'var(--color-danger)', fontSize: 13 }} role="alert">
+          <div className="warn-row" role="alert" style={{ margin: '0 14px 14px', borderTop: '1px solid var(--color-divider)' }}>
             {error}
-          </p>
+          </div>
         )}
 
-        <div className="dialog-actions">
-          <button className="btn btn-primary" onClick={submitClarifications} disabled={continueDisabled}>
-            Continue research
+        <div className="patch-foot">
+          <span className="stat-line">
+            {questions.length > 1 ? `answer all ${questions.length} to continue the diff` : 'answer to continue the diff'}
+          </span>
+          <button className="btn btn-primary run-btn" onClick={submitClarifications} disabled={continueDisabled}>
+            $ gitassist continue
           </button>
         </div>
       </div>

@@ -6,6 +6,7 @@ import { TechStack } from './TechStack';
 import { ArchitectureDiagram } from './ArchitectureDiagram';
 import { CitationPopover, type CitationDetail } from './CitationPopover';
 import { ChatPanel } from './ChatPanel';
+import { Typewriter } from './Typewriter';
 
 type TabId = 'repos' | 'learning' | 'architecture' | 'stack';
 
@@ -48,16 +49,18 @@ export function ResultsView() {
   const repoUrlByName = new Map(result.repositories.map((r) => [r.full_name, r.html_url]));
 
   return (
-    <div style={{ flex: 1, padding: '28px 32px 100px', maxWidth: 1180, margin: '0 auto', width: '100%', boxSizing: 'border-box' }}>
-      <p style={{ maxWidth: 640, fontSize: 16 }}>{result.idea_summary}</p>
+    <div className="results-page">
+      <h1 className="results-title">
+        <Typewriter text={result.idea_summary} msPerChar={18} maxMs={1400} />
+      </h1>
 
       {result.error && (
-        <p style={{ color: 'var(--color-danger)', fontSize: 13 }} role="alert">
+        <p style={{ color: 'var(--color-danger)', fontSize: 13, marginTop: 'var(--space-3)' }} role="alert">
           {result.error}
         </p>
       )}
 
-      <div className="seg" style={{ margin: 'var(--space-3) 0 var(--space-4)' }}>
+      <div className="seg" style={{ margin: '28px 0 24px' }}>
         {tabs.map((t) => (
           <label key={t.id} className="seg-opt">
             <input type="radio" name="restab" checked={activeTab === t.id} onChange={() => setActiveTab(t.id)} />
@@ -66,17 +69,19 @@ export function ResultsView() {
         ))}
       </div>
 
-      {activeTab === 'repos' && (
-        <RepoList
-          repositories={result.repositories}
-          descriptions={result.repo_descriptions}
-          citations={repoDescriptionCitations}
-          onCite={(c) => setActiveCitation(c)}
-        />
-      )}
-      {activeTab === 'learning' && <LearningPath steps={result.learning_path} />}
-      {activeTab === 'architecture' && <ArchitectureDiagram chart={result.architecture_diagram} />}
-      {activeTab === 'stack' && <TechStack items={result.tech_stack} />}
+      <div key={activeTab} className="ga-fade-in">
+        {activeTab === 'repos' && (
+          <RepoList
+            repositories={result.repositories}
+            descriptions={result.repo_descriptions}
+            citations={repoDescriptionCitations}
+            onCite={(c) => setActiveCitation(c)}
+          />
+        )}
+        {activeTab === 'learning' && <LearningPath steps={result.learning_path} />}
+        {activeTab === 'architecture' && <ArchitectureDiagram chart={result.architecture_diagram} />}
+        {activeTab === 'stack' && <TechStack items={result.tech_stack} />}
+      </div>
 
       <CitationPopover
         citation={activeCitation}

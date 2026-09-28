@@ -35,7 +35,10 @@ export function Nav() {
   return (
     <div className="nav" style={{ flexWrap: 'wrap', gap: 12 }}>
       <span className="nav-brand">
-        GitAssist <span style={{ color: 'var(--color-accent)' }}>AI</span>
+        gitassist<span style={{ color: 'var(--color-accent)' }}>/ai</span>
+      </span>
+      <span className="nav-breadcrumb">
+        git:(<b>main</b>)<span className="nav-breadcrumb-cmd"> research --idea</span>
       </span>
 
       <div ref={containerRef} style={{ position: 'relative', marginLeft: 'auto' }}>
@@ -52,14 +55,14 @@ export function Nav() {
         </button>
         {historyOpen && (
           <div
-            className="card elev-md"
+            className="card elev-md ga-pop-in"
             style={{
               position: 'absolute',
               right: 0,
               top: 42,
               width: 260,
               zIndex: 30,
-              background: 'var(--color-bg)',
+              background: 'var(--color-bg-raised)',
               gap: 2,
               padding: 6,
               maxHeight: 320,
@@ -89,7 +92,7 @@ export function Nav() {
                     color: 'inherit',
                     font: 'inherit',
                   }}
-                  onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--color-surface)')}
+                  onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--color-neutral-100)')}
                   onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
                 >
                   <div style={{ fontWeight: 500 }}>{h.title}</div>

@@ -1,53 +1,70 @@
 import type { TechRecommendation } from '../types';
+import { Typewriter } from './Typewriter';
 
 interface TechStackProps {
   items: TechRecommendation[];
 }
 
 export function TechStack({ items }: TechStackProps) {
+  const generalCount = items.filter((t) => t.supported_by.includes('general recommendation')).length;
+
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 14 }}>
-      {items.map((t) => (
-        <div key={t.name} className="card blueprint elev-sm" style={{ padding: 14 }}>
-          <i className="corner tl" /><i className="corner tr" /><i className="corner bl" /><i className="corner br" />
-          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
-            <div className="card-title">{t.name}</div>
-            <span className="tag tag-neutral">{t.category}</span>
-          </div>
-          <p className="card-body" style={{ marginTop: 4 }}>
-            {t.why_recommended}
-          </p>
-          {t.supported_by.length > 0 && (
-            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
-              {t.supported_by.map((s) =>
-                s === 'general recommendation' ? (
-                  <span key={s} className="tag tag-caution" title="Not backed by a specific reference repo — a general best practice">
-                    general recommendation
-                  </span>
-                ) : (
-                  <span key={s} className="tag tag-accent" title="A reference repo declares this dependency">
-                    {s}
-                  </span>
-                ),
-              )}
-            </div>
-          )}
-          <div style={{ display: 'flex', gap: 14, marginTop: 8, fontSize: 12 }}>
-            <div style={{ flex: 1 }}>
-              <div style={{ color: 'var(--color-accent-700)', fontWeight: 600, marginBottom: 2 }}>pros</div>
-              {t.pros.map((p) => (
-                <div key={p}>+ {p}</div>
-              ))}
-            </div>
-            <div style={{ flex: 1 }}>
-              <div style={{ opacity: 0.55, fontWeight: 600, marginBottom: 2 }}>cons</div>
-              {t.cons.map((c) => (
-                <div key={c}>– {c}</div>
-              ))}
-            </div>
-          </div>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+      {generalCount > 0 && (
+        <div className="warn-row" style={{ borderTop: '1px solid var(--color-divider)' }}>
+          {generalCount} of {items.length} picks are general best practices, not tied to a specific reference repo
+          &mdash; the rest are directly used by the repos we found.
         </div>
-      ))}
+      )}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 18 }}>
+        {items.map((t, i) => (
+          <div key={t.name} className="card ga-rise-in" style={{ padding: 0, animationDelay: `${Math.min(i, 5) * 40}ms` }}>
+            <div className="file-head">
+              <span className="fp">{t.name}</span>
+              <span className="tag tag-neutral">{t.category}</span>
+            </div>
+            <div className="lines" style={{ padding: '14px 16px 16px' }}>
+              <div className="dline prose">
+                <span className="mk"> </span>
+                <span className="tx" style={{ color: 'var(--color-text)' }}>
+                  <Typewriter text={t.why_recommended} delayMs={120 + Math.min(i, 5) * 90} />
+                </span>
+              </div>
+              {t.supported_by.length > 0 && (
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', margin: '10px 0 12px 20px' }}>
+                  {t.supported_by.map((s) =>
+                    s === 'general recommendation' ? (
+                      <details className="ground-note" key={s}>
+                        <summary className="tag-caution-note">general recommendation</summary>
+                        <span className="ground-note-body">
+                          Not backed by a specific reference repo &mdash; a general best practice.
+                        </span>
+                      </details>
+                    ) : (
+                      <details className="ground-note" key={s}>
+                        <summary className="tag tag-success">{s}</summary>
+                        <span className="ground-note-body">A reference repo declares this dependency.</span>
+                      </details>
+                    ),
+                  )}
+                </div>
+              )}
+              {t.pros.map((p) => (
+                <div className="dline prose add" key={p}>
+                  <span className="mk">+</span>
+                  <span className="tx">{p}</span>
+                </div>
+              ))}
+              {t.cons.map((c) => (
+                <div className="dline prose" key={c}>
+                  <span className="mk">-</span>
+                  <span className="tx">{c}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

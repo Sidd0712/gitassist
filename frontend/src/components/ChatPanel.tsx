@@ -1,9 +1,26 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { fetchIndexStatus } from '../services/api';
 import { getChatScope, useAppStore } from '../store/useAppStore';
 import type { Citation, IndexStatusResponse, RepoIndexState, RepoIndexStatus } from '../types';
 import { Markdown } from './Markdown';
 import { useOverlayA11y } from '../hooks/useOverlayA11y';
+import { useTypewriter } from '../hooks/useTypewriter';
+
+/** Types an assistant answer in behind the block cursor; sources and notes appear once it lands. */
+function TypedAnswer({ text, onGrow, children }: { text: string; onGrow: () => void; children: ReactNode }) {
+  const { shown, done } = useTypewriter(text, { msPerChar: 6, maxMs: 2600 });
+
+  useEffect(() => {
+    onGrow();
+  }, [shown.length, onGrow]);
+
+  return (
+    <div aria-busy={!done}>
+      <Markdown text={shown} typing={!done} />
+      {done && <div className="ga-fade-in">{children}</div>}
+    </div>
+  );
+}
 
 const STATUS_POLL_MS = 5000;
 const SEARCHABLE: RepoIndexState[] = ['partial', 'completed'];
@@ -59,9 +76,11 @@ export function ChatPanel() {
   const scope = useMemo(() => getChatScope(result), [result]);
   const scopeKey = scope.map((r) => `${r.full_name}@${r.commit_sha}`).join('|');
 
-  useEffect(() => {
+  const scrollToBottom = useCallback(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
-  }, [chatMessages, chatPending]);
+  }, []);
+
+  useEffect(scrollToBottom, [chatMessages, chatPending, scrollToBottom]);
 
   // Poll indexing progress until every repo is settled. Repos index on the
   // worker machine after the report is shown, so chat starts partial.
@@ -110,33 +129,32 @@ export function ChatPanel() {
       {isChatOpen ? (
         <div
           ref={panelRef}
-          className="card blueprint elev-lg chat-panel"
+          className="card chat-panel ga-pop-in"
           role="dialog"
           aria-label="Code chat"
           style={{
             position: 'fixed',
             zIndex: 55,
-            background: 'var(--color-bg)',
+            background: 'var(--color-bg-raised)',
             display: 'flex',
             flexDirection: 'column',
             ...(fullscreen
-              ? { inset: 24, width: 'auto', height: 'auto', padding: 18 }
-              : { right: 24, bottom: 88, width: 'min(440px, calc(100vw - 32px))', height: 'min(640px, calc(100vh - 120px))', padding: 14 }),
+              ? { inset: 24, width: 'auto', height: 'auto', padding: 24 }
+              : { right: 24, bottom: 88, width: 'min(460px, calc(100vw - 32px))', height: 'min(660px, calc(100vh - 120px))', padding: 16 }),
           }}
         >
-          <i className="corner tl" /><i className="corner tr" /><i className="corner bl" /><i className="corner br" />
           <div
             style={{
               display: 'flex',
               justifyContent: 'space-between',
               alignItems: 'center',
               borderBottom: '1px solid var(--color-divider)',
-              paddingBottom: 8,
+              paddingBottom: 12,
             }}
           >
-            <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
-              <span style={{ fontSize: 13, fontWeight: 600 }}>Code chat</span>
-              <span style={{ fontSize: 11, opacity: 0.6, fontVariantNumeric: 'tabular-nums' }}>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
+              <h2 style={{ fontSize: 16, fontWeight: 600, margin: 0 }}>Code chat</h2>
+              <span style={{ fontSize: 11.5, fontFamily: 'var(--font-mono)', color: 'var(--color-text-faint)', fontVariantNumeric: 'tabular-nums' }}>
                 {searchableCount ?? '…'}/{scope.length} repos searchable
               </span>
             </div>
@@ -190,54 +208,51 @@ export function ChatPanel() {
             </div>
           )}
 
-          <div ref={scrollRef} style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10, padding: '10px 2px' }}>
+          <div ref={scrollRef} style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', padding: '4px 4px 8px' }}>
             {chatMessages.map((m) => (
-              <div
-                key={m.id}
-                className={m.role === 'user' ? 'chat-msg chat-msg-user' : 'chat-msg chat-msg-assistant'}
-                style={{
-                  alignSelf: m.role === 'user' ? 'flex-end' : 'stretch',
-                  background: m.role === 'user' ? 'var(--color-accent)' : 'var(--color-surface)',
-                  color: m.role === 'user' ? 'var(--color-bg)' : 'inherit',
-                  padding: '8px 12px',
-                  fontSize: 13,
-                  maxWidth: m.role === 'user' ? '85%' : '100%',
-                  whiteSpace: m.role === 'user' ? 'pre-wrap' : undefined,
-                }}
-              >
-                {m.role === 'user' ? m.content : <Markdown text={m.content} />}
-                {m.role === 'assistant' && m.citations && m.citations.length > 0 && (
-                  <div className="chat-sources">
-                    <div className="chat-sources-label">Sources</div>
-                    {m.citations.map((c) => (
-                      <a
-                        key={`${c.repo_full_name}:${c.path}:${c.start_line}`}
-                        href={githubLink(c)}
-                        target="_blank"
-                        rel="noreferrer noopener"
-                        className="chat-source"
-                      >
-                        {c.repo_full_name.split('/')[1]}/{c.path}
-                        {c.start_line != null ? `:${c.start_line}-${c.end_line ?? c.start_line}` : ''}
-                      </a>
-                    ))}
-                  </div>
-                )}
-                {m.role === 'assistant' &&
-                  m.scoped_repo_count != null &&
-                  m.scope_size != null &&
-                  m.scoped_repo_count < m.scope_size && (
-                    <div className="chat-status-note" style={{ marginTop: 6, color: 'var(--color-caution)' }}>
-                      Answered using {m.scoped_repo_count} of {m.scope_size} repos — the rest were still indexing.{' '}
-                      {(status?.repositories.filter((r) => SEARCHABLE.includes(r.state)).length ?? 0) >
-                        m.scoped_repo_count && 'More have finished since — ask again for fuller coverage.'}
-                    </div>
+              <div key={m.id} className={`ga-rise-in msg ${m.role === 'assistant' ? 'msg-assistant' : ''}`}>
+                <div className="msg-who">{m.role === 'user' ? 'you' : 'gitassist'}</div>
+                <div className="msg-body" style={{ whiteSpace: m.role === 'user' ? 'pre-wrap' : undefined }}>
+                  {m.role === 'user' ? (
+                    m.content
+                  ) : (
+                    <TypedAnswer text={m.content} onGrow={scrollToBottom}>
+                      {m.citations && m.citations.length > 0 && (
+                        <div className="chat-sources">
+                          <div className="chat-sources-label">Sources</div>
+                          {m.citations.map((c) => (
+                            <a
+                              key={`${c.repo_full_name}:${c.path}:${c.start_line}`}
+                              href={githubLink(c)}
+                              target="_blank"
+                              rel="noreferrer noopener"
+                              className="chat-source"
+                            >
+                              {c.repo_full_name.split('/')[1]}/{c.path}
+                              {c.start_line != null ? `:${c.start_line}-${c.end_line ?? c.start_line}` : ''}
+                            </a>
+                          ))}
+                        </div>
+                      )}
+                      {m.scoped_repo_count != null && m.scope_size != null && m.scoped_repo_count < m.scope_size && (
+                        <div className="chat-status-note" style={{ marginTop: 8, color: 'var(--color-danger)' }}>
+                          Answered using {m.scoped_repo_count} of {m.scope_size} repos — the rest were still indexing.{' '}
+                          {(status?.repositories.filter((r) => SEARCHABLE.includes(r.state)).length ?? 0) >
+                            m.scoped_repo_count && 'More have finished since — ask again for fuller coverage.'}
+                        </div>
+                      )}
+                    </TypedAnswer>
                   )}
+                </div>
               </div>
             ))}
             {chatPending && (
-              <div style={{ alignSelf: 'flex-start', fontSize: 13, opacity: 0.6, padding: '8px 12px' }}>
-                Searching the code and writing an answer…
+              <div className="msg msg-assistant">
+                <div className="msg-who">gitassist</div>
+                <div className="msg-body" style={{ color: 'var(--color-text-faint)' }}>
+                  Searching the code and writing an answer
+                  <span className="type-cursor" aria-hidden="true" />
+                </div>
               </div>
             )}
             {chatError && (
@@ -304,9 +319,8 @@ export function ChatPanel() {
             bottom: 24,
             width: 52,
             height: 52,
-            borderRadius: '50%',
+            background: 'var(--color-bg-raised)',
             zIndex: 54,
-            boxShadow: 'var(--shadow-lg)',
           }}
           aria-label="Open chat"
         >

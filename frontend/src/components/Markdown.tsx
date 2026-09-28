@@ -5,8 +5,8 @@ import type { ReactNode } from 'react';
  * inline code, bold and http(s) links. Builds React elements (never innerHTML),
  * so model output can't inject markup.
  */
-export function Markdown({ text }: { text: string }) {
-  return <div className="md">{renderBlocks(text)}</div>;
+export function Markdown({ text, typing = false }: { text: string; typing?: boolean }) {
+  return <div className={typing ? 'md typing' : 'md'}>{renderBlocks(text)}</div>;
 }
 
 function renderBlocks(text: string): ReactNode[] {

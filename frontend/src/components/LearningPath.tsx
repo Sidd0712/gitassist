@@ -1,4 +1,5 @@
 import type { LearningStep } from '../types';
+import { Typewriter } from './Typewriter';
 
 interface LearningPathProps {
   steps: LearningStep[];
@@ -6,31 +7,32 @@ interface LearningPathProps {
 
 export function LearningPath({ steps }: LearningPathProps) {
   return (
-    <div style={{ display: 'flex', flexDirection: 'column' }}>
+    <div className="card" style={{ padding: 0 }}>
+      <div className="file-head">
+        <span className="fp">learning-path.md</span>
+        <span className="stat">{steps.length} steps</span>
+      </div>
       {steps.map((step, i) => (
-        <div key={step.step_number} style={{ display: 'flex', gap: 14 }}>
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', flex: 'none', width: 28 }}>
-            <div
-              style={{
-                fontFamily: 'var(--font-heading)',
-                fontSize: 22,
-                fontWeight: 600,
-                color: 'var(--color-accent)',
-              }}
-            >
-              {step.step_number}
-            </div>
-            {i < steps.length - 1 && (
-              <div style={{ flex: 1, width: 1, background: 'var(--color-divider)', margin: '6px 0' }} />
-            )}
+        <div
+          key={step.step_number}
+          className="ga-rise-in"
+          style={{
+            borderTop: i === 0 ? 'none' : '1px solid var(--color-divider)',
+            animationDelay: `${Math.min(i, 5) * 40}ms`,
+          }}
+        >
+          <div className="hunk-head">
+            <span className="hunk">@@ step {step.step_number} @@</span>
+            <h3 className="hunk-title">{step.title}</h3>
           </div>
-          <div className="card blueprint elev-sm" style={{ padding: 14, marginBottom: 10, flex: 1, minWidth: 0 }}>
-            <i className="corner tl" /><i className="corner tr" /><i className="corner bl" /><i className="corner br" />
-            <div className="card-title">{step.title}</div>
-            <p className="card-body" style={{ marginTop: 4 }}>
-              {step.description}
-            </p>
-            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
+          <div className="lines" style={{ padding: '8px 16px 20px' }}>
+            <div className="dline prose">
+              <span className="mk"> </span>
+              <span className="tx">
+                <Typewriter text={step.description} delayMs={120 + Math.min(i, 5) * 90} />
+              </span>
+            </div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', margin: '12px 0 0 20px' }}>
               {step.milestone && <span className="tag tag-outline">milestone: {step.milestone}</span>}
               {step.concepts.map((c) => (
                 <span key={c} className="tag tag-neutral">
@@ -39,10 +41,10 @@ export function LearningPath({ steps }: LearningPathProps) {
               ))}
             </div>
             {step.resources.length > 0 && (
-              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
-                <span style={{ fontSize: 11, opacity: 0.6 }}>Study:</span>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', margin: '10px 0 0 20px', alignItems: 'center' }}>
+                <span className="stash-label">Study:</span>
                 {step.resources.map((r) => (
-                  <span key={r} className="tag tag-accent" style={{ fontFamily: 'var(--font-mono)' }}>
+                  <span key={r} className="tag tag-accent">
                     {r}
                   </span>
                 ))}

@@ -8,6 +8,10 @@ const EXAMPLES = [
 
 const MAX_IDEA_LENGTH = 5000;
 const MIN_IDEA_LENGTH = 10;
+// Rough wrap width of the textarea at its default size — used only to give
+// the "+N" stat a visible pulse as a long single-paragraph idea grows,
+// since most ideas never contain a literal newline.
+const CHARS_PER_WRAPPED_LINE = 60;
 
 export function IdeaForm() {
   const idea = useAppStore((s) => s.idea);
@@ -17,45 +21,59 @@ export function IdeaForm() {
 
   const trimmedLength = idea.trim().length;
   const submitDisabled = trimmedLength < MIN_IDEA_LENGTH;
+  const lineCount = idea
+    ? idea.split('\n').reduce((total, line) => total + Math.max(1, Math.ceil(line.length / CHARS_PER_WRAPPED_LINE)), 0)
+    : 0;
 
   function handleSubmit(e?: React.FormEvent) {
     e?.preventDefault();
     if (!submitDisabled) submitIdea();
   }
 
+  function fillExample(label: string) {
+    setIdea(`${label} — people should be able to sign in, create a project, and see live progress.`);
+  }
+
   return (
     <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '40px 20px' }}>
-      <div style={{ width: '100%', maxWidth: 620 }}>
-        <h2 style={{ marginBottom: 'var(--space-3)' }}>What are you building?</h2>
-        <p className="text-muted" style={{ maxWidth: 480 }}>
+      <div style={{ width: '100%', maxWidth: 640 }}>
+        <h1 className="page-title">What are you building?</h1>
+        <p className="text-muted" style={{ maxWidth: '58ch', fontSize: 15.5, lineHeight: 1.65 }}>
           We&rsquo;ll search GitHub for real reference repositories, index the strongest ones, and generate a
           grounded build plan &mdash; repos, a learning path, an architecture diagram and a tech stack, all cited to
           actual code.
         </p>
 
         <form onSubmit={handleSubmit}>
-          <div className="card blueprint elev-sm" style={{ marginTop: 'var(--space-4)', padding: 'var(--space-4)' }}>
-            <i className="corner tl" /><i className="corner tr" /><i className="corner bl" /><i className="corner br" />
-            <textarea
-              id="idea-input"
-              name="idea"
-              className="input"
-              rows={5}
-              placeholder="I want to build a realtime collaborative whiteboard where multiple people can draw and sync..."
-              value={idea}
-              onChange={(e) => setIdea(e.target.value.slice(0, MAX_IDEA_LENGTH))}
-              style={{ fontSize: 15 }}
-              autoFocus
-            />
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 'var(--space-2)' }}>
-              <span style={{ fontSize: 11, opacity: 0.5 }}>
-                {idea.length} / {MAX_IDEA_LENGTH}
+          <div className="card" style={{ marginTop: 'var(--space-8)', padding: 0 }}>
+            <div className="patch-head">
+              diff --git a/your-idea b/gitassist-report
+              <br />
+              --- /dev/null
+              <br />
+              <span className="fname">+++ b/your-idea.md</span>
+            </div>
+            <div className="patch-hunk">@@ -0,0 +1,{Math.max(lineCount, 1)} @@</div>
+            <div className="idea-body">
+              <span className="idea-mark" aria-hidden="true">+</span>
+              <textarea
+                id="idea-input"
+                name="idea"
+                className="input"
+                rows={5}
+                placeholder="I want to build a realtime collaborative whiteboard where multiple people can draw and sync..."
+                value={idea}
+                onChange={(e) => setIdea(e.target.value.slice(0, MAX_IDEA_LENGTH))}
+                style={{ fontSize: 14.5, border: 'none', background: 'var(--color-accent-100)', paddingLeft: 32 }}
+                autoFocus
+              />
+            </div>
+            <div className="patch-foot">
+              <span className="stat-line">
+                <span className="add">+{lineCount}</span> -0 &middot; {idea.length} / {MAX_IDEA_LENGTH}
               </span>
-              <button className="btn btn-primary" type="submit" disabled={submitDisabled}>
-                Research this idea
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-                  <path d="M5 12h14M13 6l6 6-6 6" />
-                </svg>
+              <button className="btn btn-primary run-btn" type="submit" disabled={submitDisabled}>
+                $ gitassist research
               </button>
             </div>
           </div>
@@ -67,22 +85,20 @@ export function IdeaForm() {
           </p>
         )}
 
-        <div style={{ marginTop: 'var(--space-4)', display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-          <span style={{ fontSize: 12, opacity: 0.5 }}>try an example:</span>
+        <div className="stash" style={{ marginTop: 'var(--space-6)' }}>
+          <span className="stash-label">// pick one up:</span>
           {EXAMPLES.map((label) => (
             <span
               key={label}
               className="tag tag-outline"
               style={{ cursor: 'pointer' }}
-              onClick={() =>
-                setIdea(`${label} — people should be able to sign in, create a project, and see live progress.`)
-              }
+              onClick={() => fillExample(label)}
               role="button"
               tabIndex={0}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault();
-                  setIdea(`${label} — people should be able to sign in, create a project, and see live progress.`);
+                  fillExample(label);
                 }
               }}
             >

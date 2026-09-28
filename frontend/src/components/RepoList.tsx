@@ -1,9 +1,6 @@
 import type { Citation, RepoSearchResult } from '../types';
-
-function humanize(value: string): string {
-  const words = value.split('_');
-  return words.map((word, i) => (i === 0 ? word.charAt(0).toUpperCase() + word.slice(1) : word)).join('-');
-}
+import { humanize } from '../utils';
+import { Typewriter } from './Typewriter';
 
 interface RepoListProps {
   repositories: RepoSearchResult[];
@@ -13,80 +10,83 @@ interface RepoListProps {
 }
 
 export function RepoList({ repositories, descriptions, citations, onCite }: RepoListProps) {
+  const shallowCount = repositories.filter((r) => r.evidence_type && r.evidence_type !== 'deep_retrieval').length;
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+      {shallowCount > 0 && (
+        <div className="warn-row" style={{ borderTop: '1px solid var(--color-divider)' }}>
+          {repositories.length - shallowCount} of {repositories.length} repos are fully indexed below &mdash; the rest
+          show a README-based overview for now and unlock cited chat answers once indexing finishes.
+        </div>
+      )}
       {repositories.map((repo, i) => {
         const description = descriptions[i] || repo.description || 'No description available.';
         const repoCitations = citations.filter((c) => c.repo_full_name === repo.full_name);
+        const isTop = i === 0;
 
         return (
           <div
             key={repo.full_name}
-            className={i === 0 ? 'card blueprint elev-md' : 'card blueprint elev-sm'}
-            style={{ padding: 14 }}
+            className="card ga-rise-in"
+            style={{ padding: 0, animationDelay: `${Math.min(i, 5) * 40}ms` }}
           >
-            <i className="corner tl" /><i className="corner tr" /><i className="corner bl" /><i className="corner br" />
-            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'flex-start' }}>
-              <div style={{ minWidth: 0 }}>
-                <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-                  <a
-                    className="card-title"
-                    href={repo.html_url}
-                    target="_blank"
-                    rel="noreferrer"
-                    style={{ color: 'inherit', textDecoration: 'none' }}
-                  >
-                    {repo.full_name}
-                  </a>
-                  {repo.reference_type && (
-                    <span className="tag tag-accent-2">{humanize(repo.reference_type)}</span>
-                  )}
-                  {repo.evidence_type && repo.evidence_type !== 'deep_retrieval' && (
-                    <span
-                      className="tag tag-caution"
-                      title="This description is based on the repo's README and manifest only — deep code indexing hasn't finished. Once it does, ask the code chat for answers grounded in the actual source with citations."
-                    >
-                      {repo.evidence_type === 'shallow_evidence'
-                        ? 'overview only — not fully indexed'
-                        : 'not yet reviewed'}
-                    </span>
-                  )}
-                </div>
-                <p className="card-body" style={{ marginTop: 4 }}>
-                  {description}
-                  {repoCitations.length > 0 && (
-                    <span style={{ color: 'var(--color-accent-700)' }}>
-                      {' '}
-                      {repoCitations.map((_, ci) => `[${ci + 1}]`).join('')}
-                    </span>
-                  )}
-                </p>
-                <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
-                  {repo.topics.slice(0, 6).map((topic) => (
-                    <span key={topic} className="tag tag-neutral">
-                      {topic}
-                    </span>
-                  ))}
-                </div>
-              </div>
-              <div style={{ textAlign: 'right', flex: 'none', display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
-                <div className="card-meta" style={{ justifyContent: 'flex-end', gap: 8, fontVariantNumeric: 'tabular-nums' }}>
-                  <span>★ {repo.stars.toLocaleString()}</span>
-                  {repo.language && <span className="tag tag-neutral">{repo.language}</span>}
-                </div>
-                {i === 0 && typeof repo.fit_score === 'number' ? (
+            <div className="file-head">
+              <a href={repo.html_url} target="_blank" rel="noreferrer" className="fp" style={{ textDecoration: 'none' }}>
+                {repo.full_name}
+              </a>
+              {repo.reference_type && <span className="tag tag-accent-2">{humanize(repo.reference_type)}</span>}
+              {repo.evidence_type && repo.evidence_type !== 'deep_retrieval' && (
+                <details className="ground-note">
+                  <summary className="tag-caution-note">
+                    {repo.evidence_type === 'shallow_evidence' ? 'overview only' : 'not yet reviewed'}
+                  </summary>
+                  <span className="ground-note-body">
+                    This description is based on the repo&rsquo;s README and manifest only &mdash; deep code indexing
+                    hasn&rsquo;t finished. Once it does, ask the code chat for answers grounded in the actual source
+                    with citations.
+                  </span>
+                </details>
+              )}
+              <span className="stat">
+                {isTop && typeof repo.fit_score === 'number' ? (
                   <span className="tag tag-accent">best match</span>
-                ) : (
-                  typeof repo.fit_score === 'number' && (
-                    <span className="tag tag-outline" style={{ fontVariantNumeric: 'tabular-nums' }}>
-                      fit {repo.fit_score.toFixed(2)}
-                    </span>
-                  )
-                )}
+                ) : typeof repo.fit_score === 'number' ? (
+                  <span className="stat-line">
+                    <span className="add">+{Math.round(repo.fit_score * 100)}</span>
+                  </span>
+                ) : null}
+              </span>
+            </div>
+            <div className="lines" style={{ padding: '14px 16px' }}>
+              <div className={isTop ? 'dline prose add' : 'dline prose'}>
+                <span className="mk">{isTop ? '+' : ' '}</span>
+                <span className="tx">
+                  <Typewriter
+                    text={description}
+                    delayMs={120 + Math.min(i, 5) * 90}
+                    after={
+                      repoCitations.length > 0 && (
+                        <span style={{ color: 'var(--color-accent)', fontFamily: 'var(--font-mono)', fontSize: 12.5 }}>
+                          {' '}
+                          {repoCitations.map((_, ci) => `[${ci + 1}]`).join('')}
+                        </span>
+                      )
+                    }
+                  />
+                </span>
+              </div>
+              <div className="dline meta" style={{ marginTop: 6 }}>
+                <span className="mk"> </span>
+                <span className="tx" style={{ fontVariantNumeric: 'tabular-nums' }}>
+                  ★ {repo.stars.toLocaleString()}
+                  {repo.language ? ` · ${repo.language}` : ''}
+                  {repo.topics.length > 0 ? ` · ${repo.topics.slice(0, 6).join(', ')}` : ''}
+                </span>
               </div>
             </div>
             {repoCitations.length > 0 && (
-              <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
+              <div style={{ display: 'flex', gap: 8, padding: '0 16px 16px 36px', flexWrap: 'wrap' }}>
                 {repoCitations.map((c, ci) => (
                   <span
                     key={`${c.path}-${c.start_line}-${ci}`}

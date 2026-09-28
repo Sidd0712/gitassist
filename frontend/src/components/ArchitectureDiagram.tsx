@@ -11,11 +11,11 @@ function readMermaidTheme() {
   const styles = getComputedStyle(document.documentElement);
   const read = (name: string, fallback: string) => styles.getPropertyValue(name).trim() || fallback;
   return {
-    background: read('--color-bg', '#f2f2f3'),
-    surface: read('--color-surface', '#e9e9ea'),
-    text: read('--color-text', '#1d1f20'),
-    accent: read('--color-accent', '#5980a6'),
-    line: read('--color-neutral-500', '#98989b'),
+    background: read('--color-bg', '#0b0c0e'),
+    surface: read('--color-bg-input', '#101215'),
+    text: read('--color-text', '#d9dce1'),
+    accent: read('--color-accent', '#4fd671'),
+    line: read('--color-divider-strong', '#33373d'),
   };
 }
 
@@ -43,7 +43,7 @@ function renderDiagram(container: HTMLDivElement, chart: string) {
       clusterBorder: colors.line,
       titleColor: colors.text,
       edgeLabelBackground: colors.background,
-      fontFamily: 'Barlow, system-ui, sans-serif',
+      fontFamily: 'ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace',
     },
   });
 
@@ -68,7 +68,7 @@ function renderDiagram(container: HTMLDivElement, chart: string) {
     });
 }
 
-function DiagramCanvas({ chart, minHeight }: { chart: string; minHeight: number }) {
+function DiagramCanvas({ chart, minHeight, maxHeight }: { chart: string; minHeight: number; maxHeight: number | string }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const theme = useAppStore((s) => s.theme);
 
@@ -80,7 +80,7 @@ function DiagramCanvas({ chart, minHeight }: { chart: string; minHeight: number 
   return (
     <div
       ref={containerRef}
-      style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight, maxHeight: 480, overflow: 'auto' }}
+      style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight, maxHeight, overflow: 'auto' }}
       className="diagram-canvas"
     />
   );
@@ -95,25 +95,27 @@ export function ArchitectureDiagram({ chart }: ArchitectureDiagramProps) {
 
   return (
     <>
-      <div className="card blueprint elev-sm" style={{ padding: 14 }}>
-        <i className="corner tl" /><i className="corner tr" /><i className="corner bl" /><i className="corner br" />
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
-          <div className="card-kicker">Architecture diagram</div>
-          <button className="btn btn-secondary btn-icon" onClick={() => setFullscreen(true)} aria-label="Expand">
+      <div className="card" style={{ padding: 0 }}>
+        <div className="file-head">
+          <span className="fp">+++ b/architecture.mmd</span>
+          <button className="btn btn-secondary btn-icon" onClick={() => setFullscreen(true)} aria-label="Expand" style={{ marginLeft: 'auto' }}>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
               <path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M3 16v3a2 2 0 0 0 2 2h3" />
             </svg>
           </button>
         </div>
-        <DiagramCanvas chart={chart} minHeight={220} />
+        <div style={{ padding: 14 }}>
+          <DiagramCanvas chart={chart} minHeight={220} maxHeight={480} />
+        </div>
       </div>
 
       {fullscreen && (
         <div
+          className="ga-fade-in"
           style={{
             position: 'fixed',
             inset: 0,
-            background: 'color-mix(in srgb, var(--color-neutral-900) 60%, transparent)',
+            background: 'color-mix(in srgb, black 65%, transparent)',
             zIndex: 60,
             display: 'flex',
             alignItems: 'center',
@@ -124,13 +126,14 @@ export function ArchitectureDiagram({ chart }: ArchitectureDiagramProps) {
         >
           <div
             ref={modalRef}
-            className="card blueprint elev-lg"
+            className="card ga-pop-in"
             style={{
               width: '100%',
-              maxWidth: 900,
+              maxWidth: 'min(1400px, calc(100vw - 80px))',
               maxHeight: 'calc(100vh - 80px)',
               overflowY: 'auto',
-              background: 'var(--color-bg)',
+              background: 'var(--color-bg-raised)',
+              padding: 0,
             }}
             onClick={(e) => e.stopPropagation()}
             role="dialog"
@@ -138,16 +141,17 @@ export function ArchitectureDiagram({ chart }: ArchitectureDiagramProps) {
             aria-labelledby="diagram-modal-title"
             tabIndex={-1}
           >
-            <i className="corner tl" /><i className="corner tr" /><i className="corner bl" /><i className="corner br" />
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-              <h4 style={{ margin: 0 }} id="diagram-modal-title">Architecture diagram</h4>
-              <button className="btn btn-icon btn-secondary" onClick={() => setFullscreen(false)} aria-label="Close">
+            <div className="file-head">
+              <span className="fp" id="diagram-modal-title">+++ b/architecture.mmd</span>
+              <button className="btn btn-icon btn-secondary" onClick={() => setFullscreen(false)} aria-label="Close" style={{ marginLeft: 'auto' }}>
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
                   <path d="M6 6l12 12M18 6L6 18" />
                 </svg>
               </button>
             </div>
-            <DiagramCanvas chart={chart} minHeight={460} />
+            <div style={{ padding: 14 }}>
+              <DiagramCanvas chart={chart} minHeight={460} maxHeight="calc(100vh - 220px)" />
+            </div>
           </div>
         </div>
       )}
